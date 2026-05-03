@@ -17,7 +17,7 @@ scp xm.sh user@IP:/tmp/xm.sh
 sudo mv /tmp/xm.sh /usr/local/bin/xm
 sudo chmod +x /usr/local/bin/xm
 ```
-
+```
 xm info                    # общая сводка
 xm add-client "ivan"       # добавить клиента, сразу выдаст VLESS URI
 xm clients                 # список всех клиентов
@@ -26,3 +26,4 @@ xm edit                    # открыть конфиг (автоматичес
 xm restore                 # восстановить конфиг из бэкапа
 xm log-live                # смотреть логи в реальном времени
 xm paths                   # все важные пути одним взглядом
+```
