@@ -304,10 +304,10 @@ success "config.json записан"
 # =============================================================================
 header "Валидация конфига"
 
-if xray -test -config "$XRAY_CONFIG" 2>&1 | grep -q "Configuration OK"; then
+if sudo -u nobody xray -test -config "$XRAY_CONFIG" 2>&1 | grep -q "Configuration OK"; then
   success "xray -test: Configuration OK"
 else
-  error "Конфиг невалиден. Проверь: xray -test -config $XRAY_CONFIG"
+  error "Конфиг невалиден. Проверь: sudo -u nobody xray -test -config $XRAY_CONFIG"
 fi
 
 # =============================================================================
@@ -452,7 +452,7 @@ systemctl status xray
 journalctl -u xray -f
 tail -50 /var/log/xray/error.log
 ss -tlnp | grep ${XRAY_PORT}
-xray -test -config /usr/local/etc/xray/config.json
+sudo -u nobody xray -test -config /usr/local/etc/xray/config.json
 openssl s_client -connect ${SERVER_IP}:${XRAY_PORT} -servername ${DEST_SNI}
 EOF
 
