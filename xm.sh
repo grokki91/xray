@@ -31,18 +31,18 @@ edit)
     ;;
 
 test)
-    xray -test -config "$CONFIG" && echo -e "${GREEN}Конфиг валиден${NC}" \
+    sudo -u nobody xray -test -config "$CONFIG" && echo -e "${GREEN}Конфиг валиден${NC}" \
       || echo -e "${RED}Конфиг невалиден!${NC}"
     ;;
 
 apply)
     # Проверить + перезапустить
-    if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+    if sudo -u nobody xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
         systemctl restart xray
         echo -e "${GREEN}Конфиг применён, Xray перезапущен${NC}"
     else
         echo -e "${RED}Конфиг невалиден — Xray не перезапущен${NC}"
-        xray -test -config "$CONFIG"
+        sudo -u nobody xray -test -config "$CONFIG"
     fi
     ;;
 
