@@ -10,7 +10,7 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 CONFIG="/usr/local/etc/xray/config.json"
 BACKUP_DIR="/usr/local/etc/xray/backups"
 LOG="/var/log/xray/error.log"
-CLIENT_FILE="/root/xray-client-info.txt"
+CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
 
 case "$1" in
 
@@ -106,7 +106,7 @@ add-client)
     SID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$CONFIG")
     PATH_VAL=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
     MODE=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
-    PUBLIC_KEY=$(grep "PUBLIC KEY" "$CLIENT_FILE" 2>/dev/null | awk '{print $NF}')
+    PUBLIC_KEY=$(grep "PUBLIC KEY" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]')
     SERVER_IP=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || echo "SERVER_IP")
     ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${PATH_VAL}', safe=''))")
 
@@ -180,10 +180,10 @@ uri)
     SID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$CONFIG")
     PATH_VAL=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
     MODE=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
-    PUBLIC_KEY=$(grep "PUBLIC KEY" "$CLIENT_FILE" 2>/dev/null | awk '{print $NF}')
-    FP=$(grep "FINGERPRINT" "$CLIENT_FILE" 2>/dev/null | awk '{print $NF}')
+    PUBLIC_KEY=$(grep "PUBLIC KEY" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    FP=$(grep "FINGERPRINT" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]')
     FP="${FP:-chrome}"
-    SERVER_IP=$(grep "SERVER IP" "$CLIENT_FILE" 2>/dev/null | awk '{print $NF}')
+    SERVER_IP=$(grep "SERVER IP" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]')
     # Если IP не найден в файле — запросить у ipify
     if [[ -z "$SERVER_IP" || "$SERVER_IP" == "ТВОЙ_IP" ]]; then
         SERVER_IP=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || echo "SERVER_IP")
