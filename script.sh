@@ -33,7 +33,7 @@ header()  { echo -e "\n${BOLD}${CYAN}══════════════�
 # ─── Переменные путей ────────────────────────────────────────────────────────
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_LOG_DIR="/var/log/xray"
-CLIENT_FILE="/root/xray-client-info.txt"
+CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
 
 # =============================================================================
 # 1. ИНТЕРАКТИВНЫЙ ВВОД
@@ -456,7 +456,7 @@ xray -test -config /usr/local/etc/xray/config.json
 openssl s_client -connect ${SERVER_IP}:${XRAY_PORT} -servername ${DEST_SNI}
 EOF
 
-chmod 600 "$CLIENT_FILE"
+chmod 644 "$CLIENT_FILE"
 success "Данные клиента сохранены: $CLIENT_FILE"
 
 # =============================================================================
