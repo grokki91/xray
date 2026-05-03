@@ -168,6 +168,91 @@ uuid)
     echo "$NEW"
     ;;
 
+# ─── URI ─────────────────────────────────────────────────────────────────────
+uri)
+    # xm uri           — интерактивный выбор из списка
+    # xm uri "имя"     — по имени (comment)
+    # xm uri --all     — все клиенты сразу
+
+    # Читаем общие параметры из конфига и client-info.txt
+    SNI=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host' "$CONFIG")
+    PORT=$(jq -r '.inbounds[0].port' "$CONFIG")
+    SID=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$CONFIG")
+    PATH_VAL=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
+    MODE=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
+    PUBLIC_KEY=$(grep "PUBLIC KEY" "$CLIENT_FILE" 2>/dev/null | awk '{print $NF}')
+    FP=$(grep "FINGERPRINT" "$CLIENT_FILE" 2>/dev/null | awk '{print $NF}')
+    FP="${FP:-chrome}"
+    SERVER_IP=$(grep "SERVER IP" "$CLIENT_FILE" 2>/dev/null | awk '{print $NF}')
+    # Если IP не найден в файле — запросить у ipify
+    if [[ -z "$SERVER_IP" || "$SERVER_IP" == "ТВОЙ_IP" ]]; then
+        SERVER_IP=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || echo "SERVER_IP")
+    fi
+    ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${PATH_VAL}', safe=''))")
+
+    make_uri() {
+        local uuid="$1"
+        local comment="$2"
+        echo "vless://${uuid}@${SERVER_IP}:${PORT}?encryption=none&security=reality&sni=${SNI}&fp=${FP}&pbk=${PUBLIC_KEY}&sid=${SID}&type=xhttp&path=${ENCODED_PATH}&host=${SNI}&mode=${MODE}#${comment}"
+    }
+
+    case "${2:-}" in
+
+    --all)
+        echo -e "${BOLD}VLESS URI для всех клиентов:${NC}"
+        echo ""
+        while IFS= read -r line; do
+            UUID=$(echo "$line" | jq -r '.id')
+            COMMENT=$(echo "$line" | jq -r '.comment // "no-comment"')
+            echo -e "${CYAN}▸ ${COMMENT}${NC}"
+            make_uri "$UUID" "$COMMENT"
+            echo ""
+        done < <(jq -c '.inbounds[0].settings.clients[]' "$CONFIG")
+        ;;
+
+    "")
+        # Интерактивный выбор
+        echo -e "${BOLD}Выбери клиента:${NC}"
+        mapfile -t CLIENTS < <(jq -c '.inbounds[0].settings.clients[]' "$CONFIG")
+        for i in "${!CLIENTS[@]}"; do
+            COMMENT=$(echo "${CLIENTS[$i]}" | jq -r '.comment // "без имени"')
+            UUID=$(echo "${CLIENTS[$i]}" | jq -r '.id')
+            echo "  $((i+1))) ${COMMENT}  (${UUID:0:8}...)"
+        done
+        read -rp "Номер [Enter=1]: " CHOICE
+        CHOICE=${CHOICE:-1}
+        SELECTED="${CLIENTS[$((CHOICE-1))]}"
+        UUID=$(echo "$SELECTED" | jq -r '.id')
+        COMMENT=$(echo "$SELECTED" | jq -r '.comment // "no-comment"')
+        echo ""
+        echo -e "${CYAN}▸ ${COMMENT}${NC}"
+        make_uri "$UUID" "$COMMENT"
+        ;;
+
+    *)
+        # По имени (comment) — частичное совпадение
+        SEARCH="${2}"
+        FOUND=$(jq -c --arg s "$SEARCH" \
+          '.inbounds[0].settings.clients[] | select(.comment // "" | ascii_downcase | contains($s | ascii_downcase))' \
+          "$CONFIG")
+        if [[ -z "$FOUND" ]]; then
+            echo -e "${RED}Клиент '${SEARCH}' не найден${NC}"
+            echo -e "Доступные клиенты:"
+            jq -r '.inbounds[0].settings.clients[].comment // "без имени"' "$CONFIG" | sed 's/^/  /'
+            exit 1
+        fi
+        echo ""
+        while IFS= read -r line; do
+            UUID=$(echo "$line" | jq -r '.id')
+            COMMENT=$(echo "$line" | jq -r '.comment // "no-comment"')
+            echo -e "${CYAN}▸ ${COMMENT}${NC}"
+            make_uri "$UUID" "$COMMENT"
+            echo ""
+        done <<< "$FOUND"
+        ;;
+    esac
+    ;;
+
 # ─── Помощь ──────────────────────────────────────────────────────────────────
 *)
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════${NC}"
@@ -194,6 +279,9 @@ uuid)
     echo "  xm clients                Показать всех клиентов"
     echo "  xm add-client [имя]       Добавить клиента (генерирует UUID)"
     echo "  xm del-client             Удалить клиента"
+    echo "  xm uri                    VLESS URI — интерактивный выбор"
+    echo "  xm uri [имя]              VLESS URI — по имени клиента"
+    echo "  xm uri --all              VLESS URI — для всех клиентов"
     echo ""
     echo -e "${BOLD}Логи:${NC}"
     echo "  xm log            Последние 50 строк лога"
