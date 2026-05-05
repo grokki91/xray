@@ -33,7 +33,7 @@ header()  { echo -e "\n${BOLD}${CYAN}══════════════�
 # ─── Переменные путей ────────────────────────────────────────────────────────
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_LOG_DIR="/var/log/xray"
-CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
+CLIENT_FILE="/root/xray-client-info.txt"
 
 # =============================================================================
 # 1. ИНТЕРАКТИВНЫЙ ВВОД
@@ -304,10 +304,10 @@ success "config.json записан"
 # =============================================================================
 header "Валидация конфига"
 
-if sudo -u nobody xray -test -config "$XRAY_CONFIG" 2>&1 | grep -q "Configuration OK"; then
+if xray -test -config "$XRAY_CONFIG" 2>&1 | grep -q "Configuration OK"; then
   success "xray -test: Configuration OK"
 else
-  error "Конфиг невалиден. Проверь: sudo -u nobody xray -test -config $XRAY_CONFIG"
+  error "Конфиг невалиден. Проверь: xray -test -config $XRAY_CONFIG"
 fi
 
 # =============================================================================
@@ -452,11 +452,11 @@ systemctl status xray
 journalctl -u xray -f
 tail -50 /var/log/xray/error.log
 ss -tlnp | grep ${XRAY_PORT}
-sudo -u nobody xray -test -config /usr/local/etc/xray/config.json
+xray -test -config /usr/local/etc/xray/config.json
 openssl s_client -connect ${SERVER_IP}:${XRAY_PORT} -servername ${DEST_SNI}
 EOF
 
-chmod 644 "$CLIENT_FILE"
+chmod 600 "$CLIENT_FILE"
 success "Данные клиента сохранены: $CLIENT_FILE"
 
 # =============================================================================
