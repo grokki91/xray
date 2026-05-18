@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Xray-core · VLESS + REALITY + XHTTP  ·  Auto Setup  v4
-#  Ubuntu 22.04 LTS · Port 443 · uTLS Chrome
+#  Xray-core · VLESS + REALITY + XHTTP  ·  Auto Setup  v5
+#  Ubuntu 22.04 LTS · uTLS Chrome
 #
-#  Исправления v4:
-#   - config.json генерируется через jq (нет JSON-инъекций)
-#   - Валидация пользовательского ввода (path, SNI)
-#   - Проверка доступности dest перед записью конфига
-#   - Chrony вместо systemd-timesyncd (точный NTP, критично для REALITY)
-#   - logrotate для xray и nginx
-#   - del-client в xm удаляет по UUID, не по индексу (в xm.sh v4)
+#  Исправления v5 (относительно v4):
+#   - xm.sh автоматически копируется в /usr/local/bin/xm
+#   - SSH-порт определяется динамически (не хардкод 22)
+#   - ufw enable только ПОСЛЕ открытия SSH-порта
+#   - fail2ban logfile создаётся до старта сервиса
+#   - Защита от повторного запуска (--reinstall для принудительного)
+#   - Проверка совпадения портов XHTTP и TCP
+#   - chronyc makestep с retry-циклом
+#   - ENCODED_PATH через sys.argv (нет shell-инъекций)
 # =============================================================================
 
 set -euo pipefail
@@ -30,6 +32,24 @@ header()  { echo -e "\n${BOLD}${CYAN}══════════════�
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_LOG_DIR="/var/log/xray"
 CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
+XM_SCRIPT_SRC="$(cd "$(dirname "$0")" && pwd)/xm.sh"
+
+# =============================================================================
+# 0. ЗАЩИТА ОТ ПОВТОРНОГО ЗАПУСКА
+# =============================================================================
+if [[ -f "$XRAY_CONFIG" ]] && [[ "${1:-}" != "--reinstall" ]]; then
+  echo -e "${YELLOW}╔══════════════════════════════════════════════════════╗${NC}"
+  echo -e "${YELLOW}║  Xray уже установлен (найден $XRAY_CONFIG)  ║${NC}"
+  echo -e "${YELLOW}║  Повторный запуск сгенерирует новые ключи —         ║${NC}"
+  echo -e "${YELLOW}║  все подключённые клиенты перестанут работать!      ║${NC}"
+  echo -e "${YELLOW}╚══════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "Для принудительной переустановки запусти:"
+  echo -e "  ${BOLD}sudo bash $0 --reinstall${NC}"
+  echo ""
+  echo -e "Управление: ${BOLD}xm help${NC}  |  Диагностика: ${BOLD}xm diag${NC}"
+  exit 0
+fi
 
 # =============================================================================
 # 1. ИНТЕРАКТИВНЫЙ ВВОД
@@ -54,7 +74,6 @@ case "$SNI_CHOICE" in
   *) DEST_SNI="www.microsoft.com" ;;
 esac
 
-# Валидация SNI — только hostname символы
 if [[ ! "$DEST_SNI" =~ ^[a-zA-Z0-9._-]+$ ]]; then
   error "Недопустимые символы в SNI: $DEST_SNI"
 fi
@@ -81,7 +100,6 @@ case "$PATH_CHOICE" in
   *) XHTTP_PATH="/api/v2/assets/stream" ;;
 esac
 
-# Валидация path — запрещены кавычки, бэкслэш, управляющие символы
 if [[ "$XHTTP_PATH" =~ [\"\'\\$\`] ]] || [[ "$XHTTP_PATH" != /* ]]; then
   error "Недопустимые символы в path или path не начинается с /: $XHTTP_PATH"
 fi
@@ -135,9 +153,17 @@ DUAL_INBOUND=false
 XRAY_PORT2=8443
 if [[ "$DUAL_CHOICE" =~ ^[Yy]$ ]]; then
   DUAL_INBOUND=true
-  read -rp "Порт для TCP/XTLS-Vision [Enter=8443]: " PORT2_INPUT
-  XRAY_PORT2=${PORT2_INPUT:-8443}
-  [[ "$XRAY_PORT2" =~ ^[0-9]+$ ]] || error "Некорректный порт: $XRAY_PORT2"
+  while true; do
+    read -rp "Порт для TCP/XTLS-Vision [Enter=8443]: " PORT2_INPUT
+    XRAY_PORT2=${PORT2_INPUT:-8443}
+    [[ "$XRAY_PORT2" =~ ^[0-9]+$ ]] || { warn "Некорректный порт: $XRAY_PORT2"; continue; }
+    # Проверка совпадения портов
+    if [[ "$XRAY_PORT2" -eq "$XRAY_PORT" ]]; then
+      warn "Порт TCP ($XRAY_PORT2) совпадает с портом XHTTP ($XRAY_PORT) — выбери другой"
+      continue
+    fi
+    break
+  done
   info "Второй inbound: порт ${BOLD}$XRAY_PORT2${NC}"
 fi
 
@@ -158,7 +184,28 @@ apt-get install -y --no-install-recommends \
 success "Зависимости установлены"
 
 # =============================================================================
-# 3. NTP — CHRONY (КРИТИЧНО ДЛЯ REALITY, drift < 60 сек)
+# 3. ОПРЕДЕЛЕНИЕ SSH-ПОРТА (до UFW — критично!)
+# =============================================================================
+header "Определение SSH-порта"
+
+# Приоритет: sshd_config → активный слушатель → 22
+SSH_PORT=$(grep -E "^Port\s+[0-9]+" /etc/ssh/sshd_config 2>/dev/null \
+  | awk '{print $2}' | head -1 || echo "")
+
+if [[ -z "$SSH_PORT" ]]; then
+  SSH_PORT=$(ss -tlnp 2>/dev/null | grep sshd \
+    | awk '{print $4}' | grep -oE '[0-9]+$' | head -1 || echo "")
+fi
+
+SSH_PORT=${SSH_PORT:-22}
+
+[[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [[ "$SSH_PORT" -ge 1 ]] && [[ "$SSH_PORT" -le 65535 ]] \
+  || SSH_PORT=22
+
+info "SSH-порт: ${BOLD}$SSH_PORT${NC}"
+
+# =============================================================================
+# 4. NTP — CHRONY (КРИТИЧНО ДЛЯ REALITY, drift < 60 сек)
 # =============================================================================
 header "Настройка NTP (chrony)"
 
@@ -179,14 +226,21 @@ CHRONYEOF
 
 systemctl enable chrony
 systemctl restart chrony
-sleep 3
-chronyc makestep 2>/dev/null || true
+
+# Retry-цикл: chrony может не сразу найти источники
+info "Ожидание синхронизации времени..."
+for i in {1..10}; do
+  if chronyc makestep 2>/dev/null; then
+    break
+  fi
+  [[ $i -lt 10 ]] && sleep 2 || warn "chronyc makestep не завершился за 20 сек — продолжаем"
+done
 
 DRIFT=$(chronyc tracking 2>/dev/null | grep "System time" | awk '{print $4}' || echo "0")
 success "Chrony запущен. Дрейф: ${DRIFT} сек"
 
 # =============================================================================
-# 4. XRAY-CORE
+# 5. XRAY-CORE
 # =============================================================================
 header "Установка Xray-core"
 
@@ -194,7 +248,7 @@ bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-rele
 success "Xray: $(xray version | head -1)"
 
 # =============================================================================
-# 5. ГЕНЕРАЦИЯ КЛЮЧЕЙ
+# 6. ГЕНЕРАЦИЯ КЛЮЧЕЙ
 # =============================================================================
 header "Генерация ключей"
 
@@ -225,7 +279,7 @@ fi
 success "Ключи сгенерированы"
 
 # =============================================================================
-# 6. ПРОВЕРКА ДОСТУПНОСТИ DEST (КРИТИЧНО ДЛЯ REALITY FALLBACK)
+# 7. ПРОВЕРКА ДОСТУПНОСТИ DEST
 # =============================================================================
 header "Проверка доступности dest: $DEST_SNI"
 
@@ -243,7 +297,7 @@ else
 fi
 
 # =============================================================================
-# 7. ЛОГИ + LOGROTATE
+# 8. ЛОГИ + LOGROTATE
 # =============================================================================
 mkdir -p "$XRAY_LOG_DIR"
 chown nobody:nogroup "$XRAY_LOG_DIR"
@@ -267,7 +321,7 @@ LOGROTEOF
 success "logrotate настроен (14 дней)"
 
 # =============================================================================
-# 8. NGINX FALLBACK
+# 9. NGINX FALLBACK
 # =============================================================================
 header "Настройка Nginx fallback"
 
@@ -329,14 +383,18 @@ nginx -t && systemctl enable nginx && systemctl restart nginx
 success "Nginx fallback настроен"
 
 # =============================================================================
-# 9. FAIL2BAN
+# 10. FAIL2BAN
 # =============================================================================
 header "Настройка fail2ban"
 
-cat > /etc/fail2ban/jail.d/sshd-xray.conf <<'F2BEOF'
+# Создаём лог-файлы заранее — fail2ban не стартует jail если файл отсутствует
+touch /var/log/nginx/fallback_access.log
+chown www-data:www-data /var/log/nginx/fallback_access.log
+
+cat > /etc/fail2ban/jail.d/sshd-xray.conf <<EOF
 [sshd]
 enabled  = true
-port     = ssh
+port     = ${SSH_PORT}
 filter   = sshd
 logpath  = /var/log/auth.log
 maxretry = 5
@@ -352,7 +410,7 @@ logpath  = /var/log/nginx/fallback_access.log
 maxretry = 20
 findtime = 60
 bantime  = 1800
-F2BEOF
+EOF
 
 mkdir -p /etc/fail2ban/filter.d
 cat > /etc/fail2ban/filter.d/nginx-4xx.conf <<'F2BFEOF'
@@ -363,14 +421,13 @@ F2BFEOF
 
 systemctl enable fail2ban
 systemctl restart fail2ban
-success "fail2ban настроен"
+success "fail2ban настроен (SSH на порту $SSH_PORT)"
 
 # =============================================================================
-# 10. CONFIG.JSON — ГЕНЕРАЦИЯ ЧЕРЕЗ JQ (нет JSON-инъекций)
+# 11. CONFIG.JSON — ГЕНЕРАЦИЯ ЧЕРЕЗ JQ
 # =============================================================================
 header "Запись конфигурации Xray"
 
-# Строим XHTTP inbound полностью через jq
 XHTTP_INBOUND=$(jq -n \
   --arg     uuid       "$USER_UUID" \
   --arg     privKey    "$PRIVATE_KEY" \
@@ -487,7 +544,7 @@ jq -n \
 success "config.json записан (через jq, без возможности инъекций)"
 
 # =============================================================================
-# 11. ВАЛИДАЦИЯ
+# 12. ВАЛИДАЦИЯ КОНФИГА
 # =============================================================================
 header "Валидация конфига"
 
@@ -498,13 +555,14 @@ else
 fi
 
 # =============================================================================
-# 12. FIREWALL
+# 13. FIREWALL (UFW)
 # =============================================================================
 header "Настройка UFW"
 
-ufw allow 22/tcp              comment 'SSH'        2>/dev/null || true
-ufw allow 80/tcp              comment 'HTTP->HTTPS' 2>/dev/null || true
-ufw allow "${XRAY_PORT}/tcp"  comment 'Xray XHTTP' 2>/dev/null || true
+# SSH открываем ПЕРВЫМ — до enable, чтобы не потерять сессию
+ufw allow "${SSH_PORT}/tcp"   comment 'SSH'         2>/dev/null || true
+ufw allow 80/tcp              comment 'HTTP->HTTPS'  2>/dev/null || true
+ufw allow "${XRAY_PORT}/tcp"  comment 'Xray XHTTP'  2>/dev/null || true
 $DUAL_INBOUND && ufw allow "${XRAY_PORT2}/tcp" comment 'Xray TCP' 2>/dev/null || true
 
 if ! ufw status | grep -q "Status: active"; then
@@ -515,7 +573,7 @@ fi
 ufw status numbered
 
 # =============================================================================
-# 13. SYSTEMD
+# 14. SYSTEMD
 # =============================================================================
 header "Запуск сервиса"
 
@@ -533,13 +591,37 @@ ss -tlnp | grep -q ":${XRAY_PORT}" \
   || warn "Порт ${XRAY_PORT} не найден — проверь вручную"
 
 # =============================================================================
-# 14. IP + ДАННЫЕ КЛИЕНТА
+# 15. УСТАНОВКА xm В PATH
+# =============================================================================
+header "Установка xm (Xray Manager)"
+
+XM_TARGET="/usr/local/bin/xm"
+
+if [[ -f "$XM_SCRIPT_SRC" ]]; then
+  cp "$XM_SCRIPT_SRC" "$XM_TARGET"
+  chmod +x "$XM_TARGET"
+  success "xm установлен: $XM_TARGET"
+elif [[ -f "$(dirname "$0")/xm.sh" ]]; then
+  cp "$(dirname "$0")/xm.sh" "$XM_TARGET"
+  chmod +x "$XM_TARGET"
+  success "xm установлен: $XM_TARGET"
+else
+  warn "xm.sh не найден рядом с setup.sh"
+  warn "Скопируй xm.sh вручную: cp xm.sh /usr/local/bin/xm && chmod +x /usr/local/bin/xm"
+fi
+
+# =============================================================================
+# 16. IP + ДАННЫЕ КЛИЕНТА
 # =============================================================================
 SERVER_IP=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
          || curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null \
          || echo "ТВОЙ_IP")
 
-ENCODED_PATH=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${XHTTP_PATH}', safe=''))")
+# Безопасное URL-кодирование через sys.argv (нет shell-инъекций)
+ENCODED_PATH=$(python3 -c \
+  "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
+  "$XHTTP_PATH")
+
 VLESS_URI_XHTTP="vless://${USER_UUID}@${SERVER_IP}:${XRAY_PORT}?encryption=none&security=reality&sni=${DEST_SNI}&fp=${UTLS_FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID_1}&type=xhttp&path=${ENCODED_PATH}&host=${DEST_SNI}&mode=${XHTTP_MODE}#MyServer-XHTTP"
 
 TCP_SECTION=""
@@ -561,7 +643,7 @@ header "Сохранение данных для клиентов"
 mkdir -p "$(dirname "$CLIENT_FILE")"
 cat > "$CLIENT_FILE" <<EOF
 ═══════════════════════════════════════════════════════
-  Xray VLESS+REALITY+XHTTP · Client Info v4
+  Xray VLESS+REALITY+XHTTP · Client Info v5
   Сгенерировано: $(date)
 ═══════════════════════════════════════════════════════
 SERVER IP    : ${SERVER_IP}
@@ -573,6 +655,7 @@ SNI          : ${DEST_SNI}
 PATH         : ${XHTTP_PATH}
 MODE         : ${XHTTP_MODE}
 FINGERPRINT  : ${UTLS_FP}
+SSH PORT     : ${SSH_PORT}
 
 ALL SHORT IDs (XHTTP):
   ${SHORT_ID_1}
@@ -602,13 +685,18 @@ sing-box JSON (XHTTP):
   }
 }
 ${TCP_SECTION}
+
+───────────────────────────────────────────────────────
+ВНИМАНИЕ: этот файл содержит приватный ключ REALITY.
+Передавай только по защищённому каналу (scp, age и т.п.)
+───────────────────────────────────────────────────────
 EOF
 
 chmod 600 "$CLIENT_FILE"
 success "Данные клиента: $CLIENT_FILE"
 
 # =============================================================================
-# 15. ИТОГ
+# 17. ИТОГ
 # =============================================================================
 header "✅ Установка завершена"
 
@@ -620,6 +708,7 @@ echo -e "${BOLD}SNI:${NC}         ${DEST_SNI}"
 echo -e "${BOLD}Path:${NC}        ${XHTTP_PATH}"
 echo -e "${BOLD}Mode:${NC}        ${XHTTP_MODE}"
 echo -e "${BOLD}uTLS FP:${NC}     ${UTLS_FP}"
+echo -e "${BOLD}SSH порт:${NC}    ${SSH_PORT}"
 if $DUAL_INBOUND; then
   echo -e "${BOLD}TCP порт:${NC}    ${XRAY_PORT2}  |  PubKey: ${PUBLIC_KEY2}"
 fi
@@ -643,3 +732,6 @@ chronyc tracking 2>/dev/null | grep "System time" | sed 's/^/  /' || echo "  (с
 echo ""
 echo -e "${YELLOW}Диагностика сервера: ${BOLD}xm diag${NC}"
 echo -e "${YELLOW}Данные клиента:      ${BOLD}cat $CLIENT_FILE${NC}"
+echo ""
+echo -e "${YELLOW}⚠  $CLIENT_FILE содержит приватный ключ REALITY.${NC}"
+echo -e "${YELLOW}   Передавай только по защищённому каналу!${NC}"
