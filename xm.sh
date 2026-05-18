@@ -40,7 +40,8 @@ sep()  { echo -e "${CYAN}──────────────────�
 # ─── Вспомогательные ─────────────────────────────────────────────────────────
 _get_pubkey() {
   local label="${1:-PUBLIC KEY}"
-  grep "^${label}" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]'
+  # Пробел после label предотвращает совпадение "PUBLIC KEY" с "PUBLIC KEY2"
+  grep "^${label} " "$CLIENT_FILE" 2>/dev/null | head -1 | awk -F': ' '{print $2}' | tr -d '[:space:]'
 }
 
 _get_server_ip() {
