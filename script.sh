@@ -12,6 +12,10 @@
 #   - Проверка совпадения портов XHTTP и TCP
 #   - chronyc makestep с retry-циклом
 #   - ENCODED_PATH через sys.argv (нет shell-инъекций)
+#
+#  Исправления v5.1:
+#   - Надёжный парсинг ключей xray x25519 (поддержка всех версий Xray)
+#   - Валидация длины публичного ключа перед записью в URI
 # =============================================================================
 
 set -euo pipefail
@@ -33,6 +37,29 @@ XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_LOG_DIR="/var/log/xray"
 CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
 XM_SCRIPT_SRC="$(cd "$(dirname "$0")" && pwd)/xm.sh"
+
+# =============================================================================
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: надёжный парсинг ключей xray x25519
+# Поддерживает все известные форматы вывода Xray:
+#   "Private key: xxx"  /  "PrivateKey: xxx"
+#   "Public key: xxx"   /  "Password (PublicKey): xxx"  /  "PublicKey: xxx"
+# =============================================================================
+_parse_xray_keys() {
+  local output="$1"
+  # Извлекаем приватный ключ: берём последнее слово строки,
+  # содержащей "rivate" (покрывает "Private key", "PrivateKey" и т.п.)
+  PRIVATE_KEY=$(echo "$output" | grep -i "rivate" | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+  # Извлекаем публичный ключ: строка содержит "ublic" (Public key / PublicKey / Password(PublicKey))
+  PUBLIC_KEY=$(echo "$output"  | grep -i "ublic"  | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+
+  # Валидация: ключ X25519 в base64url — 43 символа
+  if [[ ${#PRIVATE_KEY} -lt 30 ]]; then
+    error "Не удалось распарсить PrivateKey (длина ${#PRIVATE_KEY}).\nВывод xray x25519:\n$output"
+  fi
+  if [[ ${#PUBLIC_KEY} -lt 30 ]]; then
+    error "Не удалось распарсить PublicKey (длина ${#PUBLIC_KEY}).\nВывод xray x25519:\n$output"
+  fi
+}
 
 # =============================================================================
 # 0. ЗАЩИТА ОТ ПОВТОРНОГО ЗАПУСКА
@@ -157,7 +184,6 @@ if [[ "$DUAL_CHOICE" =~ ^[Yy]$ ]]; then
     read -rp "Порт для TCP/XTLS-Vision [Enter=8443]: " PORT2_INPUT
     XRAY_PORT2=${PORT2_INPUT:-8443}
     [[ "$XRAY_PORT2" =~ ^[0-9]+$ ]] || { warn "Некорректный порт: $XRAY_PORT2"; continue; }
-    # Проверка совпадения портов
     if [[ "$XRAY_PORT2" -eq "$XRAY_PORT" ]]; then
       warn "Порт TCP ($XRAY_PORT2) совпадает с портом XHTTP ($XRAY_PORT) — выбери другой"
       continue
@@ -188,7 +214,6 @@ success "Зависимости установлены"
 # =============================================================================
 header "Определение SSH-порта"
 
-# Приоритет: sshd_config → активный слушатель → 22
 SSH_PORT=$(grep -E "^Port\s+[0-9]+" /etc/ssh/sshd_config 2>/dev/null \
   | awk '{print $2}' | head -1 || echo "")
 
@@ -205,7 +230,7 @@ SSH_PORT=${SSH_PORT:-22}
 info "SSH-порт: ${BOLD}$SSH_PORT${NC}"
 
 # =============================================================================
-# 4. NTP — CHRONY (КРИТИЧНО ДЛЯ REALITY, drift < 60 сек)
+# 4. NTP — CHRONY
 # =============================================================================
 header "Настройка NTP (chrony)"
 
@@ -227,7 +252,6 @@ CHRONYEOF
 systemctl enable chrony
 systemctl restart chrony
 
-# Retry-цикл: chrony может не сразу найти источники
 info "Ожидание синхронизации времени..."
 for i in {1..10}; do
   if chronyc makestep 2>/dev/null; then
@@ -255,11 +279,13 @@ header "Генерация ключей"
 USER_UUID=$(xray uuid)
 info "UUID: $USER_UUID"
 
+# Используем надёжный парсинг — поддерживает все версии Xray
 KEY_OUTPUT=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEY_OUTPUT" | awk '/PrivateKey:|Private key:/ {print $NF}')
-PUBLIC_KEY=$(echo  "$KEY_OUTPUT" | awk '/Password \(PublicKey\):|Public key:/ {print $NF}')
-[[ -z "$PRIVATE_KEY" ]] && error "Не удалось получить PrivateKey.\n$KEY_OUTPUT"
-[[ -z "$PUBLIC_KEY"  ]] && error "Не удалось получить PublicKey.\n$KEY_OUTPUT"
+info "Вывод xray x25519 (для отладки):"
+echo "$KEY_OUTPUT" | sed 's/^/  /'
+
+_parse_xray_keys "$KEY_OUTPUT"
+# После вызова PRIVATE_KEY и PUBLIC_KEY установлены и провалидированы
 
 SHORT_ID_1=$(openssl rand -hex 8)
 SHORT_ID_2=$(openssl rand -hex 8)
@@ -269,8 +295,12 @@ info "ShortIds: $SHORT_ID_1 / $SHORT_ID_2 / $SHORT_ID_3"
 
 if $DUAL_INBOUND; then
   KEY_OUTPUT2=$(xray x25519)
-  PRIVATE_KEY2=$(echo "$KEY_OUTPUT2" | awk '/PrivateKey:|Private key:/ {print $NF}')
-  PUBLIC_KEY2=$(echo  "$KEY_OUTPUT2" | awk '/Password \(PublicKey\):|Public key:/ {print $NF}')
+  # Временно переименуем чтобы не затереть первую пару
+  _parse_xray_keys "$KEY_OUTPUT2"
+  PRIVATE_KEY2="$PRIVATE_KEY"
+  PUBLIC_KEY2="$PUBLIC_KEY"
+  # Восстанавливаем первую пару из вывода
+  _parse_xray_keys "$KEY_OUTPUT"
   SHORT_ID_TCP_1=$(openssl rand -hex 8)
   SHORT_ID_TCP_2=$(openssl rand -hex 4)
   info "TCP Public key: $PUBLIC_KEY2"
@@ -387,7 +417,6 @@ success "Nginx fallback настроен"
 # =============================================================================
 header "Настройка fail2ban"
 
-# Создаём лог-файлы заранее — fail2ban не стартует jail если файл отсутствует
 touch /var/log/nginx/fallback_access.log
 chown www-data:www-data /var/log/nginx/fallback_access.log
 
@@ -424,7 +453,7 @@ systemctl restart fail2ban
 success "fail2ban настроен (SSH на порту $SSH_PORT)"
 
 # =============================================================================
-# 11. CONFIG.JSON — ГЕНЕРАЦИЯ ЧЕРЕЗ JQ
+# 11. CONFIG.JSON
 # =============================================================================
 header "Запись конфигурации Xray"
 
@@ -541,7 +570,7 @@ jq -n \
     }
   }' > "$XRAY_CONFIG"
 
-success "config.json записан (через jq, без возможности инъекций)"
+success "config.json записан"
 
 # =============================================================================
 # 12. ВАЛИДАЦИЯ КОНФИГА
@@ -559,7 +588,6 @@ fi
 # =============================================================================
 header "Настройка UFW"
 
-# SSH открываем ПЕРВЫМ — до enable, чтобы не потерять сессию
 ufw allow "${SSH_PORT}/tcp"   comment 'SSH'         2>/dev/null || true
 ufw allow 80/tcp              comment 'HTTP->HTTPS'  2>/dev/null || true
 ufw allow "${XRAY_PORT}/tcp"  comment 'Xray XHTTP'  2>/dev/null || true
@@ -617,7 +645,6 @@ SERVER_IP=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
          || curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null \
          || echo "ТВОЙ_IP")
 
-# Безопасное URL-кодирование через sys.argv (нет shell-инъекций)
 ENCODED_PATH=$(python3 -c \
   "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
   "$XHTTP_PATH")
@@ -641,21 +668,23 @@ fi
 
 header "Сохранение данных для клиентов"
 mkdir -p "$(dirname "$CLIENT_FILE")"
+# ВАЖНО: метки записаны БЕЗ пробела перед двоеточием,
+# чтобы _get_pubkey в xm.sh мог их надёжно найти по паттерну "^LABEL:"
 cat > "$CLIENT_FILE" <<EOF
 ═══════════════════════════════════════════════════════
-  Xray VLESS+REALITY+XHTTP · Client Info v5
+  Xray VLESS+REALITY+XHTTP · Client Info v5.1
   Сгенерировано: $(date)
 ═══════════════════════════════════════════════════════
-SERVER IP    : ${SERVER_IP}
-PORT         : ${XRAY_PORT}
-UUID         : ${USER_UUID}
-PUBLIC KEY   : ${PUBLIC_KEY}
-SHORT ID     : ${SHORT_ID_1}
-SNI          : ${DEST_SNI}
-PATH         : ${XHTTP_PATH}
-MODE         : ${XHTTP_MODE}
-FINGERPRINT  : ${UTLS_FP}
-SSH PORT     : ${SSH_PORT}
+SERVER IP: ${SERVER_IP}
+PORT: ${XRAY_PORT}
+UUID: ${USER_UUID}
+PUBLIC KEY: ${PUBLIC_KEY}
+SHORT ID: ${SHORT_ID_1}
+SNI: ${DEST_SNI}
+PATH: ${XHTTP_PATH}
+MODE: ${XHTTP_MODE}
+FINGERPRINT: ${UTLS_FP}
+SSH PORT: ${SSH_PORT}
 
 ALL SHORT IDs (XHTTP):
   ${SHORT_ID_1}
