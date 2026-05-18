@@ -1,178 +1,184 @@
-# Xray VLESS+REALITY+XHTTP — Инструкция
+# Xray VLESS+REALITY+XHTTP — Auto Setup
 
-Два файла которые тебе нужны:
-- `xray-setup.sh` — установка сервера (запускается один раз на новом VPS)
-- `xm.sh` — менеджер для управления сервером после установки
+Автоматическая установка Xray-core с VLESS+REALITY+XHTTP на Ubuntu 22.04.  
+После установки доступен менеджер `xm` для управления сервером.
 
 ---
 
-## Новый VPS — с нуля
+## Требования
 
-### 1. Залить скрипты на сервер
+- Ubuntu 22.04 LTS (чистый VPS)
+- Пользователь с `sudo` или root
+- SSH настроен, вход по root отключён
+
+---
+
+## Быстрый старт
+
+### 1. Подготовка VPS (если не сделано)
 
 ```bash
-scp xray-setup.sh xm.sh user@IP:/tmp/
+# Создать пользователя
+adduser deploy
+usermod -aG sudo deploy
+
+# Скопировать SSH-ключ на нового пользователя
+rsync --archive --chown=deploy:deploy ~/.ssh /home/deploy
+
+# Отредактировать sshd_config
+nano /etc/ssh/sshd_config
 ```
 
-### 2. Подключиться и войти в root
+Установить в `sshd_config`:
+```
+Port 2222              # любой нестандартный порт
+PermitRootLogin no
+PasswordAuthentication no
+```
 
 ```bash
-ssh user@IP
-sudo -i
+systemctl restart sshd
+# Проверить новый порт в отдельном терминале, не закрывая текущую сессию!
+```
+
+### 2. Загрузить скрипты
+
+```bash
+# Оба файла должны лежать в одной папке
+scp -P 2222 setup.sh xm.sh deploy@YOUR_IP:~
 ```
 
 ### 3. Запустить установку
 
 ```bash
-bash /tmp/xray-setup.sh
+ssh -p 2222 deploy@YOUR_IP
+sudo bash setup.sh
 ```
 
-Скрипт интерактивный — задаст вопросы:
+Скрипт задаст несколько вопросов интерактивно:
 
-| Вопрос | Рекомендация |
-|--------|-------------|
-| SNI / dest домен | `www.microsoft.com` (вариант 1) |
-| HTTP path | `/api/v2/assets/stream` (вариант 1) |
-| Режим XHTTP | `auto` (вариант 1) |
-| uTLS fingerprint | `chrome` (вариант 1) |
-| Порт | `443` (Enter) |
+| Параметр | Описание | Рекомендация |
+|---|---|---|
+| SNI / dest | Домен-«маскировка» для REALITY | `www.microsoft.com` |
+| HTTP path | Путь XHTTP | любой из списка |
+| Режим XHTTP | `auto` или `stream-one` | `auto` |
+| uTLS fingerprint | Имитация браузера | `chrome` |
+| Порт XHTTP | Основной порт | `443` |
+| TCP inbound | Второй inbound XTLS-Vision | по желанию |
 
-После установки на экране появится VLESS URI — скопируй его сразу.
+По окончании скрипт выведет VLESS URI для импорта в клиент.  
+Все данные сохраняются в `/usr/local/etc/xray/client-info.txt`.
 
-### 4. Установить менеджер xm
+> ⚠️ `client-info.txt` содержит приватный ключ REALITY — передавай только по защищённому каналу.
+
+---
+
+## Повторная установка
+
+Если Xray уже установлен, скрипт остановится с предупреждением.  
+Для полного переустановки (сгенерирует новые ключи, старые клиенты перестанут работать):
 
 ```bash
-mv /tmp/xm.sh /usr/local/bin/xm
-chmod +x /usr/local/bin/xm
+sudo bash setup.sh --reinstall
 ```
 
 ---
 
-## Подключение клиентов
+## Управление: xm
 
-### Android (v2rayNG)
-1. Google Play → установить **v2rayNG**
-2. Нажать `+` → "Import config from clipboard"
-3. Вставить VLESS URI
+После установки доступна команда `xm`. Запускать от root или через `sudo`.
 
-### Windows (Hiddify)
-1. Скачать с [github.com/hiddify/hiddify-next/releases](https://github.com/hiddify/hiddify-next/releases)
-2. Нажать `+` → "Буфер обмена"
-3. Вставить VLESS URI
-
-### Получить VLESS URI в любой момент
+### Сервис
 
 ```bash
-xm uri              # интерактивный выбор клиента
-xm uri имя          # по имени (например: xm uri pavel)
-xm uri --all        # все клиенты сразу
+xm start / stop / restart / status
+```
+
+### Клиенты
+
+```bash
+xm clients                  # показать всех клиентов
+xm add-client [имя]         # добавить клиента
+xm del-client               # удалить клиента по UUID
+xm uri                      # получить VLESS URI (интерактивный выбор)
+xm uri --all                # URI всех клиентов сразу
+xm uri --tcp                # URI для TCP inbound
+xm uri [имя]                # URI по имени клиента
+```
+
+### Второй inbound (XTLS-Vision/TCP)
+
+```bash
+xm add-tcp                  # добавить TCP inbound с новыми ключами
+```
+
+Клиенты из XHTTP inbound копируются автоматически.
+
+### Конфиг и бэкапы
+
+```bash
+xm edit                     # открыть конфиг в nano (автобэкап перед открытием)
+xm test                     # проверить валидность конфига
+xm apply                    # проверить + перезапустить xray
+xm backup                   # создать бэкап вручную
+xm restore                  # восстановить из бэкапа
+xm backups                  # список бэкапов
+```
+
+### Диагностика
+
+```bash
+xm diag                     # полная диагностика — запускай первым при проблемах
+xm diag-dpi                 # устойчивость к DPI и активным зондам
+xm diag-ntp                 # синхронизация времени (критично для REALITY)
+xm diag-ports               # открытые порты и слушатели
+xm diag-tls                 # TLS сертификат и fingerprint
+xm diag-fw                  # firewall и статус банов
+xm diag-log                 # анализ лога на ошибки
+```
+
+### Прочее
+
+```bash
+xm log                      # последние 50 строк лога xray
+xm log-live                 # лог в реальном времени
+xm ban-list                 # забаненные IP (SSH + nginx)
+xm unban 1.2.3.4            # разбанить IP
+xm nginx-probes             # топ IP, стучащихся в nginx (потенциальные зонды)
+xm info                     # сводная информация о сервере
+xm paths                    # пути ко всем файлам конфигурации
 ```
 
 ---
 
-## Управление клиентами
+## Что устанавливается
 
-```bash
-# Посмотреть всех клиентов
-xm clients
+| Компонент | Назначение |
+|---|---|
+| **Xray-core** | Прокси-сервер VLESS+REALITY+XHTTP |
+| **Nginx** | Fallback на порту 80/8080 (маскировка) |
+| **fail2ban** | Защита SSH и nginx от брутфорса |
+| **chrony** | Точная синхронизация времени (NTP) |
+| **UFW** | Файрвол |
+| **xm** | Менеджер в `/usr/local/bin/xm` |
 
-# Добавить нового клиента (сразу выдаст VLESS URI)
-xm add-client "имя"
+Конфиги и данные:
 
-# Удалить клиента
-xm del-client
 ```
-
-Каждый клиент получает свой уникальный UUID. Всё остальное в URI одинаковое.
-
----
-
-## Управление сервисом
-
-```bash
-xm status       # статус — работает ли xray
-xm restart      # перезапустить
-xm start        # запустить
-xm stop         # остановить
+/usr/local/etc/xray/config.json          — конфиг Xray
+/usr/local/etc/xray/client-info.txt      — данные клиентов и ключи
+/usr/local/etc/xray/backups/             — автоматические бэкапы
+/var/log/xray/error.log                  — лог Xray
 ```
 
 ---
 
-## Редактирование конфига
+## Клиентские приложения
 
-```bash
-xm edit         # открыть в nano (автоматически создаст бэкап перед открытием)
-xm test         # проверить валидность конфига
-xm apply        # проверить + перезапустить одной командой
-```
+| Приложение | Платформа |
+|---|---|
+| [Hiddify](https://github.com/hiddify/hiddify-app) | Windows / macOS / Linux / Android / iOS |
+| [v2rayNG](https://github.com/2dust/v2rayng) | Android |
+| [Streisand](https://github.com/nthinyane/streisand-ios) | iOS |
 
-> ⚠️ Всегда используй `xm edit` вместо `nano /usr/local/etc/xray/config.json` напрямую — он делает бэкап автоматически.
-
----
-
-## Бэкапы конфига
-
-```bash
-xm backup       # создать бэкап вручную
-xm backups      # список всех бэкапов
-xm restore      # восстановить из бэкапа (интерактивный выбор)
-```
-
-Бэкапы хранятся в `/usr/local/etc/xray/backups/` с именем вида `config_20250503_142315.json`.
-
----
-
-## Логи и диагностика
-
-```bash
-xm log          # последние 50 строк лога
-xm log-live     # лог в реальном времени (выход: Ctrl+C)
-xm info         # общая сводка: версия, статус, порт, кол-во клиентов
-xm paths        # все важные пути одним взглядом
-```
-
----
-
-## Важные файлы на сервере
-
-| Файл | Назначение |
-|------|-----------|
-| `/usr/local/etc/xray/config.json` | Основной конфиг Xray |
-| `/usr/local/etc/xray/client-info.txt` | Ключи и URI для клиентов |
-| `/usr/local/etc/xray/backups/` | Бэкапы конфига |
-| `/var/log/xray/error.log` | Лог ошибок |
-| `/usr/local/bin/xm` | Менеджер xm |
-
----
-
-## Проверка что всё работает
-
-```bash
-# Сервис запущен и порт слушается
-xm info
-
-# Подключись с клиента и открой:
-# https://2ip.ru          — должен показать IP твоего VPS
-# https://dnsleaktest.com — Extended test, DNS не должен утекать
-
-# Сертификат выглядит как Microsoft (магия REALITY):
-openssl s_client -connect IP:443 -servername www.microsoft.com 2>/dev/null | grep "CN="
-```
-
----
-
-## Если что-то пошло не так
-
-```bash
-# Посмотреть ошибки
-xm log
-
-# Проверить конфиг
-xm test
-
-# Откатить конфиг
-xm restore
-
-# Полный перезапуск
-xm apply
-```
+Импортируй VLESS URI из вывода `xm uri` или из `client-info.txt`.
