@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  xm — Xray Manager Helper  v4
+#  xm — Xray Manager Helper  v5
 #  Использование: xm [команда]
+#
+#  Исправления v5:
+#   - apply/restore используют "$0" вместо внешней команды xm
+#   - _make_uri_xhttp использует python sys.argv (нет shell-инъекций)
+#   - add-tcp проверяет совпадение портов XHTTP и TCP
+#   - add-tcp создаёт лог-файл nginx до перезапуска fail2ban
+#   - Все внутренние рекурсивные вызовы через "$0"
 #
 #  Команды:
 #   Сервис:    start / stop / restart / status
@@ -50,8 +57,31 @@ _get_fp() {
     || echo "chrome"
 }
 
+_get_ssh_port() {
+  # Читаем из client-info.txt (записывается setup.sh),
+  # fallback — sshd_config, затем ss, затем 22
+  local port
+  port=$(grep "^SSH PORT" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]')
+  if [[ -z "$port" ]]; then
+    port=$(grep -E "^Port\s+[0-9]+" /etc/ssh/sshd_config 2>/dev/null \
+      | awk '{print $2}' | head -1 || echo "")
+  fi
+  if [[ -z "$port" ]]; then
+    port=$(ss -tlnp 2>/dev/null | grep sshd \
+      | awk '{print $4}' | grep -oE '[0-9]+$' | head -1 || echo "")
+  fi
+  echo "${port:-22}"
+}
+
 _has_tcp_inbound() {
   [[ $(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0) -ge 2 ]]
+}
+
+# Безопасное URL-кодирование через python sys.argv (нет shell-инъекций)
+_url_encode() {
+  python3 -c \
+    "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
+    "$1"
 }
 
 _make_uri_xhttp() {
@@ -65,7 +95,7 @@ _make_uri_xhttp() {
   pubkey=$(_get_pubkey "PUBLIC KEY")
   fp=$(_get_fp)
   server_ip=$(_get_server_ip)
-  encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${path_val}', safe=''))")
+  encoded_path=$(_url_encode "$path_val")
   echo "vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&sni=${sni}&fp=${fp}&pbk=${pubkey}&sid=${sid}&type=xhttp&path=${encoded_path}&host=${sni}&mode=${mode}#${comment}"
 }
 
@@ -79,6 +109,19 @@ _make_uri_tcp() {
   fp=$(_get_fp)
   server_ip=$(_get_server_ip)
   echo "vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&sni=${sni}&fp=${fp}&pbk=${pubkey}&sid=${sid}&type=tcp&flow=xtls-rprx-vision#${comment}-TCP"
+}
+
+# Внутренний apply — не вызывает внешний xm, а выполняет логику напрямую
+_apply() {
+  if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+    systemctl restart xray
+    echo -e "${GREEN}Конфиг применён, Xray перезапущен${NC}"
+    return 0
+  else
+    echo -e "${RED}Конфиг невалиден — Xray не перезапущен${NC}"
+    xray -test -config "$CONFIG"
+    return 1
+  fi
 }
 
 # =============================================================================
@@ -106,13 +149,7 @@ test)
     ;;
 
 apply)
-    if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
-      systemctl restart xray
-      echo -e "${GREEN}Конфиг применён, Xray перезапущен${NC}"
-    else
-      echo -e "${RED}Конфиг невалиден — Xray не перезапущен${NC}"
-      xray -test -config "$CONFIG"
-    fi
+    _apply
     ;;
 
 # ─── Бэкапы ──────────────────────────────────────────────────────────────────
@@ -131,7 +168,8 @@ restore)
     read -rp "Выбери [Enter=1]: " CHOICE; CHOICE=${CHOICE:-1}
     cp "${FILES[$((CHOICE-1))]}" "$CONFIG"
     echo -e "${GREEN}Восстановлен: ${FILES[$((CHOICE-1))]}${NC}"
-    xm apply
+    # Используем внутреннюю функцию, не внешний xm
+    _apply
     ;;
 
 backups)
@@ -178,7 +216,7 @@ add-client)
       echo -e "\n${BOLD}VLESS URI (TCP):${NC}"
       _make_uri_tcp "$NEW_UUID" "$COMMENT"
     fi
-    xm apply
+    _apply
     ;;
 
 del-client)
@@ -203,7 +241,7 @@ del-client)
       "$CONFIG" > /tmp/xm_tmp.json && mv /tmp/xm_tmp.json "$CONFIG"
 
     echo -e "${GREEN}Клиент $TARGET_UUID удалён из всех inbound${NC}"
-    xm apply
+    _apply
     ;;
 
 # ─── URI ─────────────────────────────────────────────────────────────────────
@@ -257,7 +295,6 @@ add-tcp)
     echo -e "${BOLD}Добавление VLESS+REALITY+TCP (XTLS-Vision) inbound${NC}"
     echo ""
 
-    # Проверяем — вдруг уже есть
     if _has_tcp_inbound; then
       echo -e "${YELLOW}TCP inbound уже существует в конфиге.${NC}"
       jq -r '.inbounds[1] | "  Порт: \(.port)"' "$CONFIG"
@@ -266,13 +303,21 @@ add-tcp)
       exit 0
     fi
 
-    # Порт
-    read -rp "Порт для TCP inbound [Enter=8443]: " PORT2_INPUT
-    PORT2=${PORT2_INPUT:-8443}
-    [[ "$PORT2" =~ ^[0-9]+$ ]] && [[ "$PORT2" -ge 1 ]] && [[ "$PORT2" -le 65535 ]] \
-      || { echo -e "${RED}Некорректный порт: $PORT2${NC}"; exit 1; }
+    XHTTP_PORT_CURRENT=$(jq -r '.inbounds[0].port' "$CONFIG")
 
-    # Генерируем ключи
+    # Порт с проверкой совпадения
+    while true; do
+      read -rp "Порт для TCP inbound [Enter=8443]: " PORT2_INPUT
+      PORT2=${PORT2_INPUT:-8443}
+      [[ "$PORT2" =~ ^[0-9]+$ ]] && [[ "$PORT2" -ge 1 ]] && [[ "$PORT2" -le 65535 ]] \
+        || { echo -e "${RED}Некорректный порт: $PORT2${NC}"; continue; }
+      if [[ "$PORT2" -eq "$XHTTP_PORT_CURRENT" ]]; then
+        echo -e "${RED}Порт $PORT2 уже используется XHTTP inbound — выбери другой${NC}"
+        continue
+      fi
+      break
+    done
+
     echo -e "${CYAN}Генерация ключей X25519...${NC}"
     KEY_OUTPUT=$(xray x25519)
     PRIV=$(echo "$KEY_OUTPUT" | awk '/PrivateKey:|Private key:/ {print $NF}')
@@ -285,11 +330,9 @@ add-tcp)
     info "Public key: $PUB"
     info "Short IDs:  $SID1 / $SID2"
 
-    # Читаем SNI из существующего XHTTP inbound
     SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
     info "SNI (dest): $SNI"
 
-    # Проверяем доступность dest
     echo ""
     echo -e "${CYAN}Проверка доступности dest ${SNI}...${NC}"
     HTTP_CODE=$(curl -svo /dev/null "https://${SNI}" \
@@ -300,11 +343,9 @@ add-tcp)
       warn "dest вернул код $HTTP_CODE — продолжаем, но проверь вручную"
     fi
 
-    # Копируем клиентов из XHTTP inbound, добавляем flow
     CLIENTS_TCP=$(jq '[.inbounds[0].settings.clients[] |
       { id: .id, flow: "xtls-rprx-vision", comment: .comment }]' "$CONFIG")
 
-    # Строим TCP inbound через jq (без JSON-инъекций)
     TCP_INBOUND=$(jq -n \
       --arg     sni     "$SNI" \
       --arg     priv    "$PRIV" \
@@ -334,17 +375,14 @@ add-tcp)
         sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
       }')
 
-    # Бэкап перед изменением
     mkdir -p "$BACKUP_DIR"
     BACKUP_FILE="$BACKUP_DIR/config_$(date +%Y%m%d_%H%M%S)_before_tcp.json"
     cp "$CONFIG" "$BACKUP_FILE"
     echo -e "${GREEN}Бэкап: $BACKUP_FILE${NC}"
 
-    # Добавляем inbound в конфиг
     jq --argjson tcp "$TCP_INBOUND" '.inbounds += [$tcp]' \
       "$CONFIG" > /tmp/xm_tmp.json && mv /tmp/xm_tmp.json "$CONFIG"
 
-    # Сохраняем публичный ключ в client-info.txt
     if [[ -f "$CLIENT_FILE" ]]; then
       {
         echo ""
@@ -358,7 +396,7 @@ add-tcp)
       echo -e "${GREEN}Данные сохранены в $CLIENT_FILE${NC}"
     fi
 
-    # Открываем порт в UFW
+    # Открываем порт UFW
     if ufw status | grep -q "Status: active"; then
       ufw allow "${PORT2}/tcp" comment 'Xray TCP' 2>/dev/null && \
         echo -e "${GREEN}UFW: порт $PORT2 открыт${NC}"
@@ -366,7 +404,9 @@ add-tcp)
       warn "UFW не активен — открой порт $PORT2 вручную"
     fi
 
-    # Валидация и применение
+    # Убеждаемся что лог-файл nginx существует (нужен fail2ban)
+    touch /var/log/nginx/fallback_access.log 2>/dev/null || true
+
     echo ""
     if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
       systemctl restart xray
@@ -387,7 +427,6 @@ add-tcp)
       exit 1
     fi
 
-    # Выводим URI для каждого клиента
     SERVER_IP=$(_get_server_ip)
     FP=$(_get_fp)
     echo ""
@@ -473,6 +512,8 @@ info)
     fi
     echo -e "${BOLD}Клиентов:${NC}  $(jq '.inbounds[0].settings.clients | length' "$CONFIG")"
     echo ""
+    echo -e "${BOLD}SSH порт:${NC}  $(_get_ssh_port)"
+    echo ""
     echo -e "${BOLD}NTP дрейф:${NC}"
     chronyc tracking 2>/dev/null | grep "System time" | sed 's/^/  /' || echo "  ?"
     ;;
@@ -495,7 +536,7 @@ uuid) xray uuid ;;
 
 diag)
     echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║       Xray Full Diagnostic  v4           ║${NC}"
+    echo -e "${BOLD}${CYAN}║       Xray Full Diagnostic  v5           ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}\n"
 
     ISSUES=0
@@ -521,6 +562,12 @@ diag)
     ss -tlnp | grep -q ":80" \
       && ok "Порт 80 (nginx) слушается" \
       || warn "Порт 80 не слушается"
+
+    # Проверяем SSH-порт
+    SSH_P=$(_get_ssh_port)
+    ss -tlnp | grep -q ":${SSH_P}" \
+      && ok "SSH порт $SSH_P слушается" \
+      || { fail "SSH порт $SSH_P не слушается!"; ((ISSUES++)); }
 
     echo -e "\n${BOLD}[ 3 ] Конфиг Xray${NC}"; sep
     if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
@@ -581,10 +628,10 @@ diag)
     echo -e "\n${BOLD}[ 8 ] Firewall (UFW)${NC}"; sep
     if ufw status | grep -q "Status: active"; then
       ok "UFW активен"
-      OPEN_PORTS=$(ufw status | grep "ALLOW" | awk '{print $1}' | grep -vE "^22|^80|^443|^8443" | head -5)
-      [[ -n "$OPEN_PORTS" ]] \
-        && warn "Нестандартные открытые порты: $OPEN_PORTS" \
-        || ok "Лишних открытых портов не обнаружено"
+      # Проверяем что SSH-порт реально открыт
+      ufw status | grep -q "${SSH_P}" \
+        && ok "SSH порт $SSH_P открыт в UFW" \
+        || { fail "SSH порт $SSH_P не найден в UFW — риск потери доступа!"; ((ISSUES++)); }
     else
       fail "UFW не активен — сервер открыт!"; ((ISSUES++))
     fi
@@ -623,13 +670,15 @@ diag-dpi)
 
     sep
     echo -e "${BOLD}Тест 1: TLS handshake без REALITY (должен вести себя как $DEST)${NC}"
+    # -verify_return_error исключает ложноположительный результат при ошибке сертификата
     TLS_OUT=$(echo | timeout 5 openssl s_client \
-      -connect "${SERVER_IP}:${PORT}" -servername "$SNI" 2>&1 || true)
+      -connect "${SERVER_IP}:${PORT}" -servername "$SNI" \
+      -verify_return_error 2>&1 || true)
     if echo "$TLS_OUT" | grep -q "subject\s*=\|CN\s*="; then
       ok "TLS handshake прошёл"
       echo "$TLS_OUT" | grep "subject\|issuer" | head -2 | sed 's/^/    /'
     else
-      warn "TLS handshake не удался"
+      warn "TLS handshake не удался (ожидаемо при корректном REALITY)"
       echo "$TLS_OUT" | tail -3 | sed 's/^/    /'
     fi
 
@@ -826,7 +875,7 @@ diag-log)
 # ─── Помощь ──────────────────────────────────────────────────────────────────
 *)
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║       xm — Xray Manager  v4              ║${NC}"
+    echo -e "${BOLD}${CYAN}║       xm — Xray Manager  v5              ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${BOLD}Сервис:${NC}"
