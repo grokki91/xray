@@ -320,12 +320,12 @@ add-client)
 
     jq --arg uuid "$NEW_UUID" --arg comment "$COMMENT" \
       '.inbounds[0].settings.clients += [{"id": $uuid, "comment": $comment}]' \
-      "$CONFIG" > /tmp/xm_tmp.json && mv /tmp/xm_tmp.json "$CONFIG"
+      "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
 
     if _has_tcp_inbound; then
       jq --arg uuid "$NEW_UUID" --arg comment "$COMMENT" \
         '.inbounds[1].settings.clients += [{"id": $uuid, "flow": "xtls-rprx-vision", "comment": $comment}]' \
-        "$CONFIG" > /tmp/xm_tmp.json && mv /tmp/xm_tmp.json "$CONFIG"
+        "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
       echo -e "${GREEN}Добавлен в оба inbound${NC}"
     else
       echo -e "${GREEN}Клиент добавлен${NC}"
@@ -361,7 +361,7 @@ del-client)
 
     jq --arg uuid "$TARGET_UUID" \
       'del(.inbounds[].settings.clients[] | select(.id == $uuid))' \
-      "$CONFIG" > /tmp/xm_tmp.json && mv /tmp/xm_tmp.json "$CONFIG"
+      "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
 
     echo -e "${GREEN}Клиент $TARGET_UUID удалён из всех inbound${NC}"
     _apply
@@ -509,7 +509,7 @@ add-tcp)
     echo -e "${GREEN}Бэкап: $BACKUP_FILE${NC}"
 
     jq --argjson tcp "$TCP_INBOUND" '.inbounds += [$tcp]' \
-      "$CONFIG" > /tmp/xm_tmp.json && mv /tmp/xm_tmp.json "$CONFIG"
+      "$CONFIG" > "${CONFIG}.tmp" && mv "${CONFIG}.tmp" "$CONFIG"
 
     if [[ -f "$CLIENT_FILE" ]]; then
       {
