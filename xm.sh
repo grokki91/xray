@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  xm — Xray Manager Helper  v5
+#  xm — Xray Manager Helper  v5.1
 #  Использование: xm [команда]
 #
-#  Исправления v5:
-#   - apply/restore используют "$0" вместо внешней команды xm
-#   - _make_uri_xhttp использует python sys.argv (нет shell-инъекций)
-#   - add-tcp проверяет совпадение портов XHTTP и TCP
-#   - add-tcp создаёт лог-файл nginx до перезапуска fail2ban
-#   - Все внутренние рекурсивные вызовы через "$0"
+#  Исправления v5.1:
+#   - _get_pubkey: надёжный парсинг без привязки к пробелам/форматированию
+#   - _get_field: универсальная функция чтения любого поля из client-info.txt
+#   - _make_uri_xhttp и _make_uri_tcp читают ключи напрямую из config.json
+#     (приватный ключ → xray x25519 → публичный); client-info.txt как fallback
+#   - Добавлена команда "pubkey" для ручной диагностики
 #
 #  Команды:
 #   Сервис:    start / stop / restart / status
 #   Конфиг:    edit / test / apply
 #   Бэкапы:    backup / restore / backups
 #   Клиенты:   clients / add-client / del-client / uri
-#   TCP:       add-tcp  (добавить XTLS-Vision inbound автоматически)
+#   TCP:       add-tcp
 #   Nginx:     nginx-status / nginx-log / nginx-reload / nginx-probes
 #   Fail2ban:  ban-list / ban-ssh-stat / unban
 #   Логи:      log / log-live / log-clear
-#   Инфо:      info / paths / uuid
+#   Инфо:      info / paths / uuid / pubkey
 #   Диагностика: diag / diag-dpi / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
 # =============================================================================
 
@@ -38,15 +38,89 @@ info() { echo -e "  ${CYAN}[-]${NC} $*"; }
 sep()  { echo -e "${CYAN}──────────────────────────────────────────${NC}"; }
 
 # ─── Вспомогательные ─────────────────────────────────────────────────────────
-_get_pubkey() {
-  local label="${1:-PUBLIC KEY}"
-  # Пробел после label предотвращает совпадение "PUBLIC KEY" с "PUBLIC KEY2"
-  grep "^${label} " "$CLIENT_FILE" 2>/dev/null | head -1 | awk -F': ' '{print $2}' | tr -d '[:space:]'
+
+# Надёжное чтение поля из client-info.txt.
+# Работает с любым форматом: "LABEL: value", "LABEL : value", "LABEL  : value"
+# Использование: _get_field "PUBLIC KEY"  → значение после двоеточия
+_get_field() {
+  local label="$1"
+  grep -i "^${label}[[:space:]]*:" "$CLIENT_FILE" 2>/dev/null \
+    | head -1 \
+    | sed 's/^[^:]*:[[:space:]]*//' \
+    | tr -d '[:space:]'
+}
+
+# Читаем публичный ключ для XHTTP inbound (первый inbound).
+# Сначала пробуем вычислить из приватного ключа в config.json — самый надёжный способ.
+# Fallback: client-info.txt.
+_get_pubkey_xhttp() {
+  local privkey pub
+  privkey=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // ""' "$CONFIG" 2>/dev/null)
+  if [[ -n "$privkey" && ${#privkey} -ge 30 ]]; then
+    pub=$(echo "$privkey" | xray x25519 -i /dev/stdin 2>/dev/null \
+          | grep -i "ublic" | awk '{print $NF}' | tr -d '[:space:]' || echo "")
+    # xray x25519 не умеет читать stdin — используем временный файл
+    if [[ -z "$pub" ]]; then
+      local tmpf
+      tmpf=$(mktemp)
+      # xray x25519 принимает приватный ключ через флаг -i (некоторые версии не поддерживают)
+      # Универсальный способ: xray x25519 всегда генерирует новую пару,
+      # поэтому получаем публичный ключ через openssl из приватного
+      pub=$(echo "$privkey" \
+        | python3 -c "
+import sys, base64, hashlib
+# X25519 public key from private key (RFC 7748)
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    raw = base64.urlsafe_b64decode(sys.stdin.read().strip() + '==')
+    priv = X25519PrivateKey.from_private_bytes(raw)
+    pub_bytes = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    print(base64.urlsafe_b64encode(pub_bytes).rstrip(b'=').decode())
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+      rm -f "$tmpf"
+    fi
+    if [[ -n "$pub" && ${#pub} -ge 30 ]]; then
+      echo "$pub"
+      return
+    fi
+  fi
+  # Fallback: client-info.txt
+  _get_field "PUBLIC KEY"
+}
+
+# Публичный ключ для TCP inbound (второй inbound)
+_get_pubkey_tcp() {
+  local privkey pub
+  privkey=$(jq -r '.inbounds[1].streamSettings.realitySettings.privateKey // ""' "$CONFIG" 2>/dev/null)
+  if [[ -n "$privkey" && ${#privkey} -ge 30 ]]; then
+    pub=$(echo "$privkey" \
+      | python3 -c "
+import sys, base64
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    raw = base64.urlsafe_b64decode(sys.stdin.read().strip() + '==')
+    priv = X25519PrivateKey.from_private_bytes(raw)
+    pub_bytes = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    print(base64.urlsafe_b64encode(pub_bytes).rstrip(b'=').decode())
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+    if [[ -n "$pub" && ${#pub} -ge 30 ]]; then
+      echo "$pub"
+      return
+    fi
+  fi
+  # Fallback: client-info.txt (поле PUBLIC KEY2)
+  _get_field "PUBLIC KEY2"
 }
 
 _get_server_ip() {
   local ip
-  ip=$(grep "^SERVER IP" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]')
+  ip=$(_get_field "SERVER IP")
   if [[ -z "$ip" || "$ip" == "ТВОЙ_IP" ]]; then
     ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null || echo "SERVER_IP")
   fi
@@ -54,15 +128,14 @@ _get_server_ip() {
 }
 
 _get_fp() {
-  grep "^FINGERPRINT" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]' \
-    || echo "chrome"
+  local fp
+  fp=$(_get_field "FINGERPRINT")
+  echo "${fp:-chrome}"
 }
 
 _get_ssh_port() {
-  # Читаем из client-info.txt (записывается setup.sh),
-  # fallback — sshd_config, затем ss, затем 22
   local port
-  port=$(grep "^SSH PORT" "$CLIENT_FILE" 2>/dev/null | awk -F': ' '{print $2}' | tr -d '[:space:]')
+  port=$(_get_field "SSH PORT")
   if [[ -z "$port" ]]; then
     port=$(grep -E "^Port\s+[0-9]+" /etc/ssh/sshd_config 2>/dev/null \
       | awk '{print $2}' | head -1 || echo "")
@@ -78,7 +151,7 @@ _has_tcp_inbound() {
   [[ $(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0) -ge 2 ]]
 }
 
-# Безопасное URL-кодирование через python sys.argv (нет shell-инъекций)
+# Безопасное URL-кодирование через python sys.argv
 _url_encode() {
   python3 -c \
     "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
@@ -88,15 +161,21 @@ _url_encode() {
 _make_uri_xhttp() {
   local uuid="$1" comment="$2"
   local sni port sid path_val mode pubkey fp server_ip encoded_path
-  sni=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host' "$CONFIG")
+  sni=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host // .inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
   port=$(jq -r '.inbounds[0].port' "$CONFIG")
   sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$CONFIG")
   path_val=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
   mode=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
-  pubkey=$(_get_pubkey "PUBLIC KEY")
+  pubkey=$(_get_pubkey_xhttp)
   fp=$(_get_fp)
   server_ip=$(_get_server_ip)
   encoded_path=$(_url_encode "$path_val")
+
+  if [[ -z "$pubkey" || ${#pubkey} -lt 30 ]]; then
+    echo -e "${RED}[ERR] Не удалось получить публичный ключ XHTTP. Запусти: xm pubkey${NC}" >&2
+    return 1
+  fi
+
   echo "vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&sni=${sni}&fp=${fp}&pbk=${pubkey}&sid=${sid}&type=xhttp&path=${encoded_path}&host=${sni}&mode=${mode}#${comment}"
 }
 
@@ -106,13 +185,18 @@ _make_uri_tcp() {
   sni=$(jq -r '.inbounds[1].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
   port=$(jq -r '.inbounds[1].port' "$CONFIG")
   sid=$(jq -r '.inbounds[1].streamSettings.realitySettings.shortIds[0]' "$CONFIG")
-  pubkey=$(_get_pubkey "PUBLIC KEY2")
+  pubkey=$(_get_pubkey_tcp)
   fp=$(_get_fp)
   server_ip=$(_get_server_ip)
+
+  if [[ -z "$pubkey" || ${#pubkey} -lt 30 ]]; then
+    echo -e "${RED}[ERR] Не удалось получить публичный ключ TCP. Запусти: xm pubkey${NC}" >&2
+    return 1
+  fi
+
   echo "vless://${uuid}@${server_ip}:${port}?encryption=none&security=reality&sni=${sni}&fp=${fp}&pbk=${pubkey}&sid=${sid}&type=tcp&flow=xtls-rprx-vision#${comment}-TCP"
 }
 
-# Внутренний apply — не вызывает внешний xm, а выполняет логику напрямую
 _apply() {
   if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
     systemctl restart xray
@@ -169,12 +253,50 @@ restore)
     read -rp "Выбери [Enter=1]: " CHOICE; CHOICE=${CHOICE:-1}
     cp "${FILES[$((CHOICE-1))]}" "$CONFIG"
     echo -e "${GREEN}Восстановлен: ${FILES[$((CHOICE-1))]}${NC}"
-    # Используем внутреннюю функцию, не внешний xm
     _apply
     ;;
 
 backups)
     ls -lh "$BACKUP_DIR"/*.json 2>/dev/null || echo "Бэкапов нет"
+    ;;
+
+# ─── Диагностика публичных ключей ────────────────────────────────────────────
+pubkey)
+    echo -e "${BOLD}${CYAN}[ Диагностика публичных ключей ]${NC}"
+    sep
+    echo -e "${BOLD}XHTTP inbound (inbounds[0]):${NC}"
+    PRIV0=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // "NOT_FOUND"' "$CONFIG" 2>/dev/null)
+    echo "  Приватный ключ в config.json: ${PRIV0:0:8}...${PRIV0: -4} (длина: ${#PRIV0})"
+    PUB0=$(_get_pubkey_xhttp)
+    echo "  Вычисленный публичный ключ:   ${PUB0}"
+    PUB0_FILE=$(_get_field "PUBLIC KEY")
+    echo "  Публичный ключ из client-info: ${PUB0_FILE}"
+    if [[ "$PUB0" == "$PUB0_FILE" ]]; then
+      ok "Ключи совпадают"
+    else
+      warn "Ключи расходятся — используй вычисленный из config.json"
+    fi
+
+    if _has_tcp_inbound; then
+      sep
+      echo -e "${BOLD}TCP inbound (inbounds[1]):${NC}"
+      PRIV1=$(jq -r '.inbounds[1].streamSettings.realitySettings.privateKey // "NOT_FOUND"' "$CONFIG" 2>/dev/null)
+      echo "  Приватный ключ в config.json: ${PRIV1:0:8}...${PRIV1: -4} (длина: ${#PRIV1})"
+      PUB1=$(_get_pubkey_tcp)
+      echo "  Вычисленный публичный ключ:   ${PUB1}"
+      PUB1_FILE=$(_get_field "PUBLIC KEY2")
+      echo "  Публичный ключ из client-info: ${PUB1_FILE}"
+      if [[ "$PUB1" == "$PUB1_FILE" ]]; then
+        ok "Ключи совпадают"
+      else
+        warn "Ключи расходятся — используй вычисленный из config.json"
+      fi
+    fi
+
+    sep
+    echo -e "${YELLOW}Если python3-cryptography не установлена, ключи вычислить не получится.${NC}"
+    echo -e "Установка: ${BOLD}pip3 install cryptography --break-system-packages${NC}"
+    echo -e "Или вручную: ${BOLD}xray x25519 -i PRIVATE_KEY${NC} (если Xray ≥ 1.8.6)"
     ;;
 
 # ─── Клиенты ─────────────────────────────────────────────────────────────────
@@ -291,7 +413,7 @@ uri)
     esac
     ;;
 
-# ─── Добавить TCP inbound (XTLS-Vision) ──────────────────────────────────────
+# ─── Добавить TCP inbound ─────────────────────────────────────────────────────
 add-tcp)
     echo -e "${BOLD}Добавление VLESS+REALITY+TCP (XTLS-Vision) inbound${NC}"
     echo ""
@@ -306,7 +428,6 @@ add-tcp)
 
     XHTTP_PORT_CURRENT=$(jq -r '.inbounds[0].port' "$CONFIG")
 
-    # Порт с проверкой совпадения
     while true; do
       read -rp "Порт для TCP inbound [Enter=8443]: " PORT2_INPUT
       PORT2=${PORT2_INPUT:-8443}
@@ -321,9 +442,15 @@ add-tcp)
 
     echo -e "${CYAN}Генерация ключей X25519...${NC}"
     KEY_OUTPUT=$(xray x25519)
-    PRIV=$(echo "$KEY_OUTPUT" | awk '/PrivateKey:|Private key:/ {print $NF}')
-    PUB=$(echo  "$KEY_OUTPUT" | awk '/Password \(PublicKey\):|Public key:/ {print $NF}')
-    [[ -z "$PRIV" || -z "$PUB" ]] && { echo -e "${RED}Не удалось сгенерировать ключи${NC}"; exit 1; }
+    # Надёжный парсинг
+    PRIV=$(echo "$KEY_OUTPUT" | grep -i "rivate" | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+    PUB=$(echo  "$KEY_OUTPUT" | grep -i "ublic"  | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+    [[ -z "$PRIV" || ${#PRIV} -lt 30 || -z "$PUB" || ${#PUB} -lt 30 ]] && {
+      echo -e "${RED}Не удалось сгенерировать ключи${NC}"
+      echo "Вывод xray x25519:"
+      echo "$KEY_OUTPUT"
+      exit 1
+    }
 
     SID1=$(openssl rand -hex 8)
     SID2=$(openssl rand -hex 4)
@@ -390,14 +517,13 @@ add-tcp)
         echo "───────────────────────────────────────────────────────"
         echo "TCP INBOUND добавлен: $(date)"
         echo "───────────────────────────────────────────────────────"
-        echo "PUBLIC KEY2  : ${PUB}"
-        echo "SHORT ID TCP : ${SID1} / ${SID2}"
-        echo "PORT2        : ${PORT2}"
+        echo "PUBLIC KEY2: ${PUB}"
+        echo "SHORT ID TCP: ${SID1} / ${SID2}"
+        echo "PORT2: ${PORT2}"
       } >> "$CLIENT_FILE"
       echo -e "${GREEN}Данные сохранены в $CLIENT_FILE${NC}"
     fi
 
-    # Открываем порт UFW
     if ufw status | grep -q "Status: active"; then
       ufw allow "${PORT2}/tcp" comment 'Xray TCP' 2>/dev/null && \
         echo -e "${GREEN}UFW: порт $PORT2 открыт${NC}"
@@ -405,7 +531,6 @@ add-tcp)
       warn "UFW не активен — открой порт $PORT2 вручную"
     fi
 
-    # Убеждаемся что лог-файл nginx существует (нужен fail2ban)
     touch /var/log/nginx/fallback_access.log 2>/dev/null || true
 
     echo ""
@@ -537,7 +662,7 @@ uuid) xray uuid ;;
 
 diag)
     echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║       Xray Full Diagnostic  v5           ║${NC}"
+    echo -e "${BOLD}${CYAN}║       Xray Full Diagnostic  v5.1         ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}\n"
 
     ISSUES=0
@@ -564,7 +689,6 @@ diag)
       && ok "Порт 80 (nginx) слушается" \
       || warn "Порт 80 не слушается"
 
-    # Проверяем SSH-порт
     SSH_P=$(_get_ssh_port)
     ss -tlnp | grep -q ":${SSH_P}" \
       && ok "SSH порт $SSH_P слушается" \
@@ -578,6 +702,15 @@ diag)
     fi
     info "Inbound'ов: $(jq '.inbounds | length' "$CONFIG")"
     info "Клиентов:   $(jq '.inbounds[0].settings.clients | length' "$CONFIG")"
+
+    echo -e "\n${BOLD}[ 3b ] Публичные ключи${NC}"; sep
+    PUB_CHECK=$(_get_pubkey_xhttp)
+    if [[ -n "$PUB_CHECK" && ${#PUB_CHECK} -ge 30 ]]; then
+      ok "Публичный ключ XHTTP получен (длина ${#PUB_CHECK})"
+    else
+      fail "Не удалось получить публичный ключ XHTTP — URI будут невалидны!"; ((ISSUES++))
+      warn "Запусти: xm pubkey  для диагностики"
+    fi
 
     echo -e "\n${BOLD}[ 4 ] NTP / Время${NC}"; sep
     if systemctl is-active --quiet chrony; then
@@ -600,7 +733,7 @@ diag)
       fail "chrony не запущен"; ((ISSUES++))
     fi
 
-    echo -e "\n${BOLD}[ 5 ] Доступность dest (REALITY fallback)${NC}"; sep
+    echo -e "\n${BOLD}[ 5 ] Доступность dest${NC}"; sep
     DEST=$(jq -r '.inbounds[0].streamSettings.realitySettings.dest' "$CONFIG" | sed 's/:443//')
     info "dest: $DEST"
     HTTP_CODE=$(curl -svo /dev/null "https://${DEST}" \
@@ -611,7 +744,7 @@ diag)
       fail "dest ${DEST} недоступен (код: $HTTP_CODE)"; ((ISSUES++))
     fi
 
-    echo -e "\n${BOLD}[ 6 ] Nginx fallback (127.0.0.1:8080)${NC}"; sep
+    echo -e "\n${BOLD}[ 6 ] Nginx fallback${NC}"; sep
     FB_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080 --max-time 3 2>/dev/null || echo "000")
     [[ "$FB_CODE" == "200" ]] \
       && ok "Nginx fallback отвечает 200" \
@@ -629,7 +762,6 @@ diag)
     echo -e "\n${BOLD}[ 8 ] Firewall (UFW)${NC}"; sep
     if ufw status | grep -q "Status: active"; then
       ok "UFW активен"
-      # Проверяем что SSH-порт реально открыт
       ufw status | grep -q "${SSH_P}" \
         && ok "SSH порт $SSH_P открыт в UFW" \
         || { fail "SSH порт $SSH_P не найден в UFW — риск потери доступа!"; ((ISSUES++)); }
@@ -637,7 +769,7 @@ diag)
       fail "UFW не активен — сервер открыт!"; ((ISSUES++))
     fi
 
-    echo -e "\n${BOLD}[ 9 ] Лог Xray (последние ошибки)${NC}"; sep
+    echo -e "\n${BOLD}[ 9 ] Лог Xray${NC}"; sep
     if [[ -f "$LOG" ]] && [[ -s "$LOG" ]]; then
       info "Строк в логе: $(wc -l < "$LOG")"
       if tail -5 "$LOG" | grep -qi "failed\|error\|panic\|rejected"; then
@@ -660,7 +792,6 @@ diag)
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
     ;;
 
-# ─── DPI / Активное зондирование ─────────────────────────────────────────────
 diag-dpi)
     echo -e "\n${BOLD}${CYAN}[ DPI / Active Probe Resistance ]${NC}\n"
 
@@ -670,8 +801,7 @@ diag-dpi)
     SERVER_IP=$(_get_server_ip)
 
     sep
-    echo -e "${BOLD}Тест 1: TLS handshake без REALITY (должен вести себя как $DEST)${NC}"
-    # -verify_return_error исключает ложноположительный результат при ошибке сертификата
+    echo -e "${BOLD}Тест 1: TLS handshake${NC}"
     TLS_OUT=$(echo | timeout 5 openssl s_client \
       -connect "${SERVER_IP}:${PORT}" -servername "$SNI" \
       -verify_return_error 2>&1 || true)
@@ -684,20 +814,20 @@ diag-dpi)
     fi
 
     sep
-    echo -e "${BOLD}Тест 2: HTTP на порту 80 (ожидаем 301 redirect)${NC}"
+    echo -e "${BOLD}Тест 2: HTTP на порту 80${NC}"
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
       "http://${SERVER_IP}" --max-time 5 -H "Host: ${SNI}" 2>/dev/null || echo "000")
     [[ "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]] \
-      && ok "Порт 80 → redirect $HTTP_CODE (выглядит как обычный сайт)" \
+      && ok "Порт 80 → redirect $HTTP_CODE" \
       || warn "Порт 80 вернул: $HTTP_CODE (ожидался 301/302)"
 
     sep
-    echo -e "${BOLD}Тест 3: Nginx fallback (127.0.0.1:8080)${NC}"
+    echo -e "${BOLD}Тест 3: Nginx fallback${NC}"
     FB=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8080 --max-time 3 2>/dev/null || echo "000")
     [[ "$FB" == "200" ]] && ok "Fallback отвечает 200" || fail "Fallback не отвечает (код: $FB)"
 
     sep
-    echo -e "${BOLD}Тест 4: Случайный путь (ожидаем 404, не 400)${NC}"
+    echo -e "${BOLD}Тест 4: Случайный путь${NC}"
     RAND_PATH="/$(openssl rand -hex 8)"
     RAND_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
       "https://${SERVER_IP}${RAND_PATH}" \
@@ -711,7 +841,7 @@ diag-dpi)
     fi
 
     sep
-    echo -e "${BOLD}Тест 5: xPaddingBytes (рандомизация пакетов)${NC}"
+    echo -e "${BOLD}Тест 5: xPaddingBytes${NC}"
     PADDING=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.xPaddingBytes // ""' "$CONFIG")
     [[ -n "$PADDING" ]] && ok "xPaddingBytes: $PADDING" || warn "xPaddingBytes не задан"
 
@@ -724,13 +854,8 @@ diag-dpi)
       firefox)         info "Fingerprint: firefox — уникален, но валиден" ;;
       *)               warn "Fingerprint: $FP — проверь поддержку" ;;
     esac
-
-    echo ""
-    info "Глубокий TLS анализ: xm diag-tls"
-    info "Внешняя проверка fingerprint: https://tlsfingerprint.io"
     ;;
 
-# ─── NTP ─────────────────────────────────────────────────────────────────────
 diag-ntp)
     echo -e "\n${BOLD}${CYAN}[ NTP / Time Sync ]${NC}\n"
     sep
@@ -754,7 +879,6 @@ diag-ntp)
     fi
     ;;
 
-# ─── Порты ───────────────────────────────────────────────────────────────────
 diag-ports)
     echo -e "\n${BOLD}${CYAN}[ Open Ports & Listeners ]${NC}\n"
     sep
@@ -773,7 +897,6 @@ diag-ports)
       | grep -v "127.0.0.1" | head -20 || echo "  нет"
     ;;
 
-# ─── TLS ─────────────────────────────────────────────────────────────────────
 diag-tls)
     echo -e "\n${BOLD}${CYAN}[ TLS / Certificate Check ]${NC}\n"
 
@@ -806,7 +929,6 @@ diag-tls)
     info "Для полного fingerprint анализа: https://tlsfingerprint.io"
     ;;
 
-# ─── Firewall ─────────────────────────────────────────────────────────────────
 diag-fw)
     echo -e "\n${BOLD}${CYAN}[ Firewall & Ban Status ]${NC}\n"
 
@@ -840,7 +962,6 @@ diag-fw)
       | tail -10 | sed 's/^/  /' || echo "  лог недоступен"
     ;;
 
-# ─── Лог ─────────────────────────────────────────────────────────────────────
 diag-log)
     echo -e "\n${BOLD}${CYAN}[ Xray Log Analysis ]${NC}\n"
     sep
@@ -876,7 +997,7 @@ diag-log)
 # ─── Помощь ──────────────────────────────────────────────────────────────────
 *)
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║       xm — Xray Manager  v5              ║${NC}"
+    echo -e "${BOLD}${CYAN}║       xm — Xray Manager  v5.1            ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${BOLD}Сервис:${NC}"
@@ -900,7 +1021,7 @@ diag-log)
     echo "  xm uri --all                 Все URI всех клиентов"
     echo ""
     echo -e "${BOLD}TCP inbound:${NC}"
-    echo -e "  ${GREEN}xm add-tcp${NC}           Добавить XTLS-Vision/TCP inbound автоматически"
+    echo -e "  ${GREEN}xm add-tcp${NC}           Добавить XTLS-Vision/TCP inbound"
     echo ""
     echo -e "${BOLD}Nginx:${NC}"
     echo "  xm nginx-status / nginx-log / nginx-reload / nginx-probes"
@@ -912,15 +1033,16 @@ diag-log)
     echo "  xm log / log-live / log-clear"
     echo ""
     echo -e "${BOLD}${GREEN}Диагностика:${NC}"
-    echo -e "  ${GREEN}xm diag${NC}              Полная диагностика (запускай первым)"
-    echo -e "  ${GREEN}xm diag-dpi${NC}          Устойчивость к DPI и активным зондам"
+    echo -e "  ${GREEN}xm diag${NC}              Полная диагностика"
+    echo -e "  ${GREEN}xm pubkey${NC}            Диагностика публичных ключей"
+    echo -e "  ${GREEN}xm diag-dpi${NC}          Устойчивость к DPI"
     echo -e "  ${GREEN}xm diag-ntp${NC}          NTP / дрейф времени"
-    echo -e "  ${GREEN}xm diag-ports${NC}        Открытые порты и слушатели"
-    echo -e "  ${GREEN}xm diag-tls${NC}          TLS сертификат и fingerprint"
+    echo -e "  ${GREEN}xm diag-ports${NC}        Открытые порты"
+    echo -e "  ${GREEN}xm diag-tls${NC}          TLS сертификат"
     echo -e "  ${GREEN}xm diag-fw${NC}           Firewall и ban-статус"
-    echo -e "  ${GREEN}xm diag-log${NC}          Анализ лога на ошибки и DPI-признаки"
+    echo -e "  ${GREEN}xm diag-log${NC}          Анализ лога"
     echo ""
     echo -e "${BOLD}Инфо:${NC}"
-    echo "  xm info / paths / uuid"
+    echo "  xm info / paths / uuid / pubkey"
     ;;
 esac
