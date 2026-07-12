@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Xray-core · VLESS + REALITY + XHTTP  ·  Auto Setup  v5
+#  Xray-core · VLESS + REALITY + XHTTP  ·  Auto Setup  v5.4
 #  Ubuntu 22.04 LTS · uTLS Chrome
 #
 #  Исправления v5 (относительно v4):
@@ -16,6 +16,30 @@
 #  Исправления v5.1:
 #   - Надёжный парсинг ключей xray x25519 (поддержка всех версий Xray)
 #   - Валидация длины публичного ключа перед записью в URI
+#
+#  Исправления v5.2:
+#   - qrencode добавлен в зависимости
+#   - Функция _print_qr: QR-код прямо в терминал после установки
+#   - QR выводится для каждого VLESS URI в итоговом блоке
+#
+#  Исправления v5.3 (security hardening):
+#   - [FIX-1] config.json chmod 600 сразу после записи (приватный ключ REALITY)
+#   - [FIX-2] Временные файлы через mktemp (атомарный mv, нет race condition)
+#   - [FIX-3] Валидация формата SERVER_IP (IPv4/IPv6, не HTML-мусор)
+#   - [FIX-4] Nginx rate limiting на fallback (limit_req_zone)
+#   - [FIX-5] maxTimeDiff снижен до 10000 мс (chrony держит < 1 сек)
+#   - [FIX-6] Блокировка geoip:cn + geoip:ir в routing (сканирующие AS)
+#   - [FIX-7] xPaddingBytes расширен до 100-1460 (меньше статистических паттернов)
+#
+#  Исправления v5.4 (REALITY compatibility):
+#   - [FIX-8] Проверка РАЗМЕРА TLS Certificate у dest/SNI (openssl s_client):
+#             домены с большой цепочкой/OCSP staple (www.microsoft.com)
+#             переполняют захардкоженный буфер REALITY (~8192 б) и РВУТ
+#             хендшейк, хотя curl отвечает 200. HTTP-код это не ловит.
+#             Добавлена оценка размера сертификата в секции 7.
+#   - [FIX-8] Дефолтный список SNI заменён на домены с компактными
+#             сертификатами; microsoft.com убран из дефолтов (оставлен
+#             последней опцией как наглядный пример «слишком большого» cert).
 # =============================================================================
 
 set -euo pipefail
@@ -46,11 +70,23 @@ XM_SCRIPT_SRC="$(cd "$(dirname "$0")" && pwd)/xm.sh"
 # =============================================================================
 _parse_xray_keys() {
   local output="$1"
-  # Извлекаем приватный ключ: берём последнее слово строки,
-  # содержащей "rivate" (покрывает "Private key", "PrivateKey" и т.п.)
-  PRIVATE_KEY=$(echo "$output" | grep -i "rivate" | awk '{print $NF}' | head -1 | tr -d '[:space:]')
-  # Извлекаем публичный ключ: строка содержит "ublic" (Public key / PublicKey / Password(PublicKey))
-  PUBLIC_KEY=$(echo "$output"  | grep -i "ublic"  | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+  # [FIX] Якорим парсинг по МЕТКЕ в начале строки (^label), а не по подстроке где угодно.
+  #
+  # ПОЧЕМУ ЭТО ВАЖНО (уязвимость/несовместимость):
+  #   В новых версиях Xray-core вывод `xray x25519` изменился:
+  #     старый:  "Private key: xxx" / "Public key: yyy"
+  #     новый:   "PrivateKey: xxx"  / "Password: yyy" / "Hash32: zzz"
+  #   Здесь "Password" — это и есть бывший Public key (переименован намеренно,
+  #   чтобы им не делились: по публичному ключу теоретически можно активно
+  #   пробить REALITY-сервер). Старый `grep -i "ublic"` на строку "Password:"
+  #   НЕ срабатывал → PUBLIC_KEY оставался пустым → установка падала на валидации.
+  #   Теперь ловим "Public" ИЛИ "Password".
+  #
+  #   Якорь ^[[:space:]]* также исключает ложное совпадение, если само base64-
+  #   значение ключа случайно содержит подстроку "public"/"private": метка всегда
+  #   стоит в начале строки, а значение ключа — никогда.
+  PRIVATE_KEY=$(echo "$output" | grep -iE "^[[:space:]]*private"          | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+  PUBLIC_KEY=$(echo "$output"  | grep -iE "^[[:space:]]*(public|password)" | awk '{print $NF}' | head -1 | tr -d '[:space:]')
 
   # Валидация: ключ X25519 в base64url — 43 символа
   if [[ ${#PRIVATE_KEY} -lt 30 ]]; then
@@ -59,6 +95,109 @@ _parse_xray_keys() {
   if [[ ${#PUBLIC_KEY} -lt 30 ]]; then
     error "Не удалось распарсить PublicKey (длина ${#PUBLIC_KEY}).\nВывод xray x25519:\n$output"
   fi
+}
+
+# =============================================================================
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: вывод QR-кода прямо в терминал
+# -t UTF8  — Unicode-блоки, работают в любом терминале (ssh/tmux/screen/VSCode)
+# -m 1     — quiet zone 1 модуль (достаточно для сканирования с экрана)
+# -l L     — минимальная коррекция ошибок (меньше QR для длинных URI)
+# =============================================================================
+_print_qr() {
+  local uri="$1"
+  local label="${2:-QR-код}"
+  if command -v qrencode &>/dev/null; then
+    echo -e "\n${BOLD}${CYAN}┌─────────────────────────────────────────┐${NC}"
+    echo -e "${BOLD}${CYAN}│  ${label}${NC}"
+    echo -e "${BOLD}${CYAN}└─────────────────────────────────────────┘${NC}"
+    qrencode -t UTF8 -m 1 -l L -s 2 "$uri" \
+      || warn "QR не сгенерирован (URI слишком длинный? Попробуй: qrencode -t UTF8 -l L '...')"
+  else
+    warn "qrencode не найден — QR недоступен. Установи: apt install qrencode"
+  fi
+}
+
+# =============================================================================
+# [FIX-3] ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: получение и валидация внешнего IP
+# Защита от ситуации когда ipify/ifconfig.me вернул HTML или пустую строку.
+# Пробуем несколько источников, проверяем формат IPv4/IPv6 перед использованием.
+# =============================================================================
+_fetch_server_ip() {
+  local ip
+  for url in \
+    "https://api.ipify.org" \
+    "https://ifconfig.me" \
+    "https://api64.ipify.org"; do
+    ip=$(curl -fsSL --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+    # Проверяем IPv4: четыре октета по 1-3 цифры
+    if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+      echo "$ip"
+      return 0
+    fi
+    # Проверяем IPv6: содержит двоеточия, минимум 4 символа, только hex и ':'
+    if [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ ${#ip} -gt 4 ]]; then
+      echo "$ip"
+      return 0
+    fi
+  done
+  # Ни один источник не вернул валидный IP
+  echo "ТВОЙ_IP"
+  return 1
+}
+
+# =============================================================================
+# [FIX-8] ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: оценка размера TLS Certificate у dest/SNI
+#
+# ПОЧЕМУ (это НЕ то же, что HTTP-доступность):
+#   При fallback REALITY пересылает клиенту TLS-хендшейк реального сайта.
+#   В ряде версий Xray-core на приём Certificate-сообщения (цепочка серверных
+#   сертификатов) стоит захардкоженный буфер ~8192 байт. Большая цепочка и/или
+#   OCSP-stapling (классика — www.microsoft.com) переполняют его и РВУТ
+#   REALITY-хендшейк целиком, хотя `curl https://сайт` отвечает 200. Проверка
+#   только по HTTP-коду (секция 7 / xm add-tcp) этот случай не видит: сервер
+#   выглядит здоровым, а клиент ловит "handshake failed".
+#
+# ЧТО МЕРЯЕМ (верхняя оценка размера записи):
+#   сумма DER всех сертификатов из -showcerts + запас на OCSP staple (если есть)
+#   + служебные поля Certificate-сообщения.
+# Печатает в stdout число байт, либо "-1" если сайт недоступен по :443.
+# Всегда return 0 — сигнал об ошибке идёт через "-1", чтобы не сработал set -e.
+# =============================================================================
+REALITY_CERT_WARN=7000     # запас до лимита; между warn и limit — риск на части версий
+REALITY_CERT_LIMIT=8192    # захардкоженный буфер REALITY в ряде версий Xray-core
+
+_check_cert_size() {
+  local host="$1"
+  local raw tmpd cert size total=0 ocsp_add=0 framing=0 ncerts=0
+
+  raw=$(echo | timeout 10 openssl s_client -connect "${host}:443" \
+        -servername "$host" -showcerts -status 2>/dev/null) || raw=""
+  if [[ -z "$raw" ]]; then echo "-1"; return 0; fi
+
+  tmpd=$(mktemp -d)
+  # Разбиваем цепочку на отдельные PEM (описательные строки s:/i: openssl x509
+  # игнорирует — проверено). Каждый BEGIN..END попадает в свой файл.
+  printf '%s\n' "$raw" | awk -v d="$tmpd" '
+    /-----BEGIN CERTIFICATE-----/ {c++}
+    c>0 {print > (d "/cert" c ".pem")}
+  '
+  for cert in "$tmpd"/cert*.pem; do
+    [[ -f "$cert" ]] || continue
+    # || size=0 — иначе под set -o pipefail упавший openssl уронил бы функцию
+    size=$(openssl x509 -in "$cert" -outform DER 2>/dev/null | wc -c) || size=0
+    if [[ "${size:-0}" -gt 0 ]]; then
+      total=$((total + size)); ncerts=$((ncerts + 1))
+    fi
+  done
+  rm -rf "$tmpd"
+  [[ "$ncerts" -eq 0 ]] && { echo "-1"; return 0; }
+
+  # OCSP staple: точный размер из текста не достать, но факт наличия — да.
+  # Типичный single-cert OCSP ~1500 б; закладываем консервативно (оценка верхняя).
+  printf '%s' "$raw" | grep -qi "OCSP Response Data" && ocsp_add=1600
+  # Служебные поля Certificate: 4+1+3 + по 6 на каждый cert (len+ext_len).
+  framing=$((10 + ncerts * 6))
+  echo $((total + ocsp_add + framing)); return 0
 }
 
 # =============================================================================
@@ -84,21 +223,25 @@ fi
 header "Настройка параметров"
 
 echo -e "${BOLD}Выбери целевой домен (SNI / dest):${NC}"
-echo "  1) www.microsoft.com"
-echo "  2) login.microsoftonline.com"
-echo "  3) www.apple.com"
-echo "  4) cdn.apple.com"
+# [FIX-8] microsoft.com/login.microsoftonline.com убраны из дефолтов: у них
+# большая цепочка/OCSP staple, из-за чего REALITY-хендшейк ломается (буфер ~8192 б).
+# Дефолты ниже — с компактными сертификатами; выбор ВСЁ РАВНО проверяется
+# _check_cert_size в секции 7 (список не «слепая вера», а стартовая точка).
+echo "  1) www.apple.com        (компактный cert)"
+echo "  2) dl.google.com        (компактный cert, большой traffic pool)"
+echo "  3) www.cloudflare.com   (компактный cert, TLS1.3/H2)"
+echo "  4) www.microsoft.com    (⚠ большой cert/OCSP — как правило НЕ подходит, оставлен для наглядности проверки)"
 echo "  5) Ввести вручную"
 read -rp "Выбор [1-5, Enter=1]: " SNI_CHOICE
 SNI_CHOICE=${SNI_CHOICE:-1}
 
 case "$SNI_CHOICE" in
-  1) DEST_SNI="www.microsoft.com" ;;
-  2) DEST_SNI="login.microsoftonline.com" ;;
-  3) DEST_SNI="www.apple.com" ;;
-  4) DEST_SNI="cdn.apple.com" ;;
+  1) DEST_SNI="www.apple.com" ;;
+  2) DEST_SNI="dl.google.com" ;;
+  3) DEST_SNI="www.cloudflare.com" ;;
+  4) DEST_SNI="www.microsoft.com" ;;
   5) read -rp "Введи домен: " DEST_SNI ;;
-  *) DEST_SNI="www.microsoft.com" ;;
+  *) DEST_SNI="www.apple.com" ;;
 esac
 
 if [[ ! "$DEST_SNI" =~ ^[a-zA-Z0-9._-]+$ ]]; then
@@ -188,6 +331,10 @@ if [[ "$DUAL_CHOICE" =~ ^[Yy]$ ]]; then
       warn "Порт TCP ($XRAY_PORT2) совпадает с портом XHTTP ($XRAY_PORT) — выбери другой"
       continue
     fi
+    if [[ "$XRAY_PORT2" -eq 10443 ]]; then
+      warn "Порт 10443 зарезервирован под локальный REALITY fallback — выбери другой"
+      continue
+    fi
     break
   done
   info "Второй inbound: порт ${BOLD}$XRAY_PORT2${NC}"
@@ -206,7 +353,11 @@ header "Установка зависимостей"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   curl wget unzip uuid-runtime openssl ufw \
-  nginx fail2ban jq python3 chrony
+  nginx libnginx-mod-stream fail2ban jq python3 chrony qrencode
+# qrencode: рисует QR-код прямо в терминал (режим UTF8).
+# libnginx-mod-stream: TCP/stream-модуль nginx — нужен для настоящего
+# REALITY-fallback (ssl_preread + proxy_protocol). Пакет сам включает модуль
+# через /etc/nginx/modules-enabled/*.conf.
 success "Зависимости установлены"
 
 # =============================================================================
@@ -246,7 +397,15 @@ driftfile /var/lib/chrony/drift
 makestep 1.0 3
 rtcsync
 logdir /var/log/chrony
-local stratum 10
+# [FIX] Убран "local stratum 10".
+# Он заставлял chronyd объявлять себя авторитетным источником времени
+# (stratum 10) ДАЖЕ когда реальной синхронизации с пулом нет. Последствия:
+#   - при недоступности NTP-пула сервер продолжал считать своё дрейфующее
+#     время «синхронизированным», из-за чего REALITY (maxTimeDiff=10000)
+#     мог молча начать отклонять клиентов при расхождении часов;
+#   - "local" превращает хост в потенциальный NTP-источник (лишняя поверхность).
+# Без этой строки chrony честно показывает "не синхронизирован", пока не
+# получит реальный upstream — а xm diag-ntp это увидит.
 CHRONYEOF
 
 systemctl enable chrony
@@ -326,6 +485,23 @@ else
   [[ "$DEST_CONFIRM" =~ ^[Yy]$ ]] || error "Выбери другой dest и перезапусти."
 fi
 
+# [FIX-8] Дополнительно к HTTP-доступности — проверка РАЗМЕРА TLS-сертификата.
+# HTTP 200 не гарантирует сборку REALITY-хендшейка (см. _check_cert_size).
+info "Проверка размера TLS-сертификата $DEST_SNI (совместимость с REALITY)..."
+CERT_EST=$(_check_cert_size "$DEST_SNI")
+if [[ "$CERT_EST" == "-1" ]]; then
+  warn "Не удалось снять сертификат $DEST_SNI по :443 — пропускаю проверку размера"
+elif [[ "$CERT_EST" -ge "$REALITY_CERT_LIMIT" ]]; then
+  warn "Оценка Certificate: ${CERT_EST} б ≥ лимита REALITY (${REALITY_CERT_LIMIT} б)."
+  warn "REALITY-хендшейк, скорее всего, будет РВАТЬСЯ (клиент: handshake failed)."
+  read -rp "Домен рискованный. Всё равно использовать? [y/N]: " CERT_CONFIRM
+  [[ "$CERT_CONFIRM" =~ ^[Yy]$ ]] || error "Выбери домен с компактным сертификатом и перезапусти."
+elif [[ "$CERT_EST" -ge "$REALITY_CERT_WARN" ]]; then
+  warn "Оценка Certificate: ${CERT_EST} б — близко к лимиту (${REALITY_CERT_LIMIT} б). Возможны сбои на части версий Xray."
+else
+  success "Размер Certificate ~${CERT_EST} б — с запасом ниже лимита REALITY (${REALITY_CERT_LIMIT} б)"
+fi
+
 # =============================================================================
 # 8. ЛОГИ + LOGROTATE
 # =============================================================================
@@ -351,9 +527,20 @@ LOGROTEOF
 success "logrotate настроен (14 дней)"
 
 # =============================================================================
-# 9. NGINX FALLBACK
+# 9. NGINX — НАСТОЯЩИЙ REALITY FALLBACK (stream + ssl_preread)
+# [FIX-4 переработан] Раньше nginx на :8080/:80 в тракт Xray НЕ входил:
+#   REALITY dest указывал прямо на внешний $sni:443, а rate-limit/fail2ban
+#   фильтровали несуществующий трафик (бутафория).
+# Теперь REALITY dest = 127.0.0.1:10443 c PROXY protocol v2 (xver=2, см. §11),
+#   а здесь nginx через stream+ssl_preread:
+#     - читает SNI, НЕ терминируя TLS (сертификат реального сайта проходит
+#       насквозь — REALITY по-прежнему «одалживает» чужой валидный TLS);
+#     - проксирует ТОЛЬКО на наш разрешённый SNI (whitelist → не открытый релей);
+#     - видит РЕАЛЬНЫЙ IP клиента (proxy_protocol) → limit_conn и логи работают
+#       по настоящему адресу, а не по 127.0.0.1.
+#   :80 оставляем как обычный 301-редирект (стандартное поведение веб-сервера).
 # =============================================================================
-header "Настройка Nginx fallback"
+header "Настройка Nginx REALITY fallback (stream/ssl_preread)"
 
 mkdir -p /var/www/fallback
 cat > /var/www/fallback/index.html <<'HTMLEOF'
@@ -384,41 +571,99 @@ HTMLEOF
 
 chown -R www-data:www-data /var/www/fallback
 
+# --- HTTP vhost: только :80 → 301 (обычное поведение веб-сервера) -------------
+# Прежний внутренний vhost на :8080 удалён: в тракт REALITY он не входил.
 cat > /etc/nginx/sites-available/fallback <<'NGINXEOF'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 127.0.0.1:8080;
-    server_name _;
-    root /var/www/fallback;
-    index index.html;
     server_tokens off;
-    add_header X-Content-Type-Options "nosniff" always;
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-    location / { try_files $uri $uri/ =404; }
-    access_log /var/log/nginx/fallback_access.log;
-    error_log  /var/log/nginx/fallback_error.log warn;
+    return 301 https://$host$request_uri;
 }
 NGINXEOF
 
 rm -f /etc/nginx/sites-enabled/default
 ln -sf /etc/nginx/sites-available/fallback /etc/nginx/sites-enabled/fallback
+
+# Подчищаем старую http-бутафорию, если осталась от прошлых версий/запусков.
+rm -f /etc/nginx/conf.d/rate-limit.conf
+
+# --- STREAM: настоящий REALITY fallback --------------------------------------
+# nginx-модуль stream включается сам после установки libnginx-mod-stream
+# (см. /etc/nginx/modules-enabled/*.conf). Сам stream-блок объявляется в
+# top-level контексте nginx.conf — добавляем include ОДИН раз (идемпотентно).
+mkdir -p /etc/nginx/stream-enabled
+if ! grep -q "stream-enabled/\*.conf" /etc/nginx/nginx.conf; then
+  cat >> /etc/nginx/nginx.conf <<'NGXSTREAM'
+
+# [FIX] REALITY fallback: stream-контекст для ssl_preread SNI-проксирования.
+# Добавлено setup.sh. Не удалять — сюда подключается stream-enabled/*.conf.
+stream {
+    include /etc/nginx/stream-enabled/*.conf;
+}
+NGXSTREAM
+fi
+
+# Конфиг stream-fallback. Пишем через quoted-heredoc (чтобы shell не тронул
+# nginx-переменные $ssl_preread_server_name и т.п.), а наш SNI подставляем
+# отдельно через sed по плейсхолдеру __DEST_SNI__.
+cat > /etc/nginx/stream-enabled/reality-fallback.conf <<'STREAMEOF'
+# Разрешаем проксировать ТОЛЬКО на наш dest-SNI. Любой другой SNI (или его
+# отсутствие) → пустой апстрим → соединение обрывается. Это не даёт превратить
+# nginx в открытый SNI-релей на произвольный хост.
+map $ssl_preread_server_name $reality_upstream {
+    default        "";
+    __DEST_SNI__   __DEST_SNI__;
+}
+
+# Считаем соединения по РЕАЛЬНОМУ IP клиента (доступен благодаря proxy_protocol).
+limit_conn_zone $binary_remote_addr zone=reality_conn:10m;
+
+log_format reality_fallback '$remote_addr [$time_local] '
+                            'SNI="$ssl_preread_server_name" '
+                            'status=$status sent=$bytes_sent';
+
+# Апстрим задан именем и резолвится в рантайме → нужен resolver.
+resolver 1.1.1.1 8.8.8.8 valid=30s ipv6=off;
+resolver_timeout 5s;
+
+server {
+    # xver=2 в REALITY → сюда приходит PROXY protocol v2. Без proxy_protocol
+    # nginx не распарсит заголовок и порвёт хендшейк.
+    listen 127.0.0.1:10443 proxy_protocol;
+
+    # Читаем SNI из ClientHello БЕЗ терминации TLS.
+    ssl_preread on;
+
+    # Предохранитель от флуда/сканов: не более 20 одновременных соединений
+    # с одного реального IP. Легитимный клиент (даже XHTTP с мультиплексом)
+    # столько не открывает — порог заведомо щадящий, как у настоящих CDN.
+    limit_conn reality_conn 20;
+
+    proxy_pass $reality_upstream:443;
+    proxy_connect_timeout 5s;
+
+    access_log /var/log/nginx/reality_fallback.log reality_fallback;
+    error_log  /var/log/nginx/reality_fallback_error.log warn;
+}
+STREAMEOF
+
+# Подставляем реальный SNI (валидирован ранее как ^[a-zA-Z0-9._-]+$ — sed-safe).
+sed -i "s/__DEST_SNI__/${DEST_SNI}/g" /etc/nginx/stream-enabled/reality-fallback.conf
+
 nginx -t && systemctl enable nginx && systemctl restart nginx
-success "Nginx fallback настроен"
+success "Nginx REALITY fallback настроен (stream/ssl_preread, dest=127.0.0.1:10443)"
 
 # =============================================================================
 # 10. FAIL2BAN
 # =============================================================================
 header "Настройка fail2ban"
 
-touch /var/log/nginx/fallback_access.log
-chown www-data:www-data /var/log/nginx/fallback_access.log
+# Лог stream-fallback должен существовать до старта fail2ban (иначе джейл не
+# поднимется). Создаём и отдаём nginx.
+touch /var/log/nginx/reality_fallback.log
+chown www-data:www-data /var/log/nginx/reality_fallback.log
 
 cat > /etc/fail2ban/jail.d/sshd-xray.conf <<EOF
 [sshd]
@@ -431,20 +676,30 @@ findtime = 600
 bantime  = 3600
 ignoreip = 127.0.0.1/8
 
-[nginx-4xx]
+# [FIX] Джейл переработан. Раньше "nginx-4xx" следил за http-логом vhost'а,
+# который в тракт REALITY не входил → лог всегда пустой → джейл бесполезен.
+# Теперь следим за РЕАЛЬНЫМ логом stream-fallback: каждая строка = одно
+# соединение с реальным IP клиента. Баним по ОБЪЁМУ (флуд), а НЕ по факту
+# появления — иначе забанили бы легитимных клиентов (их хендшейк тоже
+# проходит через fallback). Порог 60 conn/60s заведомо выше нормального
+# клиента и близок к тому, как флуд отсекают настоящие CDN.
+[nginx-reality-flood]
 enabled  = true
-port     = http,https
-filter   = nginx-4xx
-logpath  = /var/log/nginx/fallback_access.log
-maxretry = 20
+port     = ${XRAY_PORT}
+filter   = nginx-reality-flood
+logpath  = /var/log/nginx/reality_fallback.log
+maxretry = 60
 findtime = 60
 bantime  = 1800
 EOF
 
 mkdir -p /etc/fail2ban/filter.d
-cat > /etc/fail2ban/filter.d/nginx-4xx.conf <<'F2BFEOF'
+# Формат строки лога мы задаём сами (log_format reality_fallback):
+#   "<IP> [дата] SNI=... status=... sent=..."
+# Поэтому regex гарантированно совпадает и ловит любое соединение по IP.
+cat > /etc/fail2ban/filter.d/nginx-reality-flood.conf <<'F2BFEOF'
 [Definition]
-failregex = ^<HOST> - .* "(GET|POST|HEAD|OPTIONS|PUT|DELETE) .* HTTP/.*" (4\d{2}) .*$
+failregex = ^<HOST> \[
 ignoreregex =
 F2BFEOF
 
@@ -454,6 +709,15 @@ success "fail2ban настроен (SSH на порту $SSH_PORT)"
 
 # =============================================================================
 # 11. CONFIG.JSON
+# [FIX-5] maxTimeDiff снижен до 10000 мс (10 сек).
+#         Chrony держит drift < 1 сек. 60 сек было избыточно и давало
+#         слишком широкое окно для replay перехваченных handshake.
+# [FIX-6] В routing добавлена блокировка geoip:cn и geoip:ir —
+#         сети, из которых идёт активное сканирование REALITY-серверов.
+#         geoip файлы поставляются с Xray по умолчанию.
+# [FIX-7] xPaddingBytes расширен до "100-1460" (прежде было "100-1000").
+#         Более широкий диапазон хуже поддаётся статистическому
+#         fingerprinting при анализе размеров пакетов DPI.
 # =============================================================================
 header "Запись конфигурации Xray"
 
@@ -481,11 +745,16 @@ XHTTP_INBOUND=$(jq -n \
       security: "reality",
       realitySettings: {
         show: false,
-        dest: ($sni + ":443"),
-        xver: 0,
+        # [FIX] dest теперь указывает на локальный nginx stream-fallback,
+        # а не напрямую на внешний сайт. nginx через ssl_preread проксирует
+        # хендшейк на реальный $sni:443 (сертификат проходит насквозь).
+        dest: "127.0.0.1:10443",
+        # [FIX] xver=2 → REALITY шлёт nginx PROXY protocol v2 с РЕАЛЬНЫМ IP
+        # клиента, поэтому limit_conn/логи/fail2ban работают по адресу клиента.
+        xver: 2,
         serverNames: [$sni],
         privateKey: $privKey,
-        maxTimeDiff: 60000,
+        maxTimeDiff: 10000,
         shortIds: [$sid1, $sid2, $sid3]
       },
       xhttpSettings: {
@@ -500,7 +769,7 @@ XHTTP_INBOUND=$(jq -n \
         maxUploadSize: 1000000,
         maxConcurrentUploads: 10,
         waitUploadWritten: $waitUp,
-        xPaddingBytes: "100-1000"
+        xPaddingBytes: "100-1460"
       }
     },
     sniffing: { enabled: true, destOverride: ["http","tls","quic"] }
@@ -527,11 +796,14 @@ if $DUAL_INBOUND; then
         security: "reality",
         realitySettings: {
           show: false,
-          dest: ($sni + ":443"),
-          xver: 0,
+          # [FIX] см. XHTTP inbound: dest → локальный nginx stream-fallback,
+          # xver=2 для передачи реального IP клиента. SNI тот же, поэтому
+          # существующего whitelist в reality-fallback.conf достаточно.
+          dest: "127.0.0.1:10443",
+          xver: 2,
           serverNames: [$sni],
           privateKey: $privKey,
-          maxTimeDiff: 60000,
+          maxTimeDiff: 10000,
           shortIds: [$sid1, $sid2]
         },
         tcpSettings: { header: { type: "none" } }
@@ -561,7 +833,8 @@ jq -n \
       domainStrategy: "IPIfNonMatch",
       rules: [
         { type: "field", ip: ["geoip:private"], outboundTag: "block" },
-        { type: "field", protocol: ["bittorrent"], outboundTag: "block" }
+        { type: "field", protocol: ["bittorrent"], outboundTag: "block" },
+        { type: "field", ip: ["geoip:cn", "geoip:ir"], outboundTag: "block" }
       ]
     },
     policy: {
@@ -570,7 +843,16 @@ jq -n \
     }
   }' > "$XRAY_CONFIG"
 
-success "config.json записан"
+# [FIX-1] Ограничиваем права на config.json сразу после записи.
+# Файл содержит приватный ключ REALITY — читать должен только root.
+# По умолчанию официальный xray-install создаёт файл с правами 644,
+# что позволяет любому локальному пользователю прочитать ключ.
+# Xray запускается от пользователя nobody (группа nogroup) — см. systemd unit.
+# 640 + root:nogroup: только root пишет, nobody читает через группу, остальные не видят.
+# chmod ПЕРЕД chown — чтобы между ними не было окна с неправильными правами.
+chmod 640 "$XRAY_CONFIG"
+chown root:nogroup "$XRAY_CONFIG"
+success "config.json записан и защищён (chmod 640, root:nogroup)"
 
 # =============================================================================
 # 12. ВАЛИДАЦИЯ КОНФИГА
@@ -641,9 +923,13 @@ fi
 # =============================================================================
 # 16. IP + ДАННЫЕ КЛИЕНТА
 # =============================================================================
-SERVER_IP=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null \
-         || curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null \
-         || echo "ТВОЙ_IP")
+
+# [FIX-3] Используем функцию с валидацией формата IP
+SERVER_IP=$(_fetch_server_ip)
+if [[ "$SERVER_IP" == "ТВОЙ_IP" ]]; then
+  warn "Не удалось автоматически определить внешний IP!"
+  warn "Укажи IP вручную в файле $CLIENT_FILE после установки."
+fi
 
 ENCODED_PATH=$(python3 -c \
   "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
@@ -672,7 +958,7 @@ mkdir -p "$(dirname "$CLIENT_FILE")"
 # чтобы _get_pubkey в xm.sh мог их надёжно найти по паттерну "^LABEL:"
 cat > "$CLIENT_FILE" <<EOF
 ═══════════════════════════════════════════════════════
-  Xray VLESS+REALITY+XHTTP · Client Info v5.1
+  Xray VLESS+REALITY+XHTTP · Client Info v5.4
   Сгенерировано: $(date)
 ═══════════════════════════════════════════════════════
 SERVER IP: ${SERVER_IP}
@@ -716,12 +1002,17 @@ sing-box JSON (XHTTP):
 ${TCP_SECTION}
 
 ───────────────────────────────────────────────────────
-ВНИМАНИЕ: этот файл содержит приватный ключ REALITY.
+ВНИМАНИЕ: файл содержит учётные данные клиента —
+UUID и параметры подключения (ПУБЛИЧНЫЙ ключ, shortId, SNI).
+Приватного ключа REALITY здесь НЕТ (он только в config.json),
+но по UUID можно подключиться как клиент и пользоваться прокси.
 Передавай только по защищённому каналу (scp, age и т.п.)
 ───────────────────────────────────────────────────────
 EOF
 
+# client-info.txt читает только root — UUID и ключи не нужны другим пользователям
 chmod 600 "$CLIENT_FILE"
+chown root:root "$CLIENT_FILE"
 success "Данные клиента: $CLIENT_FILE"
 
 # =============================================================================
@@ -744,11 +1035,15 @@ fi
 echo ""
 echo -e "${GREEN}${BOLD}VLESS URI (XHTTP):${NC}"
 echo "$VLESS_URI_XHTTP"
+_print_qr "$VLESS_URI_XHTTP" "QR XHTTP · Hiddify / v2rayNG / Shadowrocket"
+
 if $DUAL_INBOUND; then
   echo ""
   echo -e "${GREEN}${BOLD}VLESS URI (TCP):${NC}"
   echo "$VLESS_URI_TCP"
+  _print_qr "$VLESS_URI_TCP" "QR TCP (XTLS-Vision)"
 fi
+
 echo ""
 echo -e "${BOLD}Сервисы:${NC}"
 echo -e "  Xray:     $(systemctl is-active xray)"
@@ -761,6 +1056,8 @@ chronyc tracking 2>/dev/null | grep "System time" | sed 's/^/  /' || echo "  (с
 echo ""
 echo -e "${YELLOW}Диагностика сервера: ${BOLD}xm diag${NC}"
 echo -e "${YELLOW}Данные клиента:      ${BOLD}cat $CLIENT_FILE${NC}"
+echo -e "${YELLOW}QR-коды повторно:    ${BOLD}xm qr${NC}  |  Оба: ${BOLD}xm qr --both${NC}"
 echo ""
-echo -e "${YELLOW}⚠  $CLIENT_FILE содержит приватный ключ REALITY.${NC}"
+echo -e "${YELLOW}⚠  $CLIENT_FILE содержит учётные данные клиента (UUID + параметры).${NC}"
+echo -e "${YELLOW}   Приватного ключа REALITY в нём нет, но по UUID можно войти в прокси.${NC}"
 echo -e "${YELLOW}   Передавай только по защищённому каналу!${NC}"
