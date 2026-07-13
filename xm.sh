@@ -3,81 +3,17 @@
 #  xm — Xray Manager Helper  v5.6
 #  Использование: xm [команда]
 #
-#  Изменения v5.6 (REALITY compatibility + SNI single-source-of-truth):
-#   - [NEW] Команда "set-sni <domain>" — атомарная смена домена-маски во ВСЕХ
-#           местах сразу (serverNames XHTTP/TCP, xhttpSettings.host, nginx map),
-#           с проверкой размера сертификата и перевыпуском URI/QR. Раньше домен
-#           дублировался в 4 независимых местах: правка одного через xm edit +
-#           ручной sed легко оставляла рассинхрон (REALITY валидирует один SNI,
-#           клиенту в URI уходит другой → "server name mismatch").
-#   - [FIX-8] Проверка РАЗМЕРА TLS Certificate (_check_cert_size / _sni_cert_gate):
-#           домены с большой цепочкой/OCSP staple (www.microsoft.com) переполняют
-#           захардкоженный буфер REALITY (~8192 б) и рвут хендшейк, хотя curl
-#           отвечает 200. Подключено в add-tcp и set-sni.
-#   - [DIAG-FIX-5] diag / блок [6b] и diag-dpi / Тест 0 теперь ЛОВЯТ рассинхрон
-#           SNI между источниками правды (xhttpSettings.host vs serverNames vs
-#           nginx map vs TCP inbound). Раньше поля читались по отдельности и
-#           между собой не сверялись — рассинхрон проходил диагностику незаметно.
-#
-#  Изменения v5.5 (diagnostics hardening):
-#   - [DIAG-FIX-1] xm diag / блок [5] «Доступность dest» больше НЕ проверяет
-#           локальный fallback 127.0.0.1:10443 (он требует PROXY protocol и
-#           curl к нему ВСЕГДА падал → ложный ISSUES++ на каждом запуске).
-#           Теперь проверяется реальный upstream-сайт (serverNames[0]),
-#           на который nginx проксирует REALITY-хендшейк.
-#   - [DIAG-FIX-2] xm diag / блок [2] — точное сопоставление портов:
-#           ":80([^0-9]|$)" вместо ":80" (раньше ":80" ловил ":8080",
-#           ":443" ловил ":4433" — риск ложного "порт слушается").
-#   - [DIAG-FIX-3] xm diag-dpi / Тест 1 переписан. Раньше провал TLS-хендшейка
-#           считался «нормой» — это концептуально неверно: смысл REALITY в том,
-#           что активный зонд ДОЛЖЕН получить успешный хендшейк с НАСТОЯЩИМ
-#           сертификатом целевого сайта. Теперь тест сравнивает сертификат
-#           нашего сервера с сертификатом реального $SNI (fingerprint/issuer).
-#   - [DIAG-FIX-4] xm diag-dpi / Тест 4 (случайный путь) переписан. Раньше curl
-#           шёл по IP без SNI → REALITY уводил в drop, а «ожидание 404» ни на чём
-#           не основано. Теперь через --resolve предъявляется настоящий SNI, а
-#           ответ сравнивается с ответом реального сайта (неотличимость по HTTP).
-#
-#  Изменения v5.4:
-#   - [NEW] Команда "update" — обновление Xray-core из ОФИЦИАЛЬНОГО источника
-#           (репозиторий XTLS/Xray-install на GitHub) с бэкапом конфига,
-#           проверкой скачанного установщика, валидацией конфига и контролем
-#           прав 640 root:nogroup на config.json после обновления.
-#   - [NEW] Команда "update --check" — только проверка последней версии
-#           на GitHub без установки (ничего не меняет на сервере).
-#   - [NEW] Команда "update-geo" — обновление geoip.dat / geosite.dat
-#           (важно: routing-правила geoip:cn / geoip:ir опираются на эти базы,
-#           устаревшая база = дыры в блокировке сканирующих сетей).
-#
-#  Исправления v5.3 (security hardening):
-#   - [FIX-1] xm pubkey больше не выводит фрагменты приватного ключа
-#             (было: "${PRIV0:0:8}...${PRIV0: -4}" — теперь только "[СКРЫТ]")
-#   - [FIX-2] Все временные файлы через mktemp в той же директории.
-#             mv в пределах одной ФС — атомарная операция, исключает
-#             race condition и symlink-атаки на предсказуемый .tmp файл.
-#             Затронуто: add-client, del-client, add-tcp.
-#
-#  Исправления v5.2:
-#   - Добавлена команда "qr" для вывода QR-кода прямо в терминал
-#   - _print_qr / _print_qr_pair
-#
-#  Исправления v5.1:
-#   - _get_pubkey: надёжный парсинг без привязки к пробелам/форматированию
-#   - _get_field: универсальная функция чтения любого поля из client-info.txt
-#   - _make_uri_xhttp и _make_uri_tcp читают ключи напрямую из config.json
-#   - Добавлена команда "pubkey" для диагностики
-#
 #  Команды:
-#   Сервис:    start / stop / restart / status
-#   Конфиг:    edit / test / apply / set-sni
-#   Бэкапы:    backup / restore / backups
-#   Клиенты:   clients / add-client / del-client / uri / qr
-#   TCP:       add-tcp
-#   Обновление: update [--check] / update-geo
-#   Nginx:     nginx-status / nginx-log / nginx-reload / nginx-probes
-#   Fail2ban:  ban-list / ban-ssh-stat / unban
-#   Логи:      log / log-live / log-clear
-#   Инфо:      info / paths / uuid / pubkey
+#   Сервис:      start / stop / restart / status
+#   Конфиг:      edit / test / apply / set-sni
+#   Бэкапы:      backup / restore / backups
+#   Клиенты:     clients / add-client / del-client / uri / qr
+#   TCP:         add-tcp
+#   Обновление:  update [--check] / update-geo
+#   Nginx:       nginx-status / nginx-log / nginx-reload / nginx-probes
+#   Fail2ban:    ban-list / ban-ssh-stat / unban
+#   Логи:        log / log-live / log-clear
+#   Инфо:        info / paths / uuid / pubkey
 #   Диагностика: diag / diag-dpi / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
 # =============================================================================
 
@@ -89,7 +25,7 @@ BACKUP_DIR="/usr/local/etc/xray/backups"
 LOG="/var/log/xray/error.log"
 CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
 
-# [FIX-8] Пороги размера TLS Certificate для совместимости с REALITY (см. setup.sh)
+# Пороги размера TLS Certificate для совместимости с REALITY (см. setup.sh)
 REALITY_CERT_WARN=7000
 REALITY_CERT_LIMIT=8192
 
@@ -101,78 +37,48 @@ sep()  { echo -e "${CYAN}──────────────────�
 
 # ─── Вспомогательные ─────────────────────────────────────────────────────────
 
-# Надёжное чтение поля из client-info.txt.
-# Работает с любым форматом: "LABEL: value", "LABEL : value", "LABEL  : value"
+# Чтение поля из client-info.txt (формат "LABEL: value" с любыми пробелами)
 _get_field() {
   local label="$1"
   grep -i "^${label}[[:space:]]*:" "$CLIENT_FILE" 2>/dev/null \
-    | head -1 \
-    | sed 's/^[^:]*:[[:space:]]*//' \
-    | tr -d '[:space:]'
+    | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]'
 }
 
-# Читаем публичный ключ для XHTTP inbound (первый inbound).
-# Сначала пробуем вычислить из приватного ключа в config.json — самый надёжный способ.
-# Fallback: client-info.txt.
-_get_pubkey_xhttp() {
-  local privkey pub
-  privkey=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // ""' "$CONFIG" 2>/dev/null)
-  if [[ -n "$privkey" && ${#privkey} -ge 30 ]]; then
-    pub=$(echo "$privkey" \
-      | python3 -c "
+# Вычисление публичного ключа X25519 из приватного (stdin → stdout)
+_derive_pubkey() {
+  python3 -c "
 import sys, base64
 try:
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
     raw = base64.urlsafe_b64decode(sys.stdin.read().strip() + '==')
     priv = X25519PrivateKey.from_private_bytes(raw)
-    pub_bytes = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    print(base64.urlsafe_b64encode(pub_bytes).rstrip(b'=').decode())
+    pub = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    print(base64.urlsafe_b64encode(pub).rstrip(b'=').decode())
 except Exception:
     pass
-" 2>/dev/null || echo "")
-    if [[ -n "$pub" && ${#pub} -ge 30 ]]; then
-      echo "$pub"
-      return
-    fi
-  fi
-  # Fallback: client-info.txt
-  _get_field "PUBLIC KEY"
+" 2>/dev/null
 }
 
-# Публичный ключ для TCP inbound (второй inbound)
-_get_pubkey_tcp() {
-  local privkey pub
-  privkey=$(jq -r '.inbounds[1].streamSettings.realitySettings.privateKey // ""' "$CONFIG" 2>/dev/null)
+# Публичный ключ inbound'а: сначала из privateKey в config.json, иначе из client-info.txt
+# $1 — индекс inbound, $2 — имя fallback-поля
+_get_pubkey() {
+  local idx="$1" fallback="$2" privkey pub
+  privkey=$(jq -r ".inbounds[$idx].streamSettings.realitySettings.privateKey // \"\"" "$CONFIG" 2>/dev/null)
   if [[ -n "$privkey" && ${#privkey} -ge 30 ]]; then
-    pub=$(echo "$privkey" \
-      | python3 -c "
-import sys, base64
-try:
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-    raw = base64.urlsafe_b64decode(sys.stdin.read().strip() + '==')
-    priv = X25519PrivateKey.from_private_bytes(raw)
-    pub_bytes = priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    print(base64.urlsafe_b64encode(pub_bytes).rstrip(b'=').decode())
-except Exception:
-    pass
-" 2>/dev/null || echo "")
-    if [[ -n "$pub" && ${#pub} -ge 30 ]]; then
-      echo "$pub"
-      return
-    fi
+    pub=$(echo "$privkey" | _derive_pubkey)
+    [[ -n "$pub" && ${#pub} -ge 30 ]] && { echo "$pub"; return; }
   fi
-  # Fallback: client-info.txt (поле PUBLIC KEY2)
-  _get_field "PUBLIC KEY2"
+  _get_field "$fallback"
 }
+_get_pubkey_xhttp() { _get_pubkey 0 "PUBLIC KEY"; }
+_get_pubkey_tcp()   { _get_pubkey 1 "PUBLIC KEY2"; }
 
 _get_server_ip() {
   local ip
   ip=$(_get_field "SERVER IP")
   if [[ -z "$ip" || "$ip" == "ТВОЙ_IP" ]]; then
     ip=$(curl -fsSL --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || echo "")
-    # Простая валидация IPv4
     if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
       ip=$(curl -fsSL --max-time 5 https://ifconfig.me 2>/dev/null | tr -d '[:space:]' || echo "SERVER_IP")
     fi
@@ -189,14 +95,8 @@ _get_fp() {
 _get_ssh_port() {
   local port
   port=$(_get_field "SSH PORT")
-  if [[ -z "$port" ]]; then
-    port=$(grep -E "^Port\s+[0-9]+" /etc/ssh/sshd_config 2>/dev/null \
-      | awk '{print $2}' | head -1 || echo "")
-  fi
-  if [[ -z "$port" ]]; then
-    port=$(ss -tlnp 2>/dev/null | grep sshd \
-      | awk '{print $4}' | grep -oE '[0-9]+$' | head -1 || echo "")
-  fi
+  [[ -z "$port" ]] && port=$(grep -E "^Port\s+[0-9]+" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -1 || echo "")
+  [[ -z "$port" ]] && port=$(ss -tlnp 2>/dev/null | grep sshd | awk '{print $4}' | grep -oE '[0-9]+$' | head -1 || echo "")
   echo "${port:-22}"
 }
 
@@ -204,11 +104,8 @@ _has_tcp_inbound() {
   [[ $(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0) -ge 2 ]]
 }
 
-# Безопасное URL-кодирование через python sys.argv
 _url_encode() {
-  python3 -c \
-    "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" \
-    "$1"
+  python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
 }
 
 _make_uri_xhttp() {
@@ -262,25 +159,9 @@ _apply() {
   fi
 }
 
-# =============================================================================
-# [FIX-8] ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: оценка размера TLS Certificate у dest/SNI
-#
-# ПОЧЕМУ (это НЕ то же, что HTTP-доступность):
-#   При fallback REALITY пересылает клиенту TLS-хендшейк реального сайта.
-#   В ряде версий Xray-core на приём Certificate-сообщения (цепочка серверных
-#   сертификатов) стоит захардкоженный буфер ~8192 байт. Большая цепочка и/или
-#   OCSP-stapling (классика — www.microsoft.com) переполняют его и РВУТ
-#   REALITY-хендшейк целиком, хотя `curl https://сайт` отвечает 200. Проверка
-#   только по HTTP-коду (add-tcp) этот случай не видит: сервер выглядит здоровым,
-#   а клиент ловит "handshake failed".
-#
-# ЧТО МЕРЯЕМ (верхняя оценка размера записи):
-#   сумма DER всех сертификатов из -showcerts + запас на OCSP staple (если есть)
-#   + служебные поля Certificate-сообщения.
-# Печатает в stdout число байт, либо "-1" если сайт недоступен по :443.
-# (Функция идентична одноимённой в setup.sh — дублирование осознанное: xm.sh
-#  автономен от setup.sh.)
-# =============================================================================
+# Оценка размера TLS Certificate у SNI. Большая цепочка/OCSP staple переполняют
+# захардкоженный буфер REALITY (~8192 б) и рвут хендшейк, хотя curl отвечает 200.
+# Печатает верхнюю оценку размера записи в байтах, либо "-1" если сайт недоступен.
 _check_cert_size() {
   local host="$1"
   local raw tmpd cert size total=0 ocsp_add=0 framing=0 ncerts=0
@@ -290,8 +171,6 @@ _check_cert_size() {
   if [[ -z "$raw" ]]; then echo "-1"; return 0; fi
 
   tmpd=$(mktemp -d)
-  # Разбиваем цепочку на отдельные PEM (описательные строки s:/i: openssl x509
-  # игнорирует). Каждый BEGIN..END попадает в свой файл.
   printf '%s\n' "$raw" | awk -v d="$tmpd" '
     /-----BEGIN CERTIFICATE-----/ {c++}
     c>0 {print > (d "/cert" c ".pem")}
@@ -306,16 +185,13 @@ _check_cert_size() {
   rm -rf "$tmpd"
   [[ "$ncerts" -eq 0 ]] && { echo "-1"; return 0; }
 
-  # OCSP staple: точный размер из текста не достать, но факт наличия — да.
-  # Типичный single-cert OCSP ~1500 б; закладываем консервативно (оценка верхняя).
+  # OCSP staple ~1500 б (консервативная верхняя оценка) + служебные поля Certificate
   printf '%s' "$raw" | grep -qi "OCSP Response Data" && ocsp_add=1600
-  # Служебные поля Certificate: 4+1+3 + по 6 на каждый cert (len+ext_len).
   framing=$((10 + ncerts * 6))
   echo $((total + ocsp_add + framing)); return 0
 }
 
-# _sni_cert_gate <domain> — печатает вердикт через ok/warn/fail.
-# return 0 = можно использовать (или только предупреждение), 1 = не годится/недоступен.
+# Вердикт по домену через ok/warn/fail. 0 = годится/предупреждение, 1 = нет/недоступен
 _sni_cert_gate() {
   local host="$1" est
   info "Проверка размера TLS-сертификата $host (совместимость с REALITY)..."
@@ -331,51 +207,26 @@ _sni_cert_gate() {
   fi
 }
 
-# =============================================================================
-# [FIX-2] ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: атомарная замена конфига через mktemp
-#
-# Проблема предыдущего подхода "${CONFIG}.tmp":
-#   - Предсказуемое имя файла → symlink-атака: злоумышленник создаёт симлинк
-#     ${CONFIG}.tmp → /etc/cron.d/backdoor ДО записи временного файла,
-#     и jq пишет "конфиг" прямо в cron.
-#   - Race condition между записью и mv.
-#
-# mktemp создаёт файл с непредсказуемым именем в той же директории,
-# что и $CONFIG. mv в пределах одной ФС — атомарная операция (rename syscall),
-# старый файл виден либо полностью, либо нет — промежуточного состояния нет.
-# =============================================================================
+# Атомарная замена config.json: JSON через stdin → mktemp → chmod 640 root:nogroup → mv.
+# mktemp (непредсказуемое имя) исключает symlink/race, mv в пределах ФС атомарен.
 _atomic_write_config() {
-  # Принимает готовый JSON через stdin, атомарно заменяет $CONFIG
   local tmp
   tmp=$(mktemp "$(dirname "$CONFIG")/config.XXXXXX.json")
-  # Гарантируем удаление tmp при любом выходе (ошибка, прерывание)
   trap 'rm -f "$tmp"' EXIT INT TERM
   cat > "$tmp"
-  # [FIX] Не затираем рабочий конфиг, если на вход пришёл пустой или битый JSON.
-  # ПОЧЕМУ: функция вызывается как `jq ... | _atomic_write_config`. Если jq слева
-  # упадёт (например, битый фильтр или изменившаяся схема), `cat > "$tmp"` создаст
-  # пустой/обрезанный файл, а mv положит его поверх config.json. У add-client и
-  # del-client нет авто-отката (в отличие от add-tcp) — так можно молча снести
-  # рабочий конфиг и оставить Xray без запуска. Проверяем ДО mv.
+  # Не затираем рабочий конфиг пустым/битым JSON (если jq слева упал)
   if [[ ! -s "$tmp" ]] || ! jq empty "$tmp" 2>/dev/null; then
     echo -e "${RED}[ERR] Новый конфиг пуст или невалиден — запись отменена, config.json не тронут${NC}" >&2
-    rm -f "$tmp"
-    trap - EXIT INT TERM
-    return 1
+    rm -f "$tmp"; trap - EXIT INT TERM; return 1
   fi
-  # chmod/chown перед mv — чтобы новый конфиг с приватным ключом не был
-  # кратковременно доступен с правами umask (обычно 644).
-  # 640 + root:nogroup: только root пишет, nobody (xray) читает через группу.
+  # 640 root:nogroup выставляем до mv, чтобы приватный ключ не был доступен по umask
   chmod 640 "$tmp"
   chown root:nogroup "$tmp"
   mv "$tmp" "$CONFIG"
-  # Снимаем trap — файл уже перемещён, удалять нечего
   trap - EXIT INT TERM
 }
 
-# =============================================================================
-# QR-КОД: вывод прямо в терминал
-# =============================================================================
+# ─── QR-код в терминал ───────────────────────────────────────────────────────
 
 # _print_qr URI [заголовок]
 _print_qr() {
@@ -447,25 +298,18 @@ apply)
     ;;
 
 # ─── Смена домена-маски (единый источник правды для SNI/dest) ────────────────
-# [NEW] xm set-sni <domain>
-# ПОЧЕМУ ОТДЕЛЬНАЯ КОМАНДА, а не `xm edit` + ручной sed по nginx:
-#   Домен-маска физически дублируется в 4 местах:
-#     1) inbounds[0].streamSettings.realitySettings.serverNames  (XHTTP)
-#     2) inbounds[0].streamSettings.xhttpSettings.host           (XHTTP)
-#     3) inbounds[1].streamSettings.realitySettings.serverNames  (TCP, если есть)
-#     4) /etc/nginx/stream-enabled/reality-fallback.conf (map $ssl_preread_server_name)
-#   Забыл одно из мест → REALITY валидирует один SNI, а в URI клиенту уходит
-#   другой (_make_uri_xhttp берёт host из xhttpSettings в приоритете) → у клиента
-#   "server name mismatch", а diag раньше светил зелёным. Меняем ВСЕ 4 места
-#   атомарно (config через _atomic_write_config, nginx через sed+reload),
-#   прогоняем проверку размера сертификата и откатываемся при любой ошибке.
+# Домен-маска дублируется в 4 местах и должен меняться атомарно во всех:
+#   1) inbounds[0] realitySettings.serverNames (XHTTP)
+#   2) inbounds[0] xhttpSettings.host (XHTTP; именно его _make_uri_xhttp кладёт в URI)
+#   3) inbounds[1] realitySettings.serverNames (TCP, если есть)
+#   4) nginx map $ssl_preread_server_name в reality-fallback.conf
+# Рассинхрон → у клиента "server name mismatch". Откат при любой ошибке.
 set-sni)
     if [[ $EUID -ne 0 ]]; then
       echo -e "${RED}Запусти от root: sudo xm set-sni <domain>${NC}"; exit 1
     fi
     NEW_SNI="${2:-}"
     [[ -z "$NEW_SNI" ]] && read -rp "Новый домен-маска (SNI/dest): " NEW_SNI
-    # Тот же валидатор, что и в setup.sh — sed-safe, без спецсимволов
     if [[ ! "$NEW_SNI" =~ ^[a-zA-Z0-9._-]+$ ]]; then
       echo -e "${RED}Недопустимые символы в SNI: $NEW_SNI${NC}"; exit 1
     fi
@@ -474,13 +318,13 @@ set-sni)
     OLD_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
     echo -e "${BOLD}${CYAN}[ Смена домена-маски: ${OLD_SNI:-?} → ${NEW_SNI} ]${NC}"; sep
 
-    # (b) Проверка совместимости нового домена с REALITY (размер сертификата)
+    # Проверка совместимости нового домена с REALITY (размер сертификата)
     if ! _sni_cert_gate "$NEW_SNI"; then
       read -rp "Домен рискованный/недоступен. Всё равно применить? [y/N]: " C
       [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено, ничего не изменено."; exit 1; }
     fi
 
-    # ── Бэкапы для отката: config.json + nginx-conf ─────────────────────────
+    # Бэкапы для отката: config.json + nginx-conf
     mkdir -p "$BACKUP_DIR"; STAMP=$(date +%Y%m%d_%H%M%S)
     CFG_BACKUP="$BACKUP_DIR/config_${STAMP}_before_setsni.json"
     cp "$CONFIG" "$CFG_BACKUP"
@@ -488,7 +332,7 @@ set-sni)
     [[ -f "$NGINX_CONF" ]] && { NGX_BACKUP="${NGINX_CONF}.${STAMP}.bak"; cp "$NGINX_CONF" "$NGX_BACKUP"; }
     ok "Бэкапы созданы (config + nginx)"
 
-    # ── (a) config.json: все SNI-поля одним jq → атомарная запись ───────────
+    # config.json: все SNI-поля одним jq → атомарная запись
     if _has_tcp_inbound; then
       JQ_FILTER='.inbounds[0].streamSettings.realitySettings.serverNames = [$sni]
                  | .inbounds[0].streamSettings.xhttpSettings.host = $sni
@@ -504,15 +348,13 @@ set-sni)
       && ok "config.json: serverNames(XHTTP+TCP) + xhttpSettings.host → $NEW_SNI" \
       || ok "config.json: serverNames(XHTTP) + xhttpSettings.host → $NEW_SNI"
 
-    # ── (a) nginx map: старый SNI → новый в whitelist ───────────────────────
+    # nginx map: старый SNI → новый в whitelist
     if [[ -f "$NGINX_CONF" ]]; then
       if [[ -n "$OLD_SNI" ]]; then
-        # Экранируем точки старого домена (иначе sed трактует '.' как любой символ)
         OLD_ESC=$(printf '%s' "$OLD_SNI" | sed 's/[.[\*^$/]/\\&/g')
         sed -i "s/${OLD_ESC}/${NEW_SNI}/g" "$NGINX_CONF"
       fi
-      # Страховка на случай ручной правки: если новый SNI не попал в map —
-      # перезаписываем единственную не-default строку map корректной.
+      # Страховка: если новый SNI не попал в map — перезаписываем не-default строку
       NGX_CUR=$(grep -oE '^[[:space:]]*[a-zA-Z0-9._-]+[[:space:]]+[a-zA-Z0-9._-]+;' "$NGINX_CONF" 2>/dev/null | grep -v 'default' | head -1 | awk '{print $1}')
       if [[ "$NGX_CUR" != "$NEW_SNI" ]]; then
         sed -i -E "s/^[[:space:]]*[a-zA-Z0-9._-]+[[:space:]]+[a-zA-Z0-9._-]+;/    ${NEW_SNI}   ${NEW_SNI};/" "$NGINX_CONF"
@@ -529,7 +371,7 @@ set-sni)
       warn "nginx-conf $NGINX_CONF не найден — проверь REALITY fallback вручную"
     fi
 
-    # ── Валидация Xray новым конфигом + перезапуск (с откатом) ───────────────
+    # Валидация Xray новым конфигом + перезапуск (с откатом)
     if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
       systemctl restart xray; sleep 1
       if systemctl is-active --quiet xray; then
@@ -545,7 +387,7 @@ set-sni)
       exit 1
     fi
 
-    # ── (c) старые URI/QR больше не валидны — сразу выдаём новые ─────────────
+    # Старые URI/QR больше не валидны — сразу выдаём новые
     sep
     echo -e "${YELLOW}${BOLD}⚠  Домен-маска изменён на ${NEW_SNI}.${NC}"
     echo -e "${YELLOW}   ВСЕ ранее выданные URI и QR-коды больше НЕ валидны${NC}"
@@ -591,9 +433,6 @@ pubkey)
     sep
     echo -e "${BOLD}XHTTP inbound (inbounds[0]):${NC}"
     PRIV0=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // "NOT_FOUND"' "$CONFIG" 2>/dev/null)
-    # [FIX-1] Не выводим фрагменты приватного ключа.
-    # Любая часть ключа в терминале — потенциальная утечка через:
-    # tmux/screen scrollback, terminal history, log-файлы мониторинга.
     echo "  Приватный ключ в config.json: [СКРЫТ] (длина: ${#PRIV0})"
     PUB0=$(_get_pubkey_xhttp)
     echo "  Вычисленный публичный ключ:   ${PUB0}"
@@ -609,7 +448,6 @@ pubkey)
       sep
       echo -e "${BOLD}TCP inbound (inbounds[1]):${NC}"
       PRIV1=$(jq -r '.inbounds[1].streamSettings.realitySettings.privateKey // "NOT_FOUND"' "$CONFIG" 2>/dev/null)
-      # [FIX-1] Аналогично — только длина, без фрагментов
       echo "  Приватный ключ в config.json: [СКРЫТ] (длина: ${#PRIV1})"
       PUB1=$(_get_pubkey_tcp)
       echo "  Вычисленный публичный ключ:   ${PUB1}"
@@ -640,14 +478,13 @@ clients)
     fi
     ;;
 
-add-client)
+add|add-client)
     COMMENT="${2:-}"
     [[ -z "$COMMENT" ]] && read -rp "Имя клиента: " COMMENT
     NEW_UUID=$(xray uuid)
     mkdir -p "$BACKUP_DIR"
     cp "$CONFIG" "$BACKUP_DIR/config_$(date +%Y%m%d_%H%M%S).json"
 
-    # [FIX-2] Атомарная запись через mktemp вместо предсказуемого .tmp файла
     if _has_tcp_inbound; then
       jq --arg uuid "$NEW_UUID" --arg comment "$COMMENT" \
         '.inbounds[0].settings.clients += [{"id": $uuid, "comment": $comment}]
@@ -667,7 +504,7 @@ add-client)
     _apply && _print_qr_pair "$NEW_UUID" "$COMMENT" "$(_has_tcp_inbound && echo true || echo false)"
     ;;
 
-del-client)
+del|del-client)
     echo -e "${BOLD}Текущие клиенты:${NC}"
     jq -r '.inbounds[0].settings.clients[] |
       "  UUID: \(.id)  |  \(.comment // "—")"' "$CONFIG"
@@ -684,17 +521,6 @@ del-client)
     mkdir -p "$BACKUP_DIR"
     cp "$CONFIG" "$BACKUP_DIR/config_$(date +%Y%m%d_%H%M%S).json"
 
-    # [FIX-2/критично] Раньше здесь был предсказуемый "${CONFIG}.tmp" + mv,
-    # причём БЕЗ восстановления прав после записи. Два последствия:
-    #   1) symlink/race: имя ${CONFIG}.tmp предсказуемо — локальный злоумышленник
-    #      мог заранее подсунуть симлинк и заставить jq писать в чужой файл.
-    #      Ровно ради устранения этого и вводился mktemp в _atomic_write_config.
-    #   2) УТЕЧКА КЛЮЧА: jq создавал tmp по umask (644 root:root), а mv переносил
-    #      эти права на config.json. После каждого `xm del-client` config.json
-    #      из 640 root:nogroup превращался в 644 root:root — приватный ключ
-    #      REALITY становился читаем ЛЮБОМУ локальному пользователю (отмена FIX-1).
-    # Теперь используем ту же атомарную запись с mktemp + восстановлением
-    # 640 root:nogroup, что и остальные команды. Применяем Xray только при успехе.
     if jq --arg uuid "$TARGET_UUID" \
         '.inbounds |= map(.settings.clients |= map(select(.id != $uuid)))' \
         "$CONFIG" | _atomic_write_config; then
@@ -752,7 +578,7 @@ uri)
     esac
     ;;
 
-# ─── QR-КОД ──────────────────────────────────────────────────────────────────
+# ─── QR-код ──────────────────────────────────────────────────────────────────
 qr)
     MODE_TCP=false
     MODE_BOTH=false
@@ -884,11 +710,8 @@ add-tcp)
 
     echo -e "${CYAN}Генерация ключей X25519...${NC}"
     KEY_OUTPUT=$(xray x25519)
-    # [FIX] То же, что и в setup.sh: в новых версиях Xray вывод сменился на
-    # "PrivateKey/Password/Hash32", где Password = бывший Public key. Старый
-    # grep -i "ublic" на строку "Password:" не срабатывал → пустой публичный
-    # ключ → битый inbound. Якорим по метке в начале строки (^label): значение
-    # ключа никогда не стоит в начале строки, поэтому ложных срабатываний нет.
+    # В новых версиях Xray вывод: PrivateKey/Password/Hash32 (Password = бывший Public key).
+    # Якорим по метке в начале строки — значение ключа в начале строки не стоит.
     PRIV=$(echo "$KEY_OUTPUT" | grep -iE "^[[:space:]]*private"          | awk '{print $NF}' | head -1 | tr -d '[:space:]')
     PUB=$(echo  "$KEY_OUTPUT" | grep -iE "^[[:space:]]*(public|password)" | awk '{print $NF}' | head -1 | tr -d '[:space:]')
     [[ -z "$PRIV" || ${#PRIV} -lt 30 || -z "$PUB" || ${#PUB} -lt 30 ]] && {
@@ -916,9 +739,7 @@ add-tcp)
     else
       warn "dest вернул код $HTTP_CODE — продолжаем, но проверь вручную"
     fi
-    # [FIX-8] add-tcp наследует SNI от XHTTP inbound — размер уже проверялся при
-    # установке/set-sni. Но перепроверяем: сертификат сайта мог измениться, а
-    # add-tcp вводит второй inbound на тот же dest.
+    # Сертификат сайта мог измениться — перепроверяем размер под REALITY
     _sni_cert_gate "$SNI" || warn "SNI $SNI сомнителен по размеру сертификата (см. выше) — TCP inbound может ловить handshake failed"
 
     CLIENTS_TCP=$(jq '[.inbounds[0].settings.clients[] |
@@ -941,10 +762,6 @@ add-tcp)
           security: "reality",
           realitySettings: {
             show: false,
-            # [FIX] dest → локальный nginx stream-fallback (как в setup.sh),
-            # xver=2 для передачи реального IP. SNI совпадает с XHTTP inbound,
-            # значит whitelist в /etc/nginx/stream-enabled/reality-fallback.conf
-            # уже покрывает этот SNI — трогать nginx не нужно.
             dest: "127.0.0.1:10443",
             xver: 2,
             serverNames: [$sni],
@@ -962,7 +779,6 @@ add-tcp)
     cp "$CONFIG" "$BACKUP_FILE"
     echo -e "${GREEN}Бэкап: $BACKUP_FILE${NC}"
 
-    # [FIX-2] Атомарная запись через mktemp
     jq --argjson tcp "$TCP_INBOUND" '.inbounds += [$tcp]' \
       "$CONFIG" | _atomic_write_config
 
@@ -1040,31 +856,10 @@ add-tcp)
     ;;
 
 # ─── Обновление Xray ─────────────────────────────────────────────────────────
-# [NEW v5.4] Обновление Xray-core из ОФИЦИАЛЬНОГО источника — того же
-# install-release.sh из репозитория XTLS/Xray-install, которым ставит setup.sh.
-#
-# ПОЧЕМУ именно так, а не "curl | bash" в одну строку:
-#   1) `bash -c "$(curl ...)"` исполняет то, что пришло по сети, БЕЗ единой
-#      проверки. Если curl оборвался на середине / прокси вернул HTML-страницу
-#      ошибки / произошёл MITM на уровне сети — root исполнит мусор.
-#      Мы сначала скачиваем во временный файл (mktemp — непредсказуемое имя,
-#      см. FIX-2 v5.3 про symlink-атаки), делаем sanity-check (это bash-скрипт,
-#      а не HTML), и только потом запускаем.
-#   2) `--proto '=https' --tlsv1.2` — запрещаем downgrade на http:// при
-#      редиректах и старые версии TLS: канал доставки установщика должен быть
-#      не слабее канала, который он защищает.
-#   3) Бэкап config.json ДО обновления: официальный установщик существующий
-#      конфиг не трогает, но защищаемся от любых неожиданностей и даём
-#      гарантированную точку отката (xm restore).
-#   4) После обновления перепроверяем права config.json: некоторые версии
-#      установщика при переустановке unit/каталогов могут вернуть 644 —
-#      это молча отменило бы FIX-1 (приватный ключ REALITY стал бы читаем
-#      любому локальному пользователю).
-#   5) Валидация конфига (xray -test) НОВЫМ бинарником до перезапуска:
-#      если новая версия сломала совместимость схемы конфига — узнаём об этом
-#      из теста, а не из упавшего сервиса.
+# Обновление из официального XTLS/Xray-install: скачиваем во временный файл,
+# sanity-check (это shell-скрипт), только потом исполняем. --proto '=https'
+# --tlsv1.2 запрещают downgrade. Бэкап конфига + контроль прав 640 после.
 update)
-    # Обновление меняет системный бинарник и перезапускает сервис — только root
     if [[ $EUID -ne 0 ]]; then
       echo -e "${RED}Запусти от root: sudo xm update${NC}"; exit 1
     fi
@@ -1075,8 +870,7 @@ update)
     CUR_VER=$(xray version 2>/dev/null | head -1 || echo "не установлен")
     info "Текущая версия: $CUR_VER"
 
-    # Режим "--check": только сравнить с последним релизом на GitHub,
-    # ничего не скачивать и не менять на сервере.
+    # --check: только сравнить с последним релизом на GitHub, ничего не менять
     if [[ "${2:-}" == "--check" ]]; then
       LATEST=$(curl -fsSL --proto '=https' --tlsv1.2 --max-time 10 \
         https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
@@ -1086,7 +880,6 @@ update)
         exit 1
       fi
       info "Последний релиз на GitHub: $LATEST"
-      # Сравниваем только цифры версии: "Xray 25.1.30 (..." vs "v25.1.30"
       CUR_NUM=$(echo "$CUR_VER" | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
       NEW_NUM=$(echo "$LATEST"  | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
       if [[ -n "$CUR_NUM" && "$CUR_NUM" == "$NEW_NUM" ]]; then
@@ -1101,15 +894,13 @@ update)
     read -rp "Обновить Xray-core? Сервис будет перезапущен. [y/N]: " UPD_CONFIRM
     [[ "$UPD_CONFIRM" =~ ^[Yy]$ ]] || { info "Отменено."; exit 0; }
 
-    # ── Шаг 1: бэкап конфига (точка отката) ─────────────────────────────────
+    # Шаг 1: бэкап конфига (точка отката)
     mkdir -p "$BACKUP_DIR"
     UPD_BACKUP="$BACKUP_DIR/config_$(date +%Y%m%d_%H%M%S)_before_update.json"
     cp "$CONFIG" "$UPD_BACKUP"
     ok "Бэкап конфига: $UPD_BACKUP"
 
-    # ── Шаг 2: скачиваем официальный установщик во временный файл ───────────
-    # URL захардкожен на официальный репозиторий — не принимаем его из
-    # аргументов/переменных окружения, чтобы команду нельзя было "перенацелить".
+    # Шаг 2: скачиваем официальный установщик во временный файл (URL захардкожен)
     INSTALLER_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
     INSTALLER=$(mktemp /tmp/xray-install.XXXXXX.sh)
     trap 'rm -f "$INSTALLER"' EXIT INT TERM
@@ -1121,17 +912,14 @@ update)
       exit 1
     fi
 
-    # Sanity-check: файл непустой и начинается с shebang (#!),
-    # т.е. это скрипт, а не HTML-страница ошибки от прокси/капчи.
+    # Sanity-check: непустой и начинается с shebang (не HTML-страница ошибки)
     if [[ ! -s "$INSTALLER" ]] || ! head -1 "$INSTALLER" | grep -q '^#!'; then
       fail "Скачанный файл не похож на shell-скрипт — установка отменена"
       exit 1
     fi
     ok "Установщик скачан и прошёл базовую проверку"
 
-    # ── Шаг 3: запускаем обновление ──────────────────────────────────────────
-    # Официальный установщик: обновляет бинарник + geodata, существующий
-    # config.json НЕ перезаписывает, systemd unit переустанавливает.
+    # Шаг 3: обновление (бинарник + geodata; config.json не трогается)
     if ! bash "$INSTALLER" @ install; then
       fail "Установщик завершился с ошибкой — бинарник мог не обновиться"
       warn "Проверь: xray version  и  journalctl -u xray -n 30"
@@ -1141,8 +929,7 @@ update)
     NEW_VER=$(xray version 2>/dev/null | head -1 || echo "?")
     ok "Бинарник обновлён: $NEW_VER"
 
-    # ── Шаг 4: контроль прав на config.json ─────────────────────────────────
-    # Приватный ключ REALITY не должен стать читаемым всем после обновления.
+    # Шаг 4: контроль прав config.json (приватный ключ не должен стать всеобщим)
     UPD_PERMS=$(stat -c "%a %U:%G" "$CONFIG" 2>/dev/null || echo "?")
     if [[ "$UPD_PERMS" != "640 root:nogroup" ]]; then
       warn "Права config.json после обновления: $UPD_PERMS — восстанавливаю 640 root:nogroup"
@@ -1151,7 +938,7 @@ update)
     fi
     ok "config.json: 640 root:nogroup"
 
-    # ── Шаг 5: валидация конфига НОВЫМ бинарником + перезапуск ──────────────
+    # Шаг 5: валидация конфига новым бинарником + перезапуск
     if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
       ok "Конфиг валиден для новой версии"
       systemctl restart xray
@@ -1176,12 +963,7 @@ update)
     fi
     ;;
 
-# [NEW v5.4] Обновление geoip.dat / geosite.dat отдельно от бинарника.
-# ПОЧЕМУ это отдельная и ВАЖНАЯ операция: routing-правила geoip:cn и geoip:ir
-# (FIX-6 из setup.sh — блокировка сканирующих сетей) работают по этим базам.
-# Диапазоны IP у провайдеров мигрируют; с устаревшей базой часть сканирующих
-# адресов перестаёт попадать под блокировку, а легитимные адреса могут
-# блокироваться ошибочно. Обновлять стоит регулярно (например, раз в месяц).
+# Обновление geoip.dat / geosite.dat (базы для routing-правил geoip:cn / geoip:ir)
 update-geo)
     if [[ $EUID -ne 0 ]]; then
       echo -e "${RED}Запусти от root: sudo xm update-geo${NC}"; exit 1
@@ -1194,7 +976,6 @@ update-geo)
     INSTALLER=$(mktemp /tmp/xray-install.XXXXXX.sh)
     trap 'rm -f "$INSTALLER"' EXIT INT TERM
 
-    # Та же дисциплина, что и в update: скачать → проверить → исполнить
     if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 \
         -o "$INSTALLER" "$INSTALLER_URL"; then
       fail "Не удалось скачать установщик"
@@ -1205,11 +986,9 @@ update-geo)
       exit 1
     fi
 
-    # Официальная подкоманда установщика: обновляет ТОЛЬКО geoip.dat/geosite.dat
     if bash "$INSTALLER" @ install-geodata; then
       ok "geodata обновлена"
-      # Xray читает geo-файлы при старте — без перезапуска новая база
-      # не применится. _apply валидирует конфиг перед рестартом.
+      # Xray читает geo-файлы при старте — нужен перезапуск
       _apply
     else
       fail "Обновление geodata завершилось с ошибкой"
@@ -1312,13 +1091,8 @@ diag)
     done
 
     echo -e "\n${BOLD}[ 2 ] Порты${NC}"; sep
+    # Точное сопоставление порта: ":PORT([^0-9]|$)", иначе ":443" ловил бы ":4433"
     XHTTP_PORT=$(jq -r '.inbounds[0].port' "$CONFIG" 2>/dev/null || echo "?")
-    # [DIAG-FIX-2] Точное сопоставление порта: ":${PORT}([^0-9]|$)".
-    # ПОЧЕМУ: раньше grep -q ":${XHTTP_PORT}" был подстрочным и давал ложные
-    # совпадения — ":443" матчил ":4433", а ":80" матчил ":8080". В итоге
-    # диагностика могла сказать "порт слушается", хотя слушается СОСЕДНИЙ порт,
-    # а нужный — мёртв. Требуем, чтобы после номера порта шёл нецифровой символ
-    # (пробел/скобка из вывода ss) либо конец строки.
     if ss -tlnp | grep -qE ":${XHTTP_PORT}([^0-9]|$)"; then
       ok "Порт $XHTTP_PORT (XHTTP) слушается"
     else
@@ -1348,7 +1122,6 @@ diag)
     info "Inbound'ов: $(jq '.inbounds | length' "$CONFIG")"
     info "Клиентов:   $(jq '.inbounds[0].settings.clients | length' "$CONFIG")"
 
-    # [FIX-1] Проверяем права на config.json — должно быть 640 (root:nogroup)
     CONFIG_PERMS=$(stat -c "%a" "$CONFIG" 2>/dev/null || echo "???")
     if [[ "$CONFIG_PERMS" == "640" ]]; then
       ok "config.json права: 640 (root:nogroup — xray читает, остальные нет)"
@@ -1388,32 +1161,18 @@ diag)
     fi
 
     echo -e "\n${BOLD}[ 5 ] Доступность upstream-сайта (реальный dest REALITY)${NC}"; sep
-    # [DIAG-FIX-1] Раньше блок пытался curl'ить значение realitySettings.dest.
-    # Но после перехода на nginx stream-fallback dest = "127.0.0.1:10443", а этот
-    # листенер требует PROXY protocol → curl к нему ВСЕГДА падал (000) → ложный
-    # ((ISSUES++)) на каждом запуске diag, даже на полностью здоровом сервере.
-    # (Заодно старый sed 's/:443//' не срабатывал на ":10443", т.к. там нет
-    #  подстроки ":443".)
-    #
-    # Что реально важно проверить: доступен ли РЕАЛЬНЫЙ сайт (serverNames[0]),
-    # на который nginx проксирует REALITY-хендшейк. Если nginx не может достучаться
-    # до этого сайта — REALITY fallback ломается, и активные зонды получают reset
-    # вместо валидного TLS. Именно это палит сервер для DPI. Сам локальный листенер
-    # 127.0.0.1:10443 отдельно проверяется в блоке [ 6 ].
+    # dest = 127.0.0.1:10443 (локальный fallback), поэтому проверяем реальный
+    # upstream = serverNames[0], на который nginx проксирует REALITY-хендшейк.
     DEST_RAW=$(jq -r '.inbounds[0].streamSettings.realitySettings.dest' "$CONFIG" 2>/dev/null)
     SNI_UP=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG" 2>/dev/null)
     if [[ "$DEST_RAW" =~ ^127\.0\.0\.1: || "$DEST_RAW" =~ ^localhost: ]]; then
-      # Новая архитектура: dest — локальный fallback, реальный upstream = SNI
       CHECK_HOST="$SNI_UP"
     else
-      # Старая схема (dest указывал прямо на внешний сайт) — проверяем его
       CHECK_HOST=$(echo "$DEST_RAW" | sed 's/:443$//')
     fi
     info "Проверяю реальный upstream: $CHECK_HOST"
     HTTP_CODE=$(curl -svo /dev/null "https://${CHECK_HOST}" \
       --max-time 8 --connect-timeout 4 -w "%{http_code}" 2>/dev/null || echo "000")
-    # Любой валидный HTTP-статус (1xx-5xx) означает, что TLS+HTTP до сайта прошли,
-    # т.е. сайт достижим. Провал = "000" (не смогли подключиться/разрешить имя).
     if [[ "$HTTP_CODE" =~ ^[1-5][0-9][0-9]$ ]]; then
       ok "upstream ${CHECK_HOST} отвечает (HTTP $HTTP_CODE) — путь fallback до реального сайта жив"
     else
@@ -1421,8 +1180,6 @@ diag)
     fi
 
     echo -e "\n${BOLD}[ 6 ] REALITY fallback (nginx stream)${NC}"; sep
-    # Настоящий fallback слушает локально на 10443. Если его нет — REALITY dest
-    # мёртв и ВСЕ хендшейки (в т.ч. легитимные) упадут.
     if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:10443"; then
       ok "nginx stream-fallback слушает 127.0.0.1:10443"
     else
@@ -1445,16 +1202,13 @@ diag)
     fi
 
     echo -e "\n${BOLD}[ 6b ] Синхронизация домена-маски (SNI/dest)${NC}"; sep
-    # [NEW] Раньше diag читал каждое поле SNI по отдельности и НЕ сверял их между
-    # собой — рассинхрон проходил незамеченным, а клиент ловил "server name
-    # mismatch". Сверяем все источники правды с эталоном serverNames[0] (XHTTP).
+    # Сверяем все источники SNI с эталоном serverNames[0] (XHTTP)
     SNI_REF=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
     SNI_HOST=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host // ""' "$CONFIG")
     NGINX_CONF="/etc/nginx/stream-enabled/reality-fallback.conf"
     NGINX_SNI=$(grep -oE '^[[:space:]]*[a-zA-Z0-9._-]+[[:space:]]+[a-zA-Z0-9._-]+;' "$NGINX_CONF" 2>/dev/null | grep -v 'default' | head -1 | awk '{print $1}')
     info "эталон serverNames[0] (XHTTP): ${SNI_REF:-<пусто>}"
 
-    # host в xhttpSettings — именно его _make_uri_xhttp кладёт в URI (приоритетно)
     if [[ -z "$SNI_HOST" ]]; then
       warn "xhttpSettings.host пуст — URI возьмёт serverNames[0], но лучше задать явно: xm set-sni $SNI_REF"
     elif [[ "$SNI_HOST" == "$SNI_REF" ]]; then
@@ -1500,7 +1254,6 @@ diag)
     fi
 
     echo -e "\n${BOLD}[ 9 ] Routing (DPI защита)${NC}"; sep
-    # Проверяем наличие блокировки сканирующих AS
     if jq -e '.routing.rules[] | select(.ip != null) | .ip[] | select(. == "geoip:cn")' \
         "$CONFIG" &>/dev/null; then
       ok "Блокировка geoip:cn настроена"
@@ -1545,23 +1298,17 @@ diag)
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
     ;;
 
-diag-dpi)
+dpi|diag-dpi)
     echo -e "\n${BOLD}${CYAN}[ DPI / Active Probe Resistance ]${NC}\n"
 
-    # [DIAG-FIX] Переменная DEST убрана: старый
-    #   DEST=$(jq ... .dest | sed 's/:443//')
-    # давал "127.0.0.1:10443" (sed на ":10443" ничего не убирал) и НИГДЕ не
-    # использовался осмысленно. Здесь работаем с реальным SNI и IP сервера.
     PORT=$(jq -r '.inbounds[0].port' "$CONFIG")
     SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
     SERVER_IP=$(_get_server_ip)
 
     sep
     echo -e "${BOLD}Тест 0: Синхронизация SNI (источники правды)${NC}"
-    # [NEW] diag-dpi гоняет зонды по serverNames[0]. Если xhttpSettings.host или
-    # nginx-map расходятся с ним — клиент в реальности шлёт ДРУГОЙ SNI, а тесты
-    # ниже (они используют $SNI = serverNames[0]) этого не заметят и покажут
-    # «неотличимо», хотя живой клиент получает mismatch. Поэтому сверяем сначала.
+    # Тесты ниже гоняют зонды по serverNames[0]. Если host/nginx-map расходятся —
+    # живой клиент шлёт другой SNI, а тесты этого не заметят. Поэтому сверяем сначала.
     SNI_HOST_D=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host // ""' "$CONFIG")
     NGX_CONF_D="/etc/nginx/stream-enabled/reality-fallback.conf"
     NGX_SNI_D=$(grep -oE '^[[:space:]]*[a-zA-Z0-9._-]+[[:space:]]+[a-zA-Z0-9._-]+;' "$NGX_CONF_D" 2>/dev/null | grep -v 'default' | head -1 | awk '{print $1}')
@@ -1578,22 +1325,9 @@ diag-dpi)
 
     sep
     echo -e "${BOLD}Тест 1: Active probe resistance (главный тест REALITY)${NC}"
-    # [DIAG-FIX-3] Раньше тест считал, что провал TLS-хендшейка — это "ожидаемо
-    # при корректном REALITY". Это КОНЦЕПТУАЛЬНО НЕВЕРНО и обесценивало проверку.
-    #
-    # Как на самом деле работает probe-resistance REALITY:
-    #   Активный зонд (обычный TLS-клиент без наших REALITY-ключей) с ЦЕЛЕВЫМ SNI
-    #   не проходит аутентификацию REALITY, и сервер прозрачно форвардит его
-    #   соединение на fallback → реальный сайт ($SNI:443). Поэтому зонд ДОЛЖЕН
-    #   получить УСПЕШНЫЙ хендшейк и НАСТОЯЩИЙ сертификат целевого сайта —
-    #   ровно то же, что при прямом подключении к $SNI. reset/сбой хендшейка —
-    #   это НЕ норма, а аномалия, которая как раз выдаёт прокси для DPI.
-    #
-    # Поэтому корректная проверка: снять сертификат, который наш сервер отдаёт
-    # зонду, и сравнить его с сертификатом реального $SNI. Совпадение (по
-    # fingerprint или хотя бы по issuer) = мы неотличимы от настоящего сайта.
-    # -tls1_3 заодно проверяет, что TLS 1.3 работает (REALITY без него невозможен).
-
+    # Зонд с целевым SNI прозрачно форвардится на fallback → реальный сайт, поэтому
+    # ДОЛЖЕН получить успешный хендшейк с настоящим сертификатом. Сравниваем cert
+    # нашего сервера с cert реального $SNI (fingerprint/issuer). -tls1_3 проверяет TLS 1.3.
     OUR_CERT=$(echo | timeout 6 openssl s_client \
       -connect "${SERVER_IP}:${PORT}" -servername "$SNI" -tls1_3 2>/dev/null \
       | openssl x509 -noout -issuer -subject -fingerprint -sha256 2>/dev/null || echo "")
@@ -1633,7 +1367,6 @@ diag-dpi)
 
     sep
     echo -e "${BOLD}Тест 3: REALITY fallback (nginx stream)${NC}"
-    # Это TCP/stream пасс-тру (не HTTP), поэтому проверяем сам листенер, а не код 200.
     if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:10443"; then
       ok "stream-fallback слушает 127.0.0.1:10443"
     else
@@ -1642,18 +1375,8 @@ diag-dpi)
 
     sep
     echo -e "${BOLD}Тест 4: Ответ на случайный путь (сравнение с реальным сайтом)${NC}"
-    # [DIAG-FIX-4] Раньше запрос шёл на "https://${SERVER_IP}/rand" — т.е. ПО IP.
-    # curl при подключении к IP НЕ отправляет SNI, поэтому REALITY не находил
-    # совпадения serverNames и уводил соединение в drop через nginx-whitelist —
-    # реальный сайт при этом вообще не участвовал, а ожидание "404" было
-    # взято с потолка.
-    #
-    # Правильная логика: обычный (не-REALITY) HTTPS-клиент с ПРАВИЛЬНЫМ SNI
-    # форвардится REALITY на fallback → реальный $SNI. Значит на случайный путь
-    # наш сервер должен отвечать ТЕМ ЖЕ HTTP-кодом, что и настоящий сайт. Если
-    # коды совпадают — по HTTP-поведению мы неотличимы от реального сайта.
-    # --resolve заставляет curl пойти на НАШ IP:PORT, но предъявить в TLS (SNI)
-    # и в заголовке Host именно $SNI.
+    # --resolve: curl идёт на наш IP:PORT, но предъявляет в TLS (SNI) и Host именно $SNI.
+    # На случайный путь наш сервер должен отвечать тем же кодом, что и реальный сайт.
     RAND_PATH="/$(openssl rand -hex 8)"
     OUR_RAND=$(curl -sk -o /dev/null -w "%{http_code}" \
       --resolve "${SNI}:${PORT}:${SERVER_IP}" \
@@ -1761,9 +1484,7 @@ diag-tls)
     SERVER_IP=$(_get_server_ip)
 
     sep
-    # [DIAG-FIX] Эталон — реальный сайт из serverNames[0], а НЕ realitySettings.dest.
-    # dest теперь = 127.0.0.1:10443 (локальный fallback), сравнивать с ним cert
-    # бессмысленно. Реальный сайт, чей сертификат "одалживает" REALITY, — это SNI.
+    # Эталон — реальный сайт из serverNames[0] (dest = локальный fallback)
     echo -e "${BOLD}Сертификат реального сайта (${SNI}):${NC}"
     echo | timeout 5 openssl s_client \
       -connect "${SNI}:443" -servername "$SNI" 2>/dev/null \
@@ -1871,50 +1592,26 @@ diag-log)
     echo "  xm backup / restore / backups"
     echo ""
     echo -e "${BOLD}Клиенты:${NC}"
-    echo "  xm clients                   Показать всех"
-    echo "  xm add-client [имя]          Добавить (все inbound)"
-    echo "  xm del-client                Удалить по UUID"
-    echo "  xm uri                       VLESS URI — интерактивный выбор"
-    echo "  xm uri --tcp                 TCP URI"
-    echo "  xm uri [имя]                 URI по имени"
-    echo "  xm uri --all                 Все URI всех клиентов"
+    echo -e "  ${GREEN}xm add [имя]${NC} / ${GREEN}del${NC} / clients      Добавить / удалить / список"
+    echo    "  xm uri [имя|--tcp|--all]         VLESS URI (по умолч. — выбор клиента)"
     echo ""
     echo -e "${BOLD}${GREEN}QR-коды:${NC}"
-    echo -e "  ${GREEN}xm qr${NC}                QR для выбранного клиента (XHTTP)"
-    echo -e "  ${GREEN}xm qr --tcp${NC}          QR для TCP inbound"
-    echo -e "  ${GREEN}xm qr --both${NC}         Оба QR (XHTTP + TCP)"
-    echo -e "  ${GREEN}xm qr --all${NC}          QR для всех клиентов"
-    echo -e "  ${GREEN}xm qr --all --tcp${NC}    QR TCP для всех клиентов"
-    echo -e "  ${GREEN}xm qr [имя]${NC}          QR по имени клиента"
+    echo -e "  ${GREEN}xm qr [имя] [--tcp|--both|--all]${NC}   По умолч. — выбор клиента, XHTTP"
     echo ""
     echo -e "${BOLD}TCP inbound:${NC}"
-    echo -e "  ${GREEN}xm add-tcp${NC}           Добавить XTLS-Vision/TCP inbound"
+    echo -e "  ${GREEN}xm add-tcp${NC}                       Добавить XTLS-Vision/TCP inbound"
     echo ""
     echo -e "${BOLD}${GREEN}Обновление:${NC}"
-    echo -e "  ${GREEN}xm update${NC}            Обновить Xray-core (официальный источник)"
-    echo -e "  ${GREEN}xm update --check${NC}    Только проверить последнюю версию"
-    echo -e "  ${GREEN}xm update-geo${NC}        Обновить geoip.dat / geosite.dat"
+    echo -e "  ${GREEN}xm update [--check]${NC} / ${GREEN}update-geo${NC}   Xray-core / geoip.dat / geosite.dat"
     echo ""
-    echo -e "${BOLD}Nginx:${NC}"
-    echo "  xm nginx-status / nginx-log / nginx-reload / nginx-probes"
-    echo ""
-    echo -e "${BOLD}Fail2ban:${NC}"
-    echo "  xm ban-list / ban-ssh-stat / unban [IP]"
-    echo ""
-    echo -e "${BOLD}Логи:${NC}"
-    echo "  xm log / log-live / log-clear"
+    echo -e "${BOLD}Nginx:${NC}    xm nginx-status / nginx-log / nginx-reload / nginx-probes"
+    echo -e "${BOLD}Fail2ban:${NC} xm ban-list / ban-ssh-stat / unban [IP]"
+    echo -e "${BOLD}Логи:${NC}     xm log / log-live / log-clear"
+    echo -e "${BOLD}Инфо:${NC}     xm info / paths / uuid / pubkey"
     echo ""
     echo -e "${BOLD}${GREEN}Диагностика:${NC}"
-    echo -e "  ${GREEN}xm diag${NC}              Полная диагностика"
-    echo -e "  ${GREEN}xm pubkey${NC}            Диагностика публичных ключей"
-    echo -e "  ${GREEN}xm diag-dpi${NC}          Устойчивость к DPI"
-    echo -e "  ${GREEN}xm diag-ntp${NC}          NTP / дрейф времени"
-    echo -e "  ${GREEN}xm diag-ports${NC}        Открытые порты"
-    echo -e "  ${GREEN}xm diag-tls${NC}          TLS сертификат"
-    echo -e "  ${GREEN}xm diag-fw${NC}           Firewall и ban-статус"
-    echo -e "  ${GREEN}xm diag-log${NC}          Анализ лога"
-    echo ""
-    echo -e "${BOLD}Инфо:${NC}"
-    echo "  xm info / paths / uuid / pubkey"
+    echo -e "  ${GREEN}xm diag${NC}                          Полная диагностика"
+    echo -e "  ${GREEN}xm dpi${NC}                           Устойчивость к DPI"
+    echo    "  Прочее: pubkey / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log"
     ;;
 esac
