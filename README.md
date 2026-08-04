@@ -18,7 +18,7 @@
 Заходишь на VPS по SSH и одной командой скачиваешь + запускаешь установку:
 
 ```bash
-git clone https://github.com/grokki91/xray.git && cd xray && sudo bash setup.sh
+git clone https://github.com/grokki91/xray.git && cd xray && sudo bash script.sh
 ```
 
 Команда сама поставит `git`, склонирует репозиторий (`setup.sh` и `xm.sh` лежат в его корне — они должны быть рядом, скрипт это использует), зайдёт в папку и запустит установку от root.
