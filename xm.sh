@@ -44,6 +44,15 @@ _get_field() {
     | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '[:space:]'
 }
 
+# SNI из whitelist-map: строка строго вида "X   X;".
+# [FIX] Прежняя регулярка '^\s*\w+\s+\w+;' совпадала также с
+# "resolver_timeout 5s;" и "set_real_ip_from 127.0.0.1;" — при чтении спасал
+# head -1, но sed -i в set-sni шёл без адресации и переписывал ИХ ТОЖЕ.
+_get_nginx_sni() {
+  awk '$1 ~ /^[a-zA-Z0-9._-]+$/ && $2 == $1";" {print $1; exit}' \
+    /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null
+}
+
 # Вычисление публичного ключа X25519 из приватного (stdin → stdout)
 _derive_pubkey() {
   python3 -c "
@@ -350,14 +359,19 @@ set-sni)
 
     # nginx map: старый SNI → новый в whitelist
     if [[ -f "$NGINX_CONF" ]]; then
-      if [[ -n "$OLD_SNI" ]]; then
-        OLD_ESC=$(printf '%s' "$OLD_SNI" | sed 's/[.[\*^$/]/\\&/g')
-        sed -i "s/${OLD_ESC}/${NEW_SNI}/g" "$NGINX_CONF"
+      # Источник правды — сам файл (а не config.json): заменяем текущий SNI
+      # во ВСЕХ map сразу ($reality_upstream и $log_probe).
+      NGX_CUR=$(_get_nginx_sni)
+      if [[ -n "$NGX_CUR" && "$NGX_CUR" != "$NEW_SNI" ]]; then
+        NGX_ESC=$(printf '%s' "$NGX_CUR" | sed 's/[.[\*^$/]/\\&/g')
+        sed -i "s/${NGX_ESC}/${NEW_SNI}/g" "$NGINX_CONF"
       fi
-      # Страховка: если новый SNI не попал в map — перезаписываем не-default строку
-      NGX_CUR=$(grep -oE '^[[:space:]]*[a-zA-Z0-9._-]+[[:space:]]+[a-zA-Z0-9._-]+;' "$NGINX_CONF" 2>/dev/null | grep -v 'default' | head -1 | awk '{print $1}')
-      if [[ "$NGX_CUR" != "$NEW_SNI" ]]; then
-        sed -i -E "s/^[[:space:]]*[a-zA-Z0-9._-]+[[:space:]]+[a-zA-Z0-9._-]+;/    ${NEW_SNI}   ${NEW_SNI};/" "$NGINX_CONF"
+      # Проверяем результат вместо «страховочного» sed без адресации
+      if [[ "$(_get_nginx_sni)" != "$NEW_SNI" ]]; then
+        fail "SNI в $NGINX_CONF не обновился — откат"
+        [[ -n "$NGX_BACKUP" ]] && cp "$NGX_BACKUP" "$NGINX_CONF"
+        cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        exit 1
       fi
       if ! nginx -t 2>/dev/null; then
         fail "nginx -t не прошёл — откат nginx и config"
@@ -920,7 +934,7 @@ update)
     ok "Установщик скачан и прошёл базовую проверку"
 
     # Шаг 3: обновление (бинарник + geodata; config.json не трогается)
-    if ! bash "$INSTALLER" @ install; then
+    if ! bash "$INSTALLER" install; then
       fail "Установщик завершился с ошибкой — бинарник мог не обновиться"
       warn "Проверь: xray version  и  journalctl -u xray -n 30"
       exit 1
@@ -986,7 +1000,7 @@ update-geo)
       exit 1
     fi
 
-    if bash "$INSTALLER" @ install-geodata; then
+    if bash "$INSTALLER" install-geodata; then
       ok "geodata обновлена"
       # Xray читает geo-файлы при старте — нужен перезапуск
       _apply
@@ -996,25 +1010,38 @@ update-geo)
     fi
     ;;
 
+autoupd)
+    case "${2:-status}" in
+    on)   systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; ok "Включено" ;;
+    off)  systemctl disable --now apt-daily-upgrade.timer; ok "Выключено" ;;
+    now)  unattended-upgrade --dry-run -v 2>&1 | tail -20 ;;
+    log)  tail -40 /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null || echo "Лог пуст" ;;
+    *)    systemctl list-timers apt-daily-upgrade.timer --no-pager | sed 's/^/  /'
+      echo -e "\n${BOLD}Последние применённые:${NC}"
+      UUL=$(grep -a "Packages that will be upgraded" /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -5)
+      [[ -n "$UUL" ]] && sed 's/^/  /' <<< "$UUL" || echo "  нет данных"
+      ;;
+    esac
+    ;;
+
 # ─── Nginx ───────────────────────────────────────────────────────────────────
 nginx-status)  systemctl status nginx --no-pager ;;
 nginx-log)     tail -30 /var/log/nginx/reality_fallback.log 2>/dev/null || echo "Лог пуст" ;;
 nginx-reload)  nginx -t && systemctl reload nginx && echo -e "${GREEN}Nginx перезагружен${NC}" ;;
 nginx-probes)
-    echo -e "${BOLD}Топ реальных IP → REALITY fallback (соединения):${NC}"
-    echo -e "${CYAN}(включает и легитимные хендшейки — смотри на аномальные всплески)${NC}"
+    echo -e "${BOLD}Активные зонды (соединения с чужим/пустым SNI):${NC}"
+    echo -e "${CYAN}(легитимные клиенты сюда НЕ попадают — у них правильный SNI)${NC}"
     awk '{print $1}' /var/log/nginx/reality_fallback.log 2>/dev/null \
       | sort | uniq -c | sort -rn | head -20 || echo "Лог недоступен"
     ;;
 
 # ─── Fail2ban ─────────────────────────────────────────────────────────────────
 ban-list)
-    echo -e "${BOLD}Забаненные IP (SSH):${NC}"
-    fail2ban-client status sshd 2>/dev/null || echo "fail2ban не запущен"
-    fail2ban-client status nginx-reality-flood &>/dev/null && {
-      echo -e "\n${BOLD}Забаненные IP (nginx-reality-flood):${NC}"
-      fail2ban-client status nginx-reality-flood
-    } || true
+    for jail in $(_jails); do
+      echo -e "${BOLD}Джейл ${jail}:${NC}"
+      fail2ban-client status "$jail" 2>/dev/null | sed 's/^/  /'
+    done
+    [[ -z "$(_jails)" ]] && echo "fail2ban не запущен или джейлов нет"
     ;;
 
 ban-ssh-stat)  fail2ban-client status 2>/dev/null || echo "fail2ban не запущен" ;;
@@ -1029,6 +1056,32 @@ unban)
           || echo -e "${YELLOW}${jail}: IP не в бане${NC}"
       } || true
     done
+    ;;
+
+# Временное включение access-лога для отладки. Держать выключенным!
+log-access)
+    if [[ $EUID -ne 0 ]]; then
+      echo -e "${RED}Запусти от root: sudo xm log-access on|off${NC}"; exit 1
+    fi
+    case "${2:-status}" in
+    on)
+      jq '.log.access = "/var/log/xray/access.log"' "$CONFIG" | _atomic_write_config || exit 1
+      _apply || exit 1
+      warn "Access-лог ВКЛЮЧЁН — пишется 'IP клиента → адрес назначения'"
+      warn "Выключи сразу после отладки: sudo xm log-access off"
+      ;;
+    off)
+      jq '.log.access = "none"' "$CONFIG" | _atomic_write_config || exit 1
+      _apply || exit 1
+      [[ -f /var/log/xray/access.log ]] && \
+        { shred -u /var/log/xray/access.log 2>/dev/null || rm -f /var/log/xray/access.log; }
+      ok "Access-лог выключен, файл затёрт"
+      ;;
+    *)
+      CUR=$(jq -r '.log.access // "<не задано>"' "$CONFIG")
+      [[ "$CUR" == "none" ]] && ok "Access-лог отключён (none)" || warn "Access-лог: $CUR"
+      ;;
+    esac
     ;;
 
 # ─── Логи ────────────────────────────────────────────────────────────────────
@@ -1047,6 +1100,9 @@ info)
     echo -e "  nginx:     $(systemctl is-active nginx)"
     echo -e "  fail2ban:  $(systemctl is-active fail2ban)"
     echo -e "  chrony:    $(systemctl is-active chrony)"
+    echo ""
+    echo -e "${BOLD}Логи:${NC}     xm log / log-live / log-clear"
+    echo -e "  ${GREEN}xm log-access on|off|status${NC}   Временный access-лог для отладки (по умолч. off)"
     echo ""
     PORT=$(jq -r '.inbounds[0].port' "$CONFIG")
     echo -e "${BOLD}Порт XHTTP:${NC} $PORT  ($(ss -tlnp | grep -c ":$PORT" || echo 0) сокет)"
@@ -1068,7 +1124,8 @@ paths)
     echo "  Лог Xray:    $LOG"
     echo "  Клиент-файл: $CLIENT_FILE"
     echo "  Бинарник:    $(which xray)"
-    echo "  Nginx conf:  /etc/nginx/sites-available/fallback"
+    echo "  Nginx conf:  /etc/nginx/stream-enabled/reality-fallback.conf  (тракт REALITY)"
+    echo "  Nginx :80:   /etc/nginx/sites-available/fallback  (только 301-редирект)"
     echo "  F2b jail:    /etc/fail2ban/jail.d/sshd-xray.conf"
     ;;
 
@@ -1086,9 +1143,10 @@ diag)
     ISSUES=0
 
     echo -e "${BOLD}[ 1 ] Сервисы${NC}"; sep
-    for svc in xray nginx fail2ban chrony; do
+for svc in xray nginx fail2ban chrony; do
       systemctl is-active --quiet "$svc" && ok "$svc запущен" || { fail "$svc НЕ запущен"; ((ISSUES++)); }
     done
+    [[ -f /var/run/reboot-required ]] && warn "Требуется перезагрузка (обновлено ядро/libc) — перезагрузи в удобное время" || true
 
     echo -e "\n${BOLD}[ 2 ] Порты${NC}"; sep
     # Точное сопоставление порта: ":PORT([^0-9]|$)", иначе ":443" ловил бы ":4433"
@@ -1200,6 +1258,13 @@ diag)
     else
       warn "limit_conn не найден в stream-fallback"
     fi
+    # limit_conn без realip считает всех как 127.0.0.1 → лимит 20 действует
+    # на весь сервер, а не на клиента, и отстреливает своих же (status=503).
+    if grep -rq "set_real_ip_from" /etc/nginx/stream-enabled/ 2>/dev/null; then
+      ok "set_real_ip_from настроен (limit_conn считает по реальному IP клиента)"
+    else
+      fail "set_real_ip_from не задан — limit_conn считает все соединения как 127.0.0.1, лимит действует на весь сервер"; ((ISSUES++))
+    fi
 
     echo -e "\n${BOLD}[ 6b ] Синхронизация домена-маски (SNI/dest)${NC}"; sep
     # Сверяем все источники SNI с эталоном serverNames[0] (XHTTP)
@@ -1246,26 +1311,31 @@ diag)
     echo -e "\n${BOLD}[ 8 ] Firewall (UFW)${NC}"; sep
     if ufw status | grep -q "Status: active"; then
       ok "UFW активен"
-      ufw status | grep -q "${SSH_P}" \
+      ufw status | grep -qE "(^|[^0-9])${SSH_P}/tcp" 
         && ok "SSH порт $SSH_P открыт в UFW" \
         || { fail "SSH порт $SSH_P не найден в UFW — риск потери доступа!"; ((ISSUES++)); }
     else
       fail "UFW не активен — сервер открыт!"; ((ISSUES++))
     fi
 
-    echo -e "\n${BOLD}[ 9 ] Routing (DPI защита)${NC}"; sep
-    if jq -e '.routing.rules[] | select(.ip != null) | .ip[] | select(. == "geoip:cn")' \
-        "$CONFIG" &>/dev/null; then
-      ok "Блокировка geoip:cn настроена"
+    echo -e "\n${BOLD}[ 9 ] Логирование (анонимность)${NC}"; sep
+    # [FIX-9] Заменено с проверки geoip:cn/ir — она рапортовала защиту,
+    # которой нет (routing работает после аутентификации, поле ip = назначение).
+    ACC=$(jq -r '.log.access // "<не задано>"' "$CONFIG")
+    if [[ "$ACC" == "none" ]]; then
+      ok "Xray access-лог отключён (log.access=none)"
     else
-      warn "geoip:cn не заблокирован в routing — рекомендуется"
+      fail "log.access=$ACC — Xray пишет 'IP клиента → адрес назначения'! Задай \"access\":\"none\""; ((ISSUES++))
     fi
-    if jq -e '.routing.rules[] | select(.ip != null) | .ip[] | select(. == "geoip:ir")' \
-        "$CONFIG" &>/dev/null; then
-      ok "Блокировка geoip:ir настроена"
+    if grep -q 'if=\$log_probe' /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null; then
+      ok "nginx fallback логирует только чужой SNI (IP клиентов не пишутся)"
     else
-      warn "geoip:ir не заблокирован в routing — рекомендуется"
+      fail "nginx fallback пишет IP ВСЕХ клиентов — нужен map \$log_probe + access_log ... if=\$log_probe"; ((ISSUES++))
     fi
+    JCOUNT=$(journalctl -u xray --since "1 hour ago" --no-pager 2>/dev/null | grep -c "accepted" || echo 0)
+    [[ "$JCOUNT" -eq 0 ]] \
+      && ok "В journald нет access-записей за последний час" \
+      || { fail "В journald $JCOUNT access-записей за час — очисти: journalctl --rotate && journalctl --vacuum-time=1s"; ((ISSUES++)); }
 
     echo -e "\n${BOLD}[ 10 ] Лог Xray${NC}"; sep
     if [[ -f "$LOG" ]] && [[ -s "$LOG" ]]; then
@@ -1408,19 +1478,16 @@ dpi|diag-dpi)
     esac
 
     sep
-    echo -e "${BOLD}Тест 7: Routing (блокировка сканирующих AS)${NC}"
-    if jq -e '.routing.rules[] | select(.ip != null) | .ip[] | select(. == "geoip:cn")' \
-        "$CONFIG" &>/dev/null; then
-      ok "geoip:cn заблокирован"
+    echo -e "${BOLD}Тест 7: Реакция на зонды (поведение как у реального сайта)${NC}"
+    # Настоящий сайт не банит сканеры. Если мы баним — это отличие,
+    # по которому сервер отделяется от www.apple.com.
+    if fail2ban-client status 2>/dev/null | grep -qi "reality\|xray"; then
+      warn "Есть fail2ban-джейл по трафику REALITY — бан сканеров демаскирует сервер"
     else
-      warn "geoip:cn не заблокирован — активные зонды из CN проходят"
+      ok "Зонды не банятся (только rate-limit) — реакция как у настоящего CDN"
     fi
-    if jq -e '.routing.rules[] | select(.ip != null) | .ip[] | select(. == "geoip:ir")' \
-        "$CONFIG" &>/dev/null; then
-      ok "geoip:ir заблокирован"
-    else
-      warn "geoip:ir не заблокирован"
-    fi
+    PROBES=$(wc -l < /var/log/nginx/reality_fallback.log 2>/dev/null || echo 0)
+    info "Зондов с чужим SNI в логе: $PROBES (свои клиенты сюда не пишутся)"
 
     sep
     echo -e "${BOLD}Тест 8: maxTimeDiff${NC}"
@@ -1602,6 +1669,7 @@ diag-log)
     echo -e "  ${GREEN}xm add-tcp${NC}                       Добавить XTLS-Vision/TCP inbound"
     echo ""
     echo -e "${BOLD}${GREEN}Обновление:${NC}"
+    echo -e "  ${GREEN}xm autoupd on|off|now|log|status${NC}  Автопатчи безопасности ОС (20:30 МСК)"
     echo -e "  ${GREEN}xm update [--check]${NC} / ${GREEN}update-geo${NC}   Xray-core / geoip.dat / geosite.dat"
     echo ""
     echo -e "${BOLD}Nginx:${NC}    xm nginx-status / nginx-log / nginx-reload / nginx-probes"
