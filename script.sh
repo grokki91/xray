@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Xray-core · VLESS + REALITY + XHTTP  ·  Auto Setup  v5.4
-#  Ubuntu 22.04 LTS · uTLS Chrome
+#  Xray-core · VLESS + REALITY + XHTTP  ·  Auto Setup  v5.5
+#  Ubuntu 24.04 LTS
 #
 #  Исправления v5 (относительно v4):
 #   - xm.sh автоматически копируется в /usr/local/bin/xm
@@ -128,7 +128,10 @@ _fetch_server_ip() {
     "https://api.ipify.org" \
     "https://ifconfig.me" \
     "https://api64.ipify.org"; do
-    ip=$(curl -fsSL --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
+    # [FIX] "|| true": под set -euo pipefail упавший curl роняет пайп (pipefail),
+    # присваивание возвращает !=0 и функция выходит на ПЕРВОМ источнике —
+    # резервные ifconfig.me / api64 не опрашивались вообще.
+    ip=$(curl -fsSL --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
     # Проверяем IPv4: четыре октета по 1-3 цифры
     if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
       echo "$ip"
@@ -283,9 +286,9 @@ read -rp "Выбор [1-2, Enter=1]: " MODE_CHOICE
 MODE_CHOICE=${MODE_CHOICE:-1}
 
 case "$MODE_CHOICE" in
-  1) XHTTP_MODE="auto";       WAIT_UPLOAD="false"; SINGBOX_METHOD="GET"  ;;
-  2) XHTTP_MODE="stream-one"; WAIT_UPLOAD="true";  SINGBOX_METHOD="POST" ;;
-  *) XHTTP_MODE="auto";       WAIT_UPLOAD="false"; SINGBOX_METHOD="GET"  ;;
+  1) XHTTP_MODE="auto";       SINGBOX_METHOD="GET"  ;;
+  2) XHTTP_MODE="stream-one"; SINGBOX_METHOD="POST" ;;
+  *) XHTTP_MODE="auto";       SINGBOX_METHOD="GET"  ;;
 esac
 info "Mode: ${BOLD}$XHTTP_MODE${NC}"
 
@@ -353,7 +356,11 @@ header "Установка зависимостей"
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   curl wget unzip uuid-runtime openssl ufw \
-  nginx libnginx-mod-stream fail2ban jq python3 chrony qrencode
+  nginx libnginx-mod-stream fail2ban jq python3 python3-cryptography \
+  chrony qrencode unattended-upgrades
+# python3-cryptography: нужен _derive_pubkey в xm.sh (xm pubkey, xm diag [3b],
+# вычисление publicKey из privateKey). Без него ключи считать нечем — остаётся
+# только фолбэк на client-info.txt, который расходится после ручных правок.
 # qrencode: рисует QR-код прямо в терминал (режим UTF8).
 # libnginx-mod-stream: TCP/stream-модуль nginx — нужен для настоящего
 # REALITY-fallback (ssl_preread + proxy_protocol). Пакет сам включает модуль
@@ -517,11 +524,15 @@ cat > /etc/logrotate.d/xray <<'LOGROTEOF'
     compress
     delaycompress
     notifempty
-    sharedscripts
-    postrotate
-        systemctl is-active --quiet xray && \
-          kill -USR1 $(systemctl show -p MainPID xray | cut -d= -f2) 2>/dev/null || true
-    endscript
+    # [FIX] copytruncate вместо postrotate + kill -USR1.
+    # Xray-core (Go) ловит только SIGINT/SIGTERM. SIGUSR1 для Go-рантайма —
+    # сигнал с дефолтным действием "Term": процесс УМИРАЕТ, systemd его
+    # перезапускает, все клиентские соединения рвутся — каждые сутки.
+    # Плюс без "create" новый лог-файл не создавался: после первой ротации
+    # запись в лог прекращалась совсем.
+    # copytruncate: logrotate копирует файл и обнуляет оригинал — открытый
+    # дескриптор Xray остаётся валидным, сигналы и рестарт не нужны вообще.
+    copytruncate
 }
 LOGROTEOF
 success "logrotate настроен (14 дней)"
@@ -617,7 +628,16 @@ map $ssl_preread_server_name $reality_upstream {
     __DEST_SNI__   __DEST_SNI__;
 }
 
-# Считаем соединения по РЕАЛЬНОМУ IP клиента (доступен благодаря proxy_protocol).
+# [FIX-9] Флаг логирования. REALITY дозванивается до dest на КАЖДОЕ входящее
+# соединение, а не только при провале аутентификации — значит через fallback
+# идёт весь легитимный трафик. Без этого фильтра в лог попадали реальные IP
+# всех клиентов (замерено: 8522 из 9537 строк — один свой клиент) и хранились
+# 14 дней. Теперь на диск пишется только чужой/пустой SNI, т.е. чистые сканы.
+map $ssl_preread_server_name $log_probe {
+    default        1;
+    __DEST_SNI__   0;
+}
+
 limit_conn_zone $binary_remote_addr zone=reality_conn:10m;
 
 log_format reality_fallback '$remote_addr [$time_local] '
@@ -633,26 +653,34 @@ server {
     # nginx не распарсит заголовок и порвёт хендшейк.
     listen 127.0.0.1:10443 proxy_protocol;
 
+    # realip подменяет $remote_addr (127.0.0.1) адресом из PROXY v2 →
+    # limit_conn считает по реальному клиенту, а не глобально на весь сервер.
+    set_real_ip_from 127.0.0.1;
+
     # Читаем SNI из ClientHello БЕЗ терминации TLS.
     ssl_preread on;
 
-    # Предохранитель от флуда/сканов: не более 20 одновременных соединений
-    # с одного реального IP. Легитимный клиент (даже XHTTP с мультиплексом)
-    # столько не открывает — порог заведомо щадящий, как у настоящих CDN.
-    limit_conn reality_conn 20;
+    # [FIX-9] Было 20 — и резало СВОИ же XHTTP-соединения (21 срыв в error.log),
+    # т.к. через fallback идёт весь трафик, а не только зонды. 200 — заведомо
+    # выше нормального клиента, но всё ещё отсекает флуд.
+    limit_conn reality_conn 200;
 
     proxy_pass $reality_upstream:443;
     proxy_connect_timeout 5s;
 
-    access_log /var/log/nginx/reality_fallback.log reality_fallback;
-    error_log  /var/log/nginx/reality_fallback_error.log warn;
+    access_log /var/log/nginx/reality_fallback.log reality_fallback if=$log_probe;
+    error_log  /var/log/nginx/reality_fallback_error.log error;
 }
 STREAMEOF
 
 # Подставляем реальный SNI (валидирован ранее как ^[a-zA-Z0-9._-]+$ — sed-safe).
 sed -i "s/__DEST_SNI__/${DEST_SNI}/g" /etc/nginx/stream-enabled/reality-fallback.conf
 
-nginx -t && systemctl enable nginx && systemctl restart nginx
+# [FIX] Под set -e падение nginx -t внутри &&-списка НЕ прерывает скрипт,
+# и ниже печатался бы success при сломанном конфиге.
+nginx -t || error "nginx -t не прошёл — см. /etc/nginx/stream-enabled/reality-fallback.conf"
+systemctl enable nginx
+systemctl restart nginx
 success "Nginx REALITY fallback настроен (stream/ssl_preread, dest=127.0.0.1:10443)"
 
 # =============================================================================
@@ -660,11 +688,15 @@ success "Nginx REALITY fallback настроен (stream/ssl_preread, dest=127.0
 # =============================================================================
 header "Настройка fail2ban"
 
-# Лог stream-fallback должен существовать до старта fail2ban (иначе джейл не
-# поднимется). Создаём и отдаём nginx.
-touch /var/log/nginx/reality_fallback.log
-chown www-data:www-data /var/log/nginx/reality_fallback.log
-
+# [FIX-9] Джейл nginx-reality-flood удалён:
+#   1) не работал — fail2ban на Ubuntu 22.04 идёт с backend=systemd, свой
+#      файл он не читал (Total failed: 0 при 9537 строках в логе);
+#   2) при «починке» банил бы СВОИХ клиентов — их хендшейки тоже идут
+#      через fallback;
+#   3) бан сканеров сам по себе демаскирует: настоящий www.apple.com
+#      не блэкхолит Censys/Shodan, а мы бы блэкхолили. Это отличие,
+#      по которому сервер отделяется от реального сайта.
+# Флуд теперь отсекает limit_conn 200 в nginx (без бана, как у CDN).
 cat > /etc/fail2ban/jail.d/sshd-xray.conf <<EOF
 [sshd]
 enabled  = true
@@ -675,37 +707,62 @@ maxretry = 5
 findtime = 600
 bantime  = 3600
 ignoreip = 127.0.0.1/8
-
-# [FIX] Джейл переработан. Раньше "nginx-4xx" следил за http-логом vhost'а,
-# который в тракт REALITY не входил → лог всегда пустой → джейл бесполезен.
-# Теперь следим за РЕАЛЬНЫМ логом stream-fallback: каждая строка = одно
-# соединение с реальным IP клиента. Баним по ОБЪЁМУ (флуд), а НЕ по факту
-# появления — иначе забанили бы легитимных клиентов (их хендшейк тоже
-# проходит через fallback). Порог 60 conn/60s заведомо выше нормального
-# клиента и близок к тому, как флуд отсекают настоящие CDN.
-[nginx-reality-flood]
-enabled  = true
-port     = ${XRAY_PORT}
-filter   = nginx-reality-flood
-logpath  = /var/log/nginx/reality_fallback.log
-maxretry = 60
-findtime = 60
-bantime  = 1800
 EOF
-
-mkdir -p /etc/fail2ban/filter.d
-# Формат строки лога мы задаём сами (log_format reality_fallback):
-#   "<IP> [дата] SNI=... status=... sent=..."
-# Поэтому regex гарантированно совпадает и ловит любое соединение по IP.
-cat > /etc/fail2ban/filter.d/nginx-reality-flood.conf <<'F2BFEOF'
-[Definition]
-failregex = ^<HOST> \[
-ignoreregex =
-F2BFEOF
 
 systemctl enable fail2ban
 systemctl restart fail2ban
 success "fail2ban настроен (SSH на порту $SSH_PORT)"
+
+# =============================================================================
+# 10b. АВТОМАТИЧЕСКИЕ SECURITY-ПАТЧИ ОС
+# =============================================================================
+header "Настройка автоматических security-обновлений"
+
+cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'UUEOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Package-Blacklist {
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::SyslogEnable "true";
+UUEOF
+
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'UUEOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+UUEOF
+
+# Таймзона задаётся в самом таймере — системное время VPS не меняем
+mkdir -p /etc/systemd/system/apt-daily-upgrade.timer.d
+cat > /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf <<'UUEOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 20:30:00 Europe/Moscow
+RandomizedDelaySec=20m
+Persistent=true
+UUEOF
+
+mkdir -p /etc/systemd/system/apt-daily.timer.d
+cat > /etc/systemd/system/apt-daily.timer.d/override.conf <<'UUEOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 20:00:00 Europe/Moscow
+RandomizedDelaySec=10m
+Persistent=true
+UUEOF
+
+systemctl daemon-reload
+systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
+success "Security-патчи: ежедневно 20:30 МСК (без автоперезагрузки)"
 
 # =============================================================================
 # 11. CONFIG.JSON
@@ -731,7 +788,6 @@ XHTTP_INBOUND=$(jq -n \
   --arg     path       "$XHTTP_PATH" \
   --arg     mode       "$XHTTP_MODE" \
   --argjson port       "$XRAY_PORT" \
-  --argjson waitUp     "$WAIT_UPLOAD" \
   '{
     listen: "0.0.0.0",
     port: $port,
@@ -761,14 +817,12 @@ XHTTP_INBOUND=$(jq -n \
         path: $path,
         host: $sni,
         mode: $mode,
-        headers: {
-          "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-          "Accept-Encoding": "gzip, deflate, br",
-          "Cache-Control": "no-cache"
-        },
-        maxUploadSize: 1000000,
-        maxConcurrentUploads: 10,
-        waitUploadWritten: $waitUp,
+        headers: { "Cache-Control": "no-store" },
+        # [FIX-9] maxUploadSize / maxConcurrentUploads / waitUploadWritten
+        # удалены: это старые имена SplitHTTP, Xray 26.x их молча игнорирует
+        # (проверено — мусорное значение в maxUploadSize даёт Configuration OK,
+        # тогда как мусор в живом xPaddingBytes даёт ошибку). Создавали ложное
+        # впечатление настроенных лимитов.
         xPaddingBytes: "100-1460"
       }
     },
@@ -823,7 +877,10 @@ jq -n \
   --argjson inbounds "$INBOUNDS_JSON" \
   --arg     logDir   "$XRAY_LOG_DIR" \
   '{
-    log: { loglevel: "error", error: ($logDir + "/error.log") },
+    # [FIX-9] access по умолчанию = Console → journald, и loglevel его НЕ
+    # фильтрует. Замерено: 316 строк "from <IP клиента> accepted tcp:<IP
+    # назначения>:443" за 2 часа. Это полный лог «кто куда ходил».
+    log: { loglevel: "error", access: "none", dnsLog: false, error: ($logDir + "/error.log") },
     inbounds: $inbounds,
     outbounds: [
       { protocol: "freedom", tag: "direct", settings: { domainStrategy: "UseIPv4v6" } },
@@ -831,10 +888,13 @@ jq -n \
     ],
     routing: {
       domainStrategy: "IPIfNonMatch",
+      # [FIX-9] Правило geoip:cn/ir удалено. Поле `ip` в routing — это АДРЕС
+      # НАЗНАЧЕНИЯ, а не источника; плюс routing применяется уже ПОСЛЕ успешной
+      # VLESS-аутентификации, куда зонд физически не доходит. От сканов оно не
+      # защищало вообще, зато закрывало клиентам CN/IR-ресурсы.
       rules: [
         { type: "field", ip: ["geoip:private"], outboundTag: "block" },
-        { type: "field", protocol: ["bittorrent"], outboundTag: "block" },
-        { type: "field", ip: ["geoip:cn", "geoip:ir"], outboundTag: "block" }
+        { type: "field", protocol: ["bittorrent"], outboundTag: "block" }
       ]
     },
     policy: {
@@ -925,7 +985,9 @@ fi
 # =============================================================================
 
 # [FIX-3] Используем функцию с валидацией формата IP
-SERVER_IP=$(_fetch_server_ip)
+# [FIX] "|| true": при полном провале функция делает return 1, и под set -e
+# скрипт умирал прямо здесь — фолбэк на "ТВОЙ_IP" был недостижим.
+SERVER_IP=$(_fetch_server_ip) || true
 if [[ "$SERVER_IP" == "ТВОЙ_IP" ]]; then
   warn "Не удалось автоматически определить внешний IP!"
   warn "Укажи IP вручную в файле $CLIENT_FILE после установки."
@@ -958,7 +1020,7 @@ mkdir -p "$(dirname "$CLIENT_FILE")"
 # чтобы _get_pubkey в xm.sh мог их надёжно найти по паттерну "^LABEL:"
 cat > "$CLIENT_FILE" <<EOF
 ═══════════════════════════════════════════════════════
-  Xray VLESS+REALITY+XHTTP · Client Info v5.4
+  Xray VLESS+REALITY+XHTTP · Client Info v5.5
   Сгенерировано: $(date)
 ═══════════════════════════════════════════════════════
 SERVER IP: ${SERVER_IP}
