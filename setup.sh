@@ -57,6 +57,17 @@ header()  { echo -e "\n${BOLD}${CYAN}══════════════�
 
 [[ $EUID -ne 0 ]] && error "Запусти скрипт от root: sudo bash $0"
 
+# Скрипт писался под 24.04. На focal (20.04) сборка nginx старее (1.18) и
+# набор stream-модулей уже — см. FIX-10. Работает, но об этом надо знать.
+OS_VER=$(lsb_release -rs 2>/dev/null || echo "?")
+case "$OS_VER" in
+  24.04|22.04) ;;
+  20.04) echo -e "${YELLOW}[WARN]${NC} Ubuntu 20.04: стандартная поддержка закончилась (только ESM),
+       nginx 1.18 без stream_realip. Скрипт учитывает это, но обновление
+       до 22.04/24.04 рекомендуется." ;;
+  *) echo -e "${YELLOW}[WARN]${NC} Непроверенная версия ОС: $OS_VER — возможны сюрпризы" ;;
+esac
+
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_LOG_DIR="/var/log/xray"
 CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
@@ -203,6 +214,138 @@ _check_cert_size() {
   echo $((total + ocsp_add + framing)); return 0
 }
 
+SELFTEST_HINT=""
+
+# =============================================================================
+# _sni_probe <host> → "cert_б|ocsp_б|alpn_h2|tls13|x25519|rtt_мс|redirect_host"
+# cert_б = -1 если хост недоступен. Расширение _check_cert_size: одного размера
+# сертификата мало — dest обязан уметь TLS1.3 (иначе REALITY не работает в
+# принципе) и ALPN h2 (иначе XHTTP не поднимется поверх HTTP/2).
+# Все конвейеры прикрыты "|| true": под set -euo pipefail пустой grep роняет
+# присваивание и убивает весь скрипт.
+# =============================================================================
+_sni_probe() {
+  local host="$1" raw n b o total h13 tls13 alpn2 x25519 t0 t1 rtt loc
+  raw=$(echo | timeout 10 openssl s_client -connect "${host}:443" -servername "$host" \
+        -showcerts -status 2>/dev/null) || raw=""
+  if [[ -z "$raw" ]]; then echo "-1|0|нет|нет|нет|-1|"; return 0; fi
+
+  n=$(printf '%s\n' "$raw" | grep -c "BEGIN CERTIFICATE" || true); n=${n:-0}
+  b=$(printf '%s\n' "$raw" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' \
+      | grep -vE 'BEGIN|END' | tr -d '\n' | wc -c || true); b=${b:-0}
+  o=0; printf '%s' "$raw" | grep -qi "OCSP Response Data" && o=1600 || true
+  total=$(( b*3/4 + o + 10 + n*6 ))
+
+  h13=$(echo | timeout 8 openssl s_client -connect "${host}:443" -servername "$host" \
+        -tls1_3 -alpn h2 2>/dev/null) || h13=""
+  tls13="нет"; alpn2="нет"; x25519="нет"
+  printf '%s' "$h13" | grep -q  "TLSv1.3"                      && tls13="да"   || true
+  printf '%s' "$h13" | grep -qi "ALPN protocol: h2"            && alpn2="да"   || true
+  printf '%s' "$h13" | grep -qi "TLS1.3 group: *x25519"        && x25519="да"  || true
+
+  t0=$(date +%s%N)
+  echo | timeout 8 openssl s_client -connect "${host}:443" -servername "$host" >/dev/null 2>&1 || true
+  t1=$(date +%s%N); rtt=$(( (t1 - t0) / 1000000 ))
+
+  loc=$(curl -s -o /dev/null -w '%{redirect_url}' --max-time 8 "https://${host}" 2>/dev/null \
+        | awk -F/ '{print $3}' || true)
+  [[ "$loc" == "$host" ]] && loc=""
+
+  echo "${total}|${o}|${alpn2}|${tls13}|${x25519}|${rtt}|${loc}"
+}
+
+# =============================================================================
+# _selftest_vless <xhttp|tcp> <uuid> <port> <sni> <sid> <pubkey> [path] [mode]
+#
+# ЗАЧЕМ ЭТО ГЛАВНАЯ ПРОВЕРКА: REALITY при провале хендшейка НЕ ПИШЕТ НИЧЕГО
+# в лог — это штатная ветка протокола («не наш клиент, закрываем»), а не
+# ошибка. Поэтому «в логах пусто» ничего не доказывает. Здесь мы поднимаем
+# настоящий VLESS-клиент на loopback и ходим через собственный сервер:
+# сеть, провайдер и клиентское приложение исключены, ответ бинарный.
+# Печатает HTTP-код (200 = всё работает), 000 = не прошло.
+# =============================================================================
+_selftest_vless() {
+  local net="$1" uuid="$2" port="$3" sni="$4" sid="$5" pub="$6" path="${7:-}" mode="${8:-}"
+  local sport tmpcfg log code cpid
+  [[ ${#pub} -lt 30 ]] && { echo "000"; return 0; }
+  sport=$(( 20000 + RANDOM % 10000 ))
+  tmpcfg=$(mktemp /tmp/xray-selftest.XXXXXX.json)
+  log=$(mktemp /tmp/xray-selftest.XXXXXX.log)
+
+  if [[ "$net" == "xhttp" ]]; then
+    jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
+          --arg p "$path" --arg m "$mode" --argjson port "$port" --argjson sp "$sport" '{
+      log:{loglevel:"warning"},
+      inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:false}}],
+      outbounds:[{protocol:"vless",
+        settings:{vnext:[{address:"127.0.0.1",port:$port,users:[{id:$uuid,encryption:"none"}]}]},
+        streamSettings:{network:"xhttp",security:"reality",
+          realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid},
+          xhttpSettings:{path:$p,host:$sni,mode:$m}}}]}' > "$tmpcfg"
+  else
+    jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
+          --argjson port "$port" --argjson sp "$sport" '{
+      log:{loglevel:"warning"},
+      inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:false}}],
+      outbounds:[{protocol:"vless",
+        settings:{vnext:[{address:"127.0.0.1",port:$port,
+          users:[{id:$uuid,encryption:"none",flow:"xtls-rprx-vision"}]}]},
+        streamSettings:{network:"tcp",security:"reality",
+          realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid}}}]}' > "$tmpcfg"
+  fi
+
+  xray run -c "$tmpcfg" >"$log" 2>&1 &
+  cpid=$!
+  sleep 2
+  # [FIX-14] `|| echo "000"` внутри $( ) СКЛЕИВАЛСЯ с выводом самого curl:
+  # при неудаче curl печатает "000" в stdout И возвращает !=0, после чего
+  # echo добавляет ещё "000" → в переменную попадало "000000". Это не валидный
+  # HTTP-статус, и при разборе он сбивает с толку («что за код такой?»).
+  code=$(curl -s -x "socks5h://127.0.0.1:${sport}" --max-time 15 -o /dev/null \
+         -w '%{http_code}' https://api.ipify.org 2>/dev/null) || true
+  code=${code:-000}
+  kill "$cpid" 2>/dev/null || true
+  wait "$cpid" 2>/dev/null || true
+  if [[ "$code" != "200" ]]; then
+    SELFTEST_HINT=$(grep -iE "failed|EOF|reject|reality" "$log" 2>/dev/null | tail -2 || true)
+  else
+    SELFTEST_HINT=""
+  fi
+  rm -f "$tmpcfg" "$log"
+  echo "$code"
+}
+
+# =============================================================================
+# _switch_sni <domain> — перевод ВСЕГО стека на другой домен-маску:
+# config.json (serverNames XHTTP+TCP + xhttpSettings.host) + nginx map
+# (регенерация из шаблона) + рестарт. Нужен авто-подбору в секции 14b.
+# Возврат 1 = применить не удалось.
+# =============================================================================
+_switch_sni() {
+  local new="$1" tmp
+  [[ "$new" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+  tmp=$(mktemp "$(dirname "$XRAY_CONFIG")/config.XXXXXX.json")
+  jq --arg s "$new" '
+      .inbounds[0].streamSettings.realitySettings.serverNames = [$s]
+    | .inbounds[0].streamSettings.xhttpSettings.host = $s
+    | if (.inbounds|length) > 1
+      then .inbounds[1].streamSettings.realitySettings.serverNames = [$s] else . end
+  ' "$XRAY_CONFIG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  chmod 640 "$tmp"; chown root:nogroup "$tmp"; mv "$tmp" "$XRAY_CONFIG"
+
+  if [[ -f /etc/nginx/reality-fallback.conf.tmpl ]]; then
+    sed "s/__DEST_SNI__/${new}/g" /etc/nginx/reality-fallback.conf.tmpl \
+      > /etc/nginx/stream-enabled/reality-fallback.conf
+    nginx -t &>/dev/null || return 1
+    systemctl reload nginx || return 1
+  fi
+  xray -test -config "$XRAY_CONFIG" 2>&1 | grep -q "Configuration OK" || return 1
+  systemctl restart xray; sleep 2
+  systemctl is-active --quiet xray || return 1
+  return 0
+}
+
 # =============================================================================
 # 0. ЗАЩИТА ОТ ПОВТОРНОГО ЗАПУСКА
 # =============================================================================
@@ -225,27 +368,52 @@ fi
 # =============================================================================
 header "Настройка параметров"
 
-echo -e "${BOLD}Выбери целевой домен (SNI / dest):${NC}"
-# [FIX-8] microsoft.com/login.microsoftonline.com убраны из дефолтов: у них
-# большая цепочка/OCSP staple, из-за чего REALITY-хендшейк ломается (буфер ~8192 б).
-# Дефолты ниже — с компактными сертификатами; выбор ВСЁ РАВНО проверяется
-# _check_cert_size в секции 7 (список не «слепая вера», а стартовая точка).
-echo "  1) www.apple.com        (компактный cert)"
-echo "  2) dl.google.com        (компактный cert, большой traffic pool)"
-echo "  3) www.cloudflare.com   (компактный cert, TLS1.3/H2)"
-echo "  4) www.microsoft.com    (⚠ большой cert/OCSP — как правило НЕ подходит, оставлен для наглядности проверки)"
-echo "  5) Ввести вручную"
-read -rp "Выбор [1-5, Enter=1]: " SNI_CHOICE
-SNI_CHOICE=${SNI_CHOICE:-1}
+# Пул кандидатов. www.microsoft.com исключён НАВСЕГДА: cert+OCSP ≈ 9085 б при
+# буфере REALITY ~8192 б — хендшейк рвётся молча (замерено на живом сервере).
+# Порядок не важен: ниже идёт живой замер и выбор по факту.
+SNI_POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net www.apple.com)
 
-case "$SNI_CHOICE" in
-  1) DEST_SNI="www.apple.com" ;;
-  2) DEST_SNI="dl.google.com" ;;
-  3) DEST_SNI="www.cloudflare.com" ;;
-  4) DEST_SNI="www.microsoft.com" ;;
-  5) read -rp "Введи домен: " DEST_SNI ;;
-  *) DEST_SNI="www.apple.com" ;;
-esac
+echo -e "${BOLD}Подбор домена-маски (SNI / dest)${NC}"
+info "Замеряю кандидатов: cert, OCSP, ALPN h2, TLS1.3, RTT — ~20 сек..."
+echo ""
+printf "  %-22s %8s %6s %5s %7s %7s  %s\n" "домен" "cert,б" "OCSP" "h2" "TLS1.3" "RTT,мс" "вердикт"
+
+declare -a SNI_OK=()
+for h in "${SNI_POOL[@]}"; do
+  IFS='|' read -r P_CERT P_OCSP P_ALPN P_TLS13 P_X25519 P_RTT P_REDIR <<< "$(_sni_probe "$h")"
+  if [[ "$P_CERT" == "-1" ]]; then
+    printf "  %-22s %8s %6s %5s %7s %7s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "-" "-" "НЕДОСТУПЕН"
+    continue
+  fi
+  V="ГОДИТСЯ"; C="$GREEN"
+  [[ "$P_CERT" -ge "$REALITY_CERT_WARN"  ]] && { V="РИСК";       C="$YELLOW"; }
+  [[ "$P_CERT" -ge "$REALITY_CERT_LIMIT" ]] && { V="НЕ ГОДИТСЯ"; C="$RED"; }
+  # TLS1.3 обязателен: REALITY работает только поверх него.
+  # ALPN h2 обязателен: XHTTP живёт внутри HTTP/2.
+  [[ "$P_TLS13" != "да" ]] && { V="НЕТ TLS1.3"; C="$RED"; }
+  [[ "$P_ALPN"  != "да" ]] && { V="НЕТ h2";     C="$RED"; }
+  # RTT платится на КАЖДОМ входящем соединении (REALITY идёт к dest всегда).
+  [[ "$P_RTT" -gt 150 && "$V" == "ГОДИТСЯ" ]] && { V="МЕДЛЕННЫЙ"; C="$YELLOW"; }
+  [[ -n "$P_REDIR" && "$V" == "ГОДИТСЯ" ]] && { V="РЕДИРЕКТ→$P_REDIR"; C="$YELLOW"; }
+  printf "  %-22s %8s %6s %5s %7s %7s  ${C}%s${NC}\n" \
+    "$h" "$P_CERT" "$([[ ${P_OCSP:-0} -gt 0 ]] && echo да || echo нет)" \
+    "$P_ALPN" "$P_TLS13" "$P_RTT" "$V"
+  [[ "$V" == "ГОДИТСЯ" ]] && SNI_OK+=("$P_CERT $h")
+done
+echo ""
+
+# Лучший = наименьший cert среди прошедших ВСЕ проверки (больше запас до лимита)
+if [[ ${#SNI_OK[@]} -gt 0 ]]; then
+  DEST_SNI=$(printf '%s\n' "${SNI_OK[@]}" | sort -n | head -1 | awk '{print $2}')
+  success "Рекомендация: ${BOLD}$DEST_SNI${NC} — наибольший запас до лимита REALITY"
+else
+  DEST_SNI=""
+  warn "Ни один кандидат не прошёл — введи домен вручную (и проверь сеть VPS)"
+fi
+
+read -rp "Домен [Enter=${DEST_SNI:-введи вручную}]: " SNI_INPUT
+DEST_SNI=${SNI_INPUT:-$DEST_SNI}
+[[ -z "$DEST_SNI" ]] && error "Домен-маска не выбран"
 
 if [[ ! "$DEST_SNI" =~ ^[a-zA-Z0-9._-]+$ ]]; then
   error "Недопустимые символы в SNI: $DEST_SNI"
@@ -317,10 +485,33 @@ XRAY_PORT=${PORT_INPUT:-443}
   || error "Некорректный порт: $XRAY_PORT"
 info "Порт XHTTP: ${BOLD}$XRAY_PORT${NC}"
 
+# Xray сам предупреждает при старте: "Listening on non-443 ports may get your
+# IP blocked by the GFW". Сканер видит TLS на нестандартном порту при пустом
+# 443 — картина, которой у настоящего сайта не бывает.
+if [[ "$XRAY_PORT" != "443" ]]; then
+  P443=$(ss -tlnp 2>/dev/null | grep -E ':443([^0-9]|$)' | head -1 || true)
+  if [[ -z "$P443" ]]; then
+    warn "Порт 443 свободен, а выбран ${XRAY_PORT} — REALITY на нестандартном порту заметен."
+    read -rp "Использовать 443? [Y/n]: " USE443
+    [[ "${USE443:-y}" =~ ^[Yy]$ ]] && { XRAY_PORT=443; info "Порт изменён на ${BOLD}443${NC}"; }
+  else
+    warn "Порт 443 занят: $(echo "$P443" | grep -oP 'users:\(\("\K[^"]+' || echo '?')"
+    if echo "$P443" | grep -q docker; then
+      warn "Это docker-proxy. Docker публикует порты СВОИМИ правилами iptables"
+      warn "В ОБХОД UFW — контейнер открыт наружу независимо от ufw-правил."
+      warn "Проверь что там: sudo iptables -t nat -L DOCKER -n"
+    fi
+  fi
+fi
+
 echo ""
 echo -e "${BOLD}Добавить второй inbound — VLESS+REALITY+TCP (XTLS-Vision)?${NC}"
-read -rp "Добавить? [y/N]: " DUAL_CHOICE
-DUAL_CHOICE=${DUAL_CHOICE:-n}
+echo -e "${YELLOW}Настоятельно рекомендуется. XHTTP — транспорт Xray-core; клиенты${NC}"
+echo -e "${YELLOW}на ядре sing-box (Hiddify, NekoBox) могут его не поддерживать и${NC}"
+echo -e "${YELLOW}отваливаться по таймауту без единой строчки в логах. XTLS-Vision${NC}"
+echo -e "${YELLOW}понимают все клиенты, а по устойчивости к DPI он не уступает.${NC}"
+read -rp "Добавить? [Y/n]: " DUAL_CHOICE
+DUAL_CHOICE=${DUAL_CHOICE:-y}
 
 DUAL_INBOUND=false
 XRAY_PORT2=8443
@@ -353,8 +544,13 @@ read -rp "" CONFIRM
 # =============================================================================
 header "Установка зависимостей"
 
+# DEBIAN_FRONTEND + force-confold: unattended-upgrades спрашивает про уже
+# изменённый 20auto-upgrades и вешает установку на интерактивном диалоге.
+# Оставляем локальную версию — секция 10b всё равно перезапишет её своей.
+export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
+  -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
   curl wget unzip uuid-runtime openssl ufw \
   nginx libnginx-mod-stream fail2ban jq python3 python3-cryptography \
   chrony qrencode unattended-upgrades
@@ -499,10 +695,12 @@ CERT_EST=$(_check_cert_size "$DEST_SNI")
 if [[ "$CERT_EST" == "-1" ]]; then
   warn "Не удалось снять сертификат $DEST_SNI по :443 — пропускаю проверку размера"
 elif [[ "$CERT_EST" -ge "$REALITY_CERT_LIMIT" ]]; then
-  warn "Оценка Certificate: ${CERT_EST} б ≥ лимита REALITY (${REALITY_CERT_LIMIT} б)."
-  warn "REALITY-хендшейк, скорее всего, будет РВАТЬСЯ (клиент: handshake failed)."
-  read -rp "Домен рискованный. Всё равно использовать? [y/N]: " CERT_CONFIRM
-  [[ "$CERT_CONFIRM" =~ ^[Yy]$ ]] || error "Выбери домен с компактным сертификатом и перезапусти."
+  # Обхода нет намеренно. Прежний "[y/N]" позволял поставить заведомо нерабочий
+  # домен: клиент ловит таймаут, в логах сервера ПУСТО (REALITY молчит), и
+  # диагностика начинается с нуля. Установка с таким dest бессмысленна.
+  error "Оценка Certificate: ${CERT_EST} б ≥ лимита REALITY (${REALITY_CERT_LIMIT} б).
+       REALITY-хендшейк будет рваться МОЛЧА: у клиента таймаут, в логах ничего.
+       Выбери домен с компактным сертификатом (см. таблицу выше) и перезапусти."
 elif [[ "$CERT_EST" -ge "$REALITY_CERT_WARN" ]]; then
   warn "Оценка Certificate: ${CERT_EST} б — близко к лимиту (${REALITY_CERT_LIMIT} б). Возможны сбои на части версий Xray."
 else
@@ -512,9 +710,34 @@ fi
 # =============================================================================
 # 8. ЛОГИ + LOGROTATE
 # =============================================================================
-mkdir -p "$XRAY_LOG_DIR"
-chown nobody:nogroup "$XRAY_LOG_DIR"
-success "Лог-директория: $XRAY_LOG_DIR"
+# [FIX-14] Каталог мало создать — нужно ГАРАНТИРОВАТЬ, что пользователь сервиса
+# сможет создать в нём файл, и что сам error.log уже существует с правильным
+# владельцем.
+#
+# ПОЧЕМУ ЭТО НЕ ЛОВИЛОСЬ: `xray -test` проверяет только схему конфига и даёт
+# "Configuration OK" даже когда процесс физически не может открыть лог. Ошибка
+# существует лишь в рантайме, от пользователя nobody (User=nobody в юните от
+# XTLS/Xray-install). Xray падает с exit 23, а RestartPreventExitStatus=23 в
+# юните запрещает рестарт — в журнале одна строка "permission denied".
+#
+# ПОЧЕМУ mkdir НЕ ХВАТАЛО: mkdir -p на существующем каталоге права не меняет.
+# После ручного удаления *.log каталог оставался незаписываемым для nobody, и
+# создать error.log заново было нечем. install -d/-m применяет права и к уже
+# существующему пути — поэтому здесь именно install, а не mkdir+chown.
+XRAY_USER=$(systemctl show -p User --value xray 2>/dev/null || true)
+XRAY_USER=${XRAY_USER:-nobody}
+XRAY_GROUP=$(id -gn "$XRAY_USER" 2>/dev/null || echo nogroup)
+
+install -d -m 750 -o "$XRAY_USER" -g "$XRAY_GROUP" "$XRAY_LOG_DIR"
+install -m 640 -o "$XRAY_USER" -g "$XRAY_GROUP" /dev/null "$XRAY_LOG_DIR/error.log"
+
+# Проверяем ФАКТ доступа от имени сервиса, а не права «на бумаге»:
+# ACL, chattr +i или нестандартный владелец каталога сюда тоже попадут.
+if ! sudo -u "$XRAY_USER" test -w "$XRAY_LOG_DIR/error.log"; then
+  error "Пользователь $XRAY_USER не может писать в $XRAY_LOG_DIR/error.log.
+       Смотри: sudo ls -la $XRAY_LOG_DIR  и  sudo lsattr -d $XRAY_LOG_DIR"
+fi
+success "Лог-директория: $XRAY_LOG_DIR ($XRAY_USER:$XRAY_GROUP, error.log создан)"
 
 cat > /etc/logrotate.d/xray <<'LOGROTEOF'
 /var/log/xray/*.log {
@@ -551,6 +774,44 @@ success "logrotate настроен (14 дней)"
 #       по настоящему адресу, а не по 127.0.0.1.
 #   :80 оставляем как обычный 301-редирект (стандартное поведение веб-сервера).
 # =============================================================================
+
+# =============================================================================
+# [FIX-11] Наличие ssl_preread НЕЛЬЗЯ определять по `nginx -V`.
+#
+# ПОЧЕМУ: в Debian/Ubuntu stream собирается ОТДЕЛЬНЫМ проходом как динамический
+# модуль (пакет libnginx-mod-stream), и его configure-флагов в `nginx -V`
+# основного бинарника НЕТ — там только аргументы сборки nginx-core. Прежняя
+# проверка падала ВСЕГДА, даже когда модуль установлен и полностью рабочий
+# (замерено: Ubuntu 20.04, nginx 1.18.0-0ubuntu1.7, libnginx-mod-stream стоит).
+# Проверяем по факту, тремя способами от дешёвого к точному.
+# =============================================================================
+_has_ssl_preread() {
+  # 1) Статическая сборка (nginx.org / свой билд) — флаг реально виден
+  if nginx -V 2>&1 | grep -q -- "--with-stream_ssl_preread_module"; then return 0; fi
+  # 2) Динамический модуль: имя директивы лежит строкой внутри .so
+  if grep -rqs "ssl_preread" /usr/lib/nginx/modules/; then return 0; fi
+  # 3) Функциональная проверка: минимальный stream-конфиг через nginx -t
+  local t rc=1
+  t=$(mktemp /tmp/ngx-preread.XXXXXX.conf)
+  {
+    cat /etc/nginx/modules-enabled/*.conf 2>/dev/null || true
+    echo "events {}"
+    echo "stream { server { listen 127.0.0.1:65535; ssl_preread on; proxy_pass 127.0.0.1:1; } }"
+  } > "$t"
+  if nginx -t -c "$t" &>/dev/null; then rc=0; fi
+  rm -f "$t"
+  return "$rc"
+}
+
+# Без ssl_preread stream-fallback невозможен в принципе. Проверяем ДО записи
+# конфигов, чтобы не падать на nginx -t с уже переписанным nginx.conf.
+if ! _has_ssl_preread; then
+  error "nginx собран без ssl_preread — REALITY fallback невозможен.
+       Проверь:  sudo grep -rl ssl_preread /usr/lib/nginx/modules/
+       Поставь:  sudo apt install -y libnginx-mod-stream
+       Либо возьми nginx с nginx.org (там ssl_preread вкомпилен статически)."
+fi
+
 header "Настройка Nginx REALITY fallback (stream/ssl_preread)"
 
 mkdir -p /var/www/fallback
@@ -605,6 +866,13 @@ rm -f /etc/nginx/conf.d/rate-limit.conf
 # (см. /etc/nginx/modules-enabled/*.conf). Сам stream-блок объявляется в
 # top-level контексте nginx.conf — добавляем include ОДИН раз (идемпотентно).
 mkdir -p /etc/nginx/stream-enabled
+# [FIX-11] Сносим конфиги от прошлых версий скрипта ДО записи новых.
+# В версиях < v5.5 здесь лежал set_real_ip_from, а ngx_stream_realip_module
+# в пакетах Ubuntu отсутствует → `nginx -t` падал с
+#   "set_real_ip_from" directive is not allowed here
+# и ронял ВЕСЬ nginx, включая свежесгенерированный конфиг. Свой файл скрипт
+# всё равно перезаписывает ниже; каталог создаётся только этим скриптом.
+rm -f /etc/nginx/stream-enabled/*
 if ! grep -q "stream-enabled/\*.conf" /etc/nginx/nginx.conf; then
   cat >> /etc/nginx/nginx.conf <<'NGXSTREAM'
 
@@ -631,16 +899,30 @@ map $ssl_preread_server_name $reality_upstream {
 # [FIX-9] Флаг логирования. REALITY дозванивается до dest на КАЖДОЕ входящее
 # соединение, а не только при провале аутентификации — значит через fallback
 # идёт весь легитимный трафик. Без этого фильтра в лог попадали реальные IP
-# всех клиентов (замерено: 8522 из 9537 строк — один свой клиент) и хранились
-# 14 дней. Теперь на диск пишется только чужой/пустой SNI, т.е. чистые сканы.
+# всех клиентов и хранились 14 дней. Теперь на диск пишется только чужой/
+# пустой SNI, т.е. чистые сканы.
 map $ssl_preread_server_name $log_probe {
     default        1;
     __DEST_SNI__   0;
 }
 
-limit_conn_zone $binary_remote_addr zone=reality_conn:10m;
+# [FIX-10] Ключ лимита и поле лога — $proxy_protocol_addr, а НЕ $remote_addr.
+#
+# ПОЧЕМУ: $remote_addr в stream подменяется реальным адресом клиента только
+# модулем ngx_stream_realip_module (директива set_real_ip_from). Этот модуль
+# требует сборки с --with-stream_realip_module, которого НЕТ в пакетах nginx
+# для Ubuntu — libnginx-mod-stream привозит ssl_preread, но не realip.
+# Итог прежней версии: nginx -t падал с
+#   "set_real_ip_from" directive is not allowed here
+# (парсер находил ОДНОИМЁННУЮ директиву http-модуля и отвергал её в stream).
+#
+# $proxy_protocol_addr отдаёт ядро stream при listen ... proxy_protocol —
+# доп. модулей не нужно, значение то же: реальный IP клиента из PROXY v2.
+# Переменная доступна с фазы post-accept, то есть раньше limit_conn
+# (фаза preaccess), так что порядок вычисления корректен.
+limit_conn_zone $proxy_protocol_addr zone=reality_conn:10m;
 
-log_format reality_fallback '$remote_addr [$time_local] '
+log_format reality_fallback '$proxy_protocol_addr [$time_local] '
                             'SNI="$ssl_preread_server_name" '
                             'status=$status sent=$bytes_sent';
 
@@ -653,16 +935,12 @@ server {
     # nginx не распарсит заголовок и порвёт хендшейк.
     listen 127.0.0.1:10443 proxy_protocol;
 
-    # realip подменяет $remote_addr (127.0.0.1) адресом из PROXY v2 →
-    # limit_conn считает по реальному клиенту, а не глобально на весь сервер.
-    set_real_ip_from 127.0.0.1;
-
     # Читаем SNI из ClientHello БЕЗ терминации TLS.
     ssl_preread on;
 
-    # [FIX-9] Было 20 — и резало СВОИ же XHTTP-соединения (21 срыв в error.log),
-    # т.к. через fallback идёт весь трафик, а не только зонды. 200 — заведомо
-    # выше нормального клиента, но всё ещё отсекает флуд.
+    # [FIX-9] Было 20 — и резало СВОИ же XHTTP-соединения, т.к. через fallback
+    # идёт весь трафик, а не только зонды. 200 — заведомо выше нормального
+    # клиента, но всё ещё отсекает флуд.
     limit_conn reality_conn 200;
 
     proxy_pass $reality_upstream:443;
@@ -673,6 +951,11 @@ server {
 }
 STREAMEOF
 
+# Сохраняем шаблон с плейсхолдером ВНЕ stream-enabled/ (иначе nginx подхватит
+# его как конфиг и упадёт на __DEST_SNI__). Из шаблона регенерируется конфиг
+# при смене домена-маски — см. _switch_sni и секцию 14b.
+cp /etc/nginx/stream-enabled/reality-fallback.conf /etc/nginx/reality-fallback.conf.tmpl
+chmod 600 /etc/nginx/reality-fallback.conf.tmpl
 # Подставляем реальный SNI (валидирован ранее как ^[a-zA-Z0-9._-]+$ — sed-safe).
 sed -i "s/__DEST_SNI__/${DEST_SNI}/g" /etc/nginx/stream-enabled/reality-fallback.conf
 
@@ -765,6 +1048,60 @@ systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
 success "Security-патчи: ежедневно 20:30 МСК (без автоперезагрузки)"
 
 # =============================================================================
+# 10c. ЕЖЕНЕДЕЛЬНАЯ РЕВАЛИДАЦИЯ ДОМЕНА-МАСКИ
+# Сертификаты сайтов ротируются. Если у текущего dest вырастет цепочка или
+# появится OCSP staple — REALITY начнёт рвать хендшейки МОЛЧА, и следующая
+# диагностика опять начнётся с «клиент не работает, в логах пусто».
+# =============================================================================
+header "Ревалидация домена-маски (watchdog)"
+
+cat > /usr/local/bin/xray-sni-watch <<'WATCHEOF'
+#!/usr/bin/env bash
+CFG=/usr/local/etc/xray/config.json
+FLAG=/var/lib/xray-sni-watch.flag
+H=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CFG" 2>/dev/null)
+[[ -z "$H" ]] && exit 0
+R=$(echo | timeout 10 openssl s_client -connect "$H:443" -servername "$H" -showcerts -status 2>/dev/null)
+if [[ -z "$R" ]]; then
+  echo "$(date -Is) $H НЕДОСТУПЕН по :443 — REALITY fallback сломан" > "$FLAG"; exit 0
+fi
+N=$(printf '%s\n' "$R" | grep -c "BEGIN CERTIFICATE"); N=${N:-0}
+B=$(printf '%s\n' "$R" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' \
+    | grep -vE 'BEGIN|END' | tr -d '\n' | wc -c); B=${B:-0}
+O=0; printf '%s' "$R" | grep -qi "OCSP Response Data" && O=1600
+T=$((B*3/4+O+10+N*6))
+if [[ "$T" -ge 7000 ]]; then
+  echo "$(date -Is) $H: Certificate ~${T} б при лимите 8192 — смени домен: xm sni-scan" > "$FLAG"
+else
+  rm -f "$FLAG"
+fi
+WATCHEOF
+chmod 755 /usr/local/bin/xray-sni-watch
+
+cat > /etc/systemd/system/xray-sni-watch.service <<'EOF'
+[Unit]
+Description=REALITY dest certificate size watchdog
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xray-sni-watch
+EOF
+
+cat > /etc/systemd/system/xray-sni-watch.timer <<'EOF'
+[Unit]
+Description=Weekly REALITY dest certificate check
+[Timer]
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now xray-sni-watch.timer
+success "Watchdog домена-маски: еженедельно (флаг виден в xm info)"
+
+# =============================================================================
 # 11. CONFIG.JSON
 # [FIX-5] maxTimeDiff снижен до 10000 мс (10 сек).
 #         Chrony держит drift < 1 сек. 60 сек было избыточно и давало
@@ -777,6 +1114,22 @@ success "Security-патчи: ежедневно 20:30 МСК (без автоп
 #         fingerprinting при анализе размеров пакетов DPI.
 # =============================================================================
 header "Запись конфигурации Xray"
+
+# [FIX-12] Каталог конфига может отсутствовать: официальный install-release.sh
+# создаёт /usr/local/etc/xray только когда РЕАЛЬНО ставит бинарник. Если версия
+# уже актуальна ("info: No new version"), он выходит раньше и каталог не трогает.
+# После полной очистки (rm -rf /usr/local/etc/xray) редирект `> $XRAY_CONFIG`
+# падал с "No such file or directory" и под set -e убивал установку на середине.
+# 750 root:nogroup: xray работает от nobody (нужен traverse через группу),
+# остальные локальные пользователи каталог даже не перечислят.
+mkdir -p "$(dirname "$XRAY_CONFIG")"
+# [FIX-13] Права как у официального установщика — 755 root:root.
+# 750 root:nogroup выигрыша не даёт: секреты закрыты правами самих файлов —
+# config.json 640 root:nogroup (приватный ключ REALITY) и client-info.txt
+# 600 root:root. Зато нестандартные права на каталоге, через который Xray
+# ходит от пользователя nobody, — лишняя переменная при разборе «не стартует».
+chown root:root "$(dirname "$XRAY_CONFIG")"
+chmod 755 "$(dirname "$XRAY_CONFIG")"
 
 XHTTP_INBOUND=$(jq -n \
   --arg     uuid       "$USER_UUID" \
@@ -926,6 +1279,26 @@ else
 fi
 
 # =============================================================================
+# 12b. УСТАНОВКА xm В PATH (до запуска сервиса — нужен для диагностики сбоя)
+# =============================================================================
+header "Установка xm (Xray Manager)"
+
+XM_TARGET="/usr/local/bin/xm"
+
+if [[ -f "$XM_SCRIPT_SRC" ]]; then
+  cp "$XM_SCRIPT_SRC" "$XM_TARGET"
+  chmod +x "$XM_TARGET"
+  success "xm установлен: $XM_TARGET"
+elif [[ -f "$(dirname "$0")/xm.sh" ]]; then
+  cp "$(dirname "$0")/xm.sh" "$XM_TARGET"
+  chmod +x "$XM_TARGET"
+  success "xm установлен: $XM_TARGET"
+else
+  warn "xm.sh не найден рядом с setup.sh"
+  warn "Скопируй xm.sh вручную: sudo cp xm.sh /usr/local/bin/xm && sudo chmod +x /usr/local/bin/xm"
+fi
+
+# =============================================================================
 # 13. FIREWALL (UFW)
 # =============================================================================
 header "Настройка UFW"
@@ -952,33 +1325,94 @@ systemctl enable xray
 systemctl restart xray
 sleep 2
 
-systemctl is-active --quiet xray \
-  && success "Xray запущен" \
-  || error "Xray не запустился: journalctl -u xray -n 50"
+if systemctl is-active --quiet xray; then
+  success "Xray запущен"
+else
+  # [FIX-13] Печатаем причину НА МЕСТЕ. `xray -test` проверяет только схему
+  # конфига и проходит успешно, даже когда процесс не может занять порт или
+  # создать лог-файл: эти ошибки существуют лишь в рантайме. Запуск от nobody
+  # (пользователь сервиса) даёт точный текст, journalctl — историю рестартов,
+  # ss — имя процесса-конкурента за порт. Без этого разбор начинается с нуля.
+  echo ""
+  warn "─── journalctl -u xray (последние 30 строк) ───"
+  journalctl -u xray -n 30 --no-pager 2>/dev/null | sed 's/^/  /' || true
+  echo ""
+  warn "─── запуск от имени nobody (точный текст ошибки) ───"
+  timeout 5 sudo -u nobody "$(command -v xray)" run -config "$XRAY_CONFIG" 2>&1 \
+    | head -20 | sed 's/^/  /' || true
+  echo ""
+  warn "─── кто занял порт ${XRAY_PORT} ───"
+  ss -tlnp 2>/dev/null | grep -E ":${XRAY_PORT}([^0-9]|$)" | sed 's/^/  /' \
+    || echo "  (никто — значит дело не в порте)"
+  error "Xray не запустился — причина выше"
+fi
 
 ss -tlnp | grep -q ":${XRAY_PORT}" \
   && success "Порт ${XRAY_PORT} прослушивается" \
   || warn "Порт ${XRAY_PORT} не найден — проверь вручную"
 
 # =============================================================================
-# 15. УСТАНОВКА xm В PATH
+# 14b. SELFTEST — ГЛАВНАЯ ПРОВЕРКА УСТАНОВКИ
+# Поднимаем локальный VLESS-клиент и ходим через собственный сервер. Если
+# трафик не прошёл — автоматически пробуем следующий домен-маску из тех, что
+# прошли замер в секции 1. Всё это ДО выдачи URI и QR, чтобы не раздавать
+# клиентам заведомо нерабочий конфиг.
 # =============================================================================
-header "Установка xm (Xray Manager)"
+header "Selftest: живой REALITY-хендшейк через loopback"
 
-XM_TARGET="/usr/local/bin/xm"
+SELFTEST_OK=false
+SELFTEST_SNI="$DEST_SNI"
 
-if [[ -f "$XM_SCRIPT_SRC" ]]; then
-  cp "$XM_SCRIPT_SRC" "$XM_TARGET"
-  chmod +x "$XM_TARGET"
-  success "xm установлен: $XM_TARGET"
-elif [[ -f "$(dirname "$0")/xm.sh" ]]; then
-  cp "$(dirname "$0")/xm.sh" "$XM_TARGET"
-  chmod +x "$XM_TARGET"
-  success "xm установлен: $XM_TARGET"
-else
-  warn "xm.sh не найден рядом с setup.sh"
-  warn "Скопируй xm.sh вручную: cp xm.sh /usr/local/bin/xm && chmod +x /usr/local/bin/xm"
+declare -a RETRY_POOL=("$DEST_SNI")
+for entry in ${SNI_OK[@]+"${SNI_OK[@]}"}; do
+  cand=$(echo "$entry" | awk '{print $2}')
+  [[ -n "$cand" && "$cand" != "$DEST_SNI" ]] && RETRY_POOL+=("$cand")
+done
+
+for cand in "${RETRY_POOL[@]}"; do
+  if [[ "$cand" != "$SELFTEST_SNI" ]]; then
+    warn "Пробую следующий домен-маску: $cand"
+    _switch_sni "$cand" || { warn "Не удалось переключить на $cand — пропускаю"; continue; }
+    SELFTEST_SNI="$cand"
+  fi
+  info "XHTTP через 127.0.0.1:${XRAY_PORT} (SNI: $SELFTEST_SNI)..."
+  CODE=$(_selftest_vless xhttp "$USER_UUID" "$XRAY_PORT" "$SELFTEST_SNI" \
+         "$SHORT_ID_1" "$PUBLIC_KEY" "$XHTTP_PATH" "$XHTTP_MODE")
+  if [[ "$CODE" == "200" ]]; then
+    success "XHTTP: трафик прошёл (HTTP 200) — REALITY-хендшейк рабочий"
+    SELFTEST_OK=true
+    DEST_SNI="$SELFTEST_SNI"
+    break
+  fi
+  warn "XHTTP selftest не прошёл (код: $CODE), домен $SELFTEST_SNI"
+  [[ -n "${SELFTEST_HINT:-}" ]] && echo "$SELFTEST_HINT" | sed 's/^/    /'
+done
+
+if $SELFTEST_OK && $DUAL_INBOUND; then
+  info "TCP/XTLS-Vision через 127.0.0.1:${XRAY_PORT2}..."
+  CODE2=$(_selftest_vless tcp "$USER_UUID" "$XRAY_PORT2" "$DEST_SNI" \
+          "$SHORT_ID_TCP_1" "$PUBLIC_KEY2")
+  [[ "$CODE2" == "200" ]] \
+    && success "TCP/Vision: трафик прошёл (HTTP 200)" \
+    || warn "TCP/Vision не прошёл (код: $CODE2) — проверь: sudo xm selftest --tcp"
 fi
+
+if ! $SELFTEST_OK; then
+  warn "═══════════════════════════════════════════════════════════"
+  warn "  Ни один домен-маска не дал рабочего хендшейка."
+  warn "  Установка завершится, но сервер, скорее всего, НЕ работает."
+  warn "  Напоминание: пустой лог у REALITY — норма, а не признак здоровья."
+  warn "  Диагностика:  sudo xm selftest  |  sudo xm sni-scan"
+  warn "  Смена домена: sudo xm set-sni <домен>"
+  warn "═══════════════════════════════════════════════════════════"
+fi
+
+# =============================================================================
+# 15. (перенесено выше — см. блок перед секцией 13)
+# [FIX-13] xm ставится ДО запуска сервиса: при падении на старте Xray скрипт
+# выходит по set -e, и раньше xm просто не успевал установиться — диагностика
+# начиналась с "xm: command not found" именно в тот момент, когда он нужен.
+# =============================================================================
 
 # =============================================================================
 # 16. IP + ДАННЫЕ КЛИЕНТА
@@ -1045,7 +1479,12 @@ VLESS URI (XHTTP):
 ${VLESS_URI_XHTTP}
 
 ───────────────────────────────────────────────────────
-sing-box JSON (XHTTP):
+sing-box JSON (XHTTP)
+⚠ XHTTP — транспорт Xray-core. Клиенты на ядре sing-box
+(Hiddify, NekoBox) могут его НЕ поддерживать: симптом —
+подключение висит и отваливается по таймауту, в логах
+сервера при этом ПУСТО (REALITY отказы не логирует).
+Для таких клиентов используй профиль TCP/XTLS-Vision ниже.
 ───────────────────────────────────────────────────────
 {
   "type": "vless", "tag": "proxy-xhttp",
