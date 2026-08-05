@@ -113,6 +113,13 @@ _has_tcp_inbound() {
   [[ $(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0) -ge 2 ]]
 }
 
+# Список активных джейлов fail2ban. Раньше вызывалась в ban-list, но НЕ была
+# определена нигде → "_jails: command not found".
+_jails() {
+  fail2ban-client status 2>/dev/null \
+    | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' ' '
+}
+
 _url_encode() {
   python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
 }
@@ -214,6 +221,78 @@ _sni_cert_gate() {
   else
     ok "Размер Certificate ~${est} б — с запасом ниже лимита REALITY (${REALITY_CERT_LIMIT} б)"; return 0
   fi
+}
+
+# =============================================================================
+# _selftest <xhttp|tcp> — поднимает локальный VLESS-клиент и ходит через
+# СВОЙ ЖЕ сервер. Единственная проверка, дающая бинарный ответ «сервер или
+# клиент». REALITY при провале хендшейка молчит, поэтому пустой лог — норма,
+# а не признак здоровья. Печатает HTTP-код.
+# =============================================================================
+_selftest() {
+  local net="$1" idx=0
+  [[ "$net" == "tcp" ]] && idx=1
+  local uuid port sni sid pub path_v mode sport tmpcfg log code cpid
+  uuid=$(jq -r ".inbounds[$idx].settings.clients[0].id" "$CONFIG")
+  port=$(jq -r ".inbounds[$idx].port" "$CONFIG")
+  sni=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.serverNames[0]" "$CONFIG")
+  sid=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.shortIds[0]" "$CONFIG")
+  # Метка fallback-поля в client-info.txt зависит от inbound'а. Прежняя строка
+  # была склеена из двух правок и подставляла в fallback сам ключ — при пустом
+  # privateKey в config.json selftest падал на «не вычислить публичный ключ».
+  local fb="PUBLIC KEY"
+  [[ "$idx" -eq 1 ]] && fb="PUBLIC KEY2"
+  pub=$(_get_pubkey "$idx" "$fb")
+  [[ -z "$pub" || ${#pub} -lt 30 ]] && { fail "Не вычислить публичный ключ (xm pubkey)"; return 1; }
+
+  sport=$(( 20000 + RANDOM % 10000 ))
+  tmpcfg=$(mktemp /tmp/xm-selftest.XXXXXX.json)
+  log=$(mktemp /tmp/xm-selftest.XXXXXX.log)
+
+  if [[ "$net" == "xhttp" ]]; then
+    path_v=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
+    mode=$(jq   -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
+    jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
+          --arg p "$path_v" --arg m "$mode" --argjson port "$port" --argjson sp "$sport" '{
+      log:{loglevel:"warning"},
+      inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:false}}],
+      outbounds:[{protocol:"vless",
+        settings:{vnext:[{address:"127.0.0.1",port:$port,users:[{id:$uuid,encryption:"none"}]}]},
+        streamSettings:{network:"xhttp",security:"reality",
+          realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid},
+          xhttpSettings:{path:$p,host:$sni,mode:$m}}}]}' > "$tmpcfg"
+  else
+    jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
+          --argjson port "$port" --argjson sp "$sport" '{
+      log:{loglevel:"warning"},
+      inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:false}}],
+      outbounds:[{protocol:"vless",
+        settings:{vnext:[{address:"127.0.0.1",port:$port,
+          users:[{id:$uuid,encryption:"none",flow:"xtls-rprx-vision"}]}]},
+        streamSettings:{network:"tcp",security:"reality",
+          realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid}}}]}' > "$tmpcfg"
+  fi
+
+  info "Транспорт: $net | порт: $port | SNI: $sni"
+  xray run -c "$tmpcfg" >"$log" 2>&1 &
+  cpid=$!; sleep 2
+  # [FIX-14] см. setup.sh: curl при неудаче сам печатает "000", и `|| echo "000"`
+  # давал склейку "000000" вместо кода. Разделяем вывод и обработку ошибки.
+  code=$(curl -s -x "socks5h://127.0.0.1:${sport}" --max-time 15 -o /dev/null \
+         -w '%{http_code}' https://api.ipify.org 2>/dev/null) || true
+  code=${code:-000}
+  kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
+
+  if [[ "$code" == "200" ]]; then
+    ok "Трафик прошёл (HTTP 200) — сервер исправен по транспорту $net"
+    ok "Значит проблема НА КЛИЕНТЕ: креды, приложение или сеть до сервера"
+  else
+    fail "Трафик НЕ прошёл (код: $code) — виноват сервер, не клиент"
+    grep -iE "failed|EOF|reject|reality" "$log" 2>/dev/null | tail -5 | sed 's/^/    /'
+    warn "Дальше: sudo xm sni-scan  |  sudo xm reality-debug on"
+  fi
+  rm -f "$tmpcfg" "$log"
+  [[ "$code" == "200" ]]
 }
 
 # Атомарная замена config.json: JSON через stdin → mktemp → chmod 640 root:nogroup → mv.
@@ -337,8 +416,11 @@ set-sni)
     mkdir -p "$BACKUP_DIR"; STAMP=$(date +%Y%m%d_%H%M%S)
     CFG_BACKUP="$BACKUP_DIR/config_${STAMP}_before_setsni.json"
     cp "$CONFIG" "$CFG_BACKUP"
+    # Бэкап кладём в $BACKUP_DIR, а НЕ рядом в stream-enabled/: nginx включает
+    # оттуда файлы по маске, и любой лишний файл в этом каталоге — риск второго
+    # server{} на 127.0.0.1:10443 и падения nginx -t после смены домена.
     NGX_BACKUP=""
-    [[ -f "$NGINX_CONF" ]] && { NGX_BACKUP="${NGINX_CONF}.${STAMP}.bak"; cp "$NGINX_CONF" "$NGX_BACKUP"; }
+    [[ -f "$NGINX_CONF" ]] && { NGX_BACKUP="$BACKUP_DIR/reality-fallback_${STAMP}.conf.bak"; cp "$NGINX_CONF" "$NGX_BACKUP"; }
     ok "Бэкапы созданы (config + nginx)"
 
     # config.json: все SNI-поля одним jq → атомарная запись
@@ -759,11 +841,26 @@ add-tcp)
     CLIENTS_TCP=$(jq '[.inbounds[0].settings.clients[] |
       { id: .id, flow: "xtls-rprx-vision", comment: .comment }]' "$CONFIG")
 
+    # dest/xver ЗЕРКАЛИМ с inbounds[0], а не хардкодим. На сервере со старой
+    # архитектурой (dest = внешний сайт, xver = 0) хардкод 127.0.0.1:10443
+    # создаёт МЁРТВЫЙ inbound: nginx stream-fallback там не поднят, а симптом —
+    # тот же таймаут при пустых логах.
+    DEST_MIRROR=$(jq -r '.inbounds[0].streamSettings.realitySettings.dest' "$CONFIG")
+    XVER_MIRROR=$(jq -r '.inbounds[0].streamSettings.realitySettings.xver // 0' "$CONFIG")
+    info "dest: $DEST_MIRROR (xver=$XVER_MIRROR) — как у XHTTP inbound"
+    if [[ "$DEST_MIRROR" == "127.0.0.1:10443" ]] && ! ss -tlnp 2>/dev/null | grep -q "127.0.0.1:10443"; then
+      fail "dest = 127.0.0.1:10443, но никто там не слушает — nginx stream-fallback не поднят"
+      fail "TCP inbound окажется нерабочим. Сначала почини fallback: xm diag → блок [6]"
+      exit 1
+    fi
+
     TCP_INBOUND=$(jq -n \
       --arg     sni     "$SNI" \
       --arg     priv    "$PRIV" \
       --arg     sid1    "$SID1" \
       --arg     sid2    "$SID2" \
+      --arg     dest    "$DEST_MIRROR" \
+      --argjson xver    "$XVER_MIRROR" \
       --argjson port    "$PORT2" \
       --argjson clients "$CLIENTS_TCP" \
       '{
@@ -776,8 +873,8 @@ add-tcp)
           security: "reality",
           realitySettings: {
             show: false,
-            dest: "127.0.0.1:10443",
-            xver: 2,
+            dest: $dest,
+            xver: $xver,
             serverNames: [$sni],
             privateKey: $priv,
             maxTimeDiff: 10000,
@@ -1049,7 +1146,7 @@ ban-ssh-stat)  fail2ban-client status 2>/dev/null || echo "fail2ban не зап�
 unban)
     TARGET_IP="${2:-}"
     [[ -z "$TARGET_IP" ]] && read -rp "IP для разбана: " TARGET_IP
-    for jail in sshd nginx-reality-flood; do
+    for jail in $(_jails); do
       fail2ban-client status "$jail" &>/dev/null && {
         fail2ban-client set "$jail" unbanip "$TARGET_IP" 2>/dev/null \
           && echo -e "${GREEN}${jail}: разбан${NC}" \
@@ -1080,6 +1177,44 @@ log-access)
     *)
       CUR=$(jq -r '.log.access // "<не задано>"' "$CONFIG")
       [[ "$CUR" == "none" ]] && ok "Access-лог отключён (none)" || warn "Access-лог: $CUR"
+      ;;
+    esac
+    ;;
+
+# Единственный способ увидеть, ПОЧЕМУ REALITY отказывает. Пишет IP клиентов —
+# поэтому авто-выключение через 15 мин, чтобы забытая отладка не копила логи.
+reality-debug)
+    if [[ $EUID -ne 0 ]]; then
+      echo -e "${RED}Запусти от root: sudo xm reality-debug on|off|status${NC}"; exit 1
+    fi
+    case "${2:-status}" in
+    on)
+      jq '.inbounds[0].streamSettings.realitySettings.show = true | .log.loglevel = "debug"' \
+        "$CONFIG" | _atomic_write_config || exit 1
+      _apply || exit 1
+      warn "REALITY-отладка ВКЛЮЧЕНА — в $LOG пишутся IP клиентов и детали хендшейка"
+      info "Строка 'REALITY: processed invalid connection' = клиент не прошёл аутентификацию"
+      info "(старый pbk/UUID/shortId у клиента). Её отсутствие = проблема выше по стеку."
+      systemd-run --on-active=15min --unit=xray-reality-debug-off \
+        /usr/local/bin/xm reality-debug off &>/dev/null \
+        && ok "Авто-выключение через 15 мин запланировано" \
+        || warn "Авто-выключение не запланировано — выключи вручную!"
+      ;;
+    off)
+      systemctl stop xray-reality-debug-off.timer &>/dev/null || true
+      jq '.inbounds[0].streamSettings.realitySettings.show = false | .log.loglevel = "warning"' \
+        "$CONFIG" | _atomic_write_config || exit 1
+      _apply || exit 1
+      [[ -f "$LOG" ]] && { shred -u "$LOG" 2>/dev/null || rm -f "$LOG"; }
+      touch "$LOG"; chown nobody:nogroup "$LOG" 2>/dev/null || true
+      ok "REALITY-отладка выключена, лог затёрт"
+      ;;
+    *)
+      SHOW=$(jq -r '.inbounds[0].streamSettings.realitySettings.show // false' "$CONFIG")
+      LVL=$(jq -r '.log.loglevel // "?"' "$CONFIG")
+      [[ "$SHOW" == "true" ]] \
+        && warn "show=true, loglevel=$LVL — ОТЛАДКА ВКЛЮЧЕНА, выключи: sudo xm reality-debug off" \
+        || ok "show=false, loglevel=$LVL"
       ;;
     esac
     ;;
@@ -1115,6 +1250,11 @@ info)
     echo -e "${BOLD}SSH порт:${NC}  $(_get_ssh_port)"
     echo ""
     echo -e "${BOLD}NTP дрейф:${NC}"
+    if [[ -f /var/lib/xray-sni-watch.flag ]]; then
+      echo ""
+      warn "Watchdog домена-маски:"
+      sed 's/^/    /' /var/lib/xray-sni-watch.flag
+    fi
     chronyc tracking 2>/dev/null | grep "System time" | sed 's/^/  /' || echo "  ?"
     ;;
 
@@ -1258,12 +1398,16 @@ for svc in xray nginx fail2ban chrony; do
     else
       warn "limit_conn не найден в stream-fallback"
     fi
-    # limit_conn без realip считает всех как 127.0.0.1 → лимит 20 действует
-    # на весь сервер, а не на клиента, и отстреливает своих же (status=503).
-    if grep -rq "set_real_ip_from" /etc/nginx/stream-enabled/ 2>/dev/null; then
-      ok "set_real_ip_from настроен (limit_conn считает по реальному IP клиента)"
+    # Без реального IP клиента limit_conn считает всех как 127.0.0.1 → лимит
+    # действует на весь сервер и отстреливает своих же (status=503).
+    # Годится ЛЮБОЙ из двух способов: $proxy_protocol_addr (работает везде)
+    # или set_real_ip_from (нужен ngx_stream_realip_module, в Ubuntu его нет).
+    if grep -rqE 'limit_conn_zone[[:space:]]+\$proxy_protocol_addr' /etc/nginx/stream-enabled/ 2>/dev/null; then
+      ok "limit_conn по \$proxy_protocol_addr — считает реальный IP клиента"
+    elif grep -rq "set_real_ip_from" /etc/nginx/stream-enabled/ 2>/dev/null; then
+      ok "limit_conn по \$remote_addr + set_real_ip_from (realip-модуль доступен)"
     else
-      fail "set_real_ip_from не задан — limit_conn считает все соединения как 127.0.0.1, лимит действует на весь сервер"; ((ISSUES++))
+      fail "limit_conn считает все соединения как 127.0.0.1 — лимит бьёт по своим же клиентам"; ((ISSUES++))
     fi
 
     echo -e "\n${BOLD}[ 6b ] Синхронизация домена-маски (SNI/dest)${NC}"; sep
@@ -1311,9 +1455,14 @@ for svc in xray nginx fail2ban chrony; do
     echo -e "\n${BOLD}[ 8 ] Firewall (UFW)${NC}"; sep
     if ufw status | grep -q "Status: active"; then
       ok "UFW активен"
-      ufw status | grep -qE "(^|[^0-9])${SSH_P}/tcp" 
-        && ok "SSH порт $SSH_P открыт в UFW" \
-        || { fail "SSH порт $SSH_P не найден в UFW — риск потери доступа!"; ((ISSUES++)); }
+      # if/else вместо && || : прежняя запись потеряла '\' после grep, из-за чего
+      # строка "&& ok ..." становилась отдельной командой → syntax error → весь
+      # case не парсился → xm не запускался НИ ОДНОЙ командой.
+      if ufw status | grep -qE "(^|[^0-9])${SSH_P}/tcp"; then
+        ok "SSH порт $SSH_P открыт в UFW"
+      else
+        fail "SSH порт $SSH_P не найден в UFW — риск потери доступа!"; ((ISSUES++))
+      fi
     else
       fail "UFW не активен — сервер открыт!"; ((ISSUES++))
     fi
@@ -1332,7 +1481,8 @@ for svc in xray nginx fail2ban chrony; do
     else
       fail "nginx fallback пишет IP ВСЕХ клиентов — нужен map \$log_probe + access_log ... if=\$log_probe"; ((ISSUES++))
     fi
-    JCOUNT=$(journalctl -u xray --since "1 hour ago" --no-pager 2>/dev/null | grep -c "accepted" || echo 0)
+    JCOUNT=$(journalctl -u xray --since "1 hour ago" --no-pager 2>/dev/null | grep -c "accepted" || true)
+    JCOUNT=${JCOUNT:-0}
     [[ "$JCOUNT" -eq 0 ]] \
       && ok "В journald нет access-записей за последний час" \
       || { fail "В journald $JCOUNT access-записей за час — очисти: journalctl --rotate && journalctl --vacuum-time=1s"; ((ISSUES++)); }
@@ -1591,7 +1741,7 @@ diag-fw)
     echo -e "${BOLD}fail2ban:${NC}"
     if systemctl is-active --quiet fail2ban; then
       ok "fail2ban запущен"
-      for jail in sshd nginx-reality-flood; do
+      for jail in $(_jails); do
         if fail2ban-client status "$jail" &>/dev/null; then
           TOTAL=$(fail2ban-client status "$jail" 2>/dev/null | grep "Total banned" | awk '{print $NF}')
           CURRENT=$(fail2ban-client status "$jail" 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
@@ -1630,13 +1780,71 @@ diag-log)
 
     echo ""
     echo -e "${BOLD}Признаки DPI/блокировки:${NC}"
-    HANDSHAKE_FAILS=$(grep -c "rejected\|handshake\|tls.*fail\|reality.*fail" "$LOG" 2>/dev/null || echo 0)
+    HANDSHAKE_FAILS=$(grep -c "rejected\|handshake\|tls.*fail\|reality.*fail" "$LOG" 2>/dev/null || true)
+    HANDSHAKE_FAILS=${HANDSHAKE_FAILS:-0}
     if [[ "$HANDSHAKE_FAILS" -gt 50 ]]; then
       warn "Много отклонённых handshake ($HANDSHAKE_FAILS) — возможное DPI или сканирование"
     elif [[ "$HANDSHAKE_FAILS" -gt 0 ]]; then
       info "Отклонённых handshake: $HANDSHAKE_FAILS (норма)"
     else
       ok "Признаков DPI-блокировки нет"
+    fi
+    ;;
+
+# ─── Selftest ────────────────────────────────────────────────────────────────
+selftest)
+    if [[ $EUID -ne 0 ]]; then
+      echo -e "${RED}Запусти от root: sudo xm selftest${NC}"; exit 1
+    fi
+    echo -e "${BOLD}${CYAN}[ Selftest: живой хендшейк через loopback ]${NC}"; sep
+    if [[ "${2:-}" == "--tcp" ]]; then
+      _has_tcp_inbound || { fail "TCP inbound отсутствует"; exit 1; }
+      _selftest tcp
+    elif [[ "${2:-}" == "--all" ]]; then
+      _selftest xhttp; R1=$?
+      _has_tcp_inbound && { sep; _selftest tcp; }
+      exit $R1
+    else
+      _selftest xhttp
+    fi
+    ;;
+
+# ─── Подбор домена-маски ─────────────────────────────────────────────────────
+sni-scan)
+    POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net www.apple.com)
+    CUR=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
+    if [[ -n "$CUR" ]] && ! printf '%s\n' "${POOL[@]}" | grep -qx "$CUR"; then
+      POOL=("$CUR" "${POOL[@]}")
+    fi
+    echo -e "${BOLD}${CYAN}[ Подбор домена-маски ]${NC}"; sep
+    printf "  %-22s %9s %6s %8s  %s\n" "домен" "cert,б" "h2" "RTT,мс" "вердикт"
+    BEST=""; BEST_SZ=999999
+    for h in "${POOL[@]}"; do
+      EST=$(_check_cert_size "$h")
+      if [[ "$EST" == "-1" ]]; then
+        printf "  %-22s %9s %6s %8s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "НЕДОСТУПЕН"; continue
+      fi
+      T0=$(date +%s%N)
+      HS=$(echo | timeout 8 openssl s_client -connect "$h:443" -servername "$h" \
+           -tls1_3 -alpn h2 2>/dev/null)
+      T1=$(date +%s%N); RTT=$(( (T1-T0)/1000000 ))
+      H2=нет;  printf '%s' "$HS" | grep -qi "ALPN protocol: h2" && H2=да
+      T13=нет; printf '%s' "$HS" | grep -q  "TLSv1.3"           && T13=да
+      V="ГОДИТСЯ"; C="$GREEN"
+      [[ "$EST" -ge "$REALITY_CERT_WARN"  ]] && { V="РИСК";       C="$YELLOW"; }
+      [[ "$EST" -ge "$REALITY_CERT_LIMIT" ]] && { V="НЕ ГОДИТСЯ"; C="$RED"; }
+      [[ "$H2" != "да" || "$T13" != "да"  ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; }
+      GOOD="$V"
+      [[ "$h" == "$CUR" ]] && V="$V ← текущий"
+      printf "  %-22s %9s %6s %8s  ${C}%s${NC}\n" "$h" "$EST" "$H2" "$RTT" "$V"
+      if [[ "$GOOD" == "ГОДИТСЯ" && "$EST" -lt "$BEST_SZ" ]]; then BEST="$h"; BEST_SZ="$EST"; fi
+    done
+    sep
+    if [[ -n "$BEST" ]]; then
+      ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_SZ} б)"
+      [[ "$BEST" != "$CUR" ]] && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST${NC}"
+    else
+      fail "Ни один кандидат не прошёл — расширь POOL в xm.sh"
     fi
     ;;
 
@@ -1678,6 +1886,9 @@ diag-log)
     echo -e "${BOLD}Инфо:${NC}     xm info / paths / uuid / pubkey"
     echo ""
     echo -e "${BOLD}${GREEN}Диагностика:${NC}"
+    echo -e "  ${GREEN}xm selftest [--tcp|--all]${NC}        Живой хендшейк через loopback — НАЧИНАЙ С НЕЁ"
+    echo -e "  ${GREEN}xm sni-scan${NC}                      Замер доменов-масок (cert/h2/RTT)"
+    echo -e "  ${GREEN}xm reality-debug on|off${NC}          Почему REALITY отказывает (авто-off 15 мин)"
     echo -e "  ${GREEN}xm diag${NC}                          Полная диагностика"
     echo -e "  ${GREEN}xm dpi${NC}                           Устойчивость к DPI"
     echo    "  Прочее: pubkey / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log"
