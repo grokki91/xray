@@ -415,8 +415,46 @@ if [[ -f "$XRAY_CONFIG" ]] && [[ "${1:-}" != "--reinstall" ]]; then
   echo -e "Для принудительной переустановки запусти:"
   echo -e "  ${BOLD}sudo bash $0 --reinstall${NC}"
   echo ""
+  echo -e "Обновить только менеджер (ключи и клиенты не тронутся):"
+  echo -e "  ${BOLD}sudo xm self-update${NC}"
+  echo ""
   echo -e "Управление: ${BOLD}xm help${NC}  |  Диагностика: ${BOLD}xm diag${NC}"
   exit 0
+fi
+
+# --reinstall на живом сервере — самая разрушительная операция в проекте, и она
+# бьёт не только по VPN. Скрипт переписывает общесистемные вещи: nginx.conf,
+# sites-enabled, весь stream-enabled/, ufw, fail2ban. Если на этой же машине
+# живёт что-то ещё (бот, сайт, API) — оно может встать. Поэтому показываем, что
+# именно рядом, и требуем осознанного подтверждения.
+if [[ -f "$XRAY_CONFIG" ]] && [[ "${1:-}" == "--reinstall" ]]; then
+  echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
+  echo -e "${RED}${BOLD}║  ПЕРЕУСТАНОВКА — читай, что будет переписано         ║${NC}"
+  echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════╝${NC}"
+  echo ""
+  echo -e "  ${BOLD}Ключи REALITY${NC} генерируются заново — ВСЕ выданные клиентам URI и"
+  echo    "  QR-коды перестанут работать, их придётся раздать заново."
+  echo ""
+  echo -e "  ${BOLD}Общесистемное${NC} (задевает соседей по серверу, если они есть):"
+  echo    "    · /etc/nginx/nginx.conf     — дописывается stream-блок"
+  echo    "    · sites-enabled/default     — удаляется"
+  echo    "    · sites-available/fallback  — перезаписывается, listen 80 default_server"
+  echo    "    · /etc/nginx/stream-enabled/*  — вычищается ЦЕЛИКОМ"
+  echo    "    · ufw                       — включается, открываются только наши порты"
+  echo    "    · fail2ban, unattended-upgrades — конфиги перезаписываются"
+  echo ""
+  if command -v xm &>/dev/null; then
+    echo -e "${CYAN}Что сейчас есть на этой машине:${NC}"
+    xm neighbors 2>/dev/null | sed 's/^/  /' || true
+    echo ""
+  fi
+  echo -e "${YELLOW}Если нужно просто обновить менеджер — переустановка НЕ нужна:${NC}"
+  echo -e "  ${BOLD}sudo xm self-update${NC}   обновить xm из репозитория"
+  echo -e "  ${BOLD}sudo xm harden${NC}        применить свежие анти-DPI настройки"
+  echo -e "  ${BOLD}sudo xm update${NC}        обновить Xray-core"
+  echo ""
+  read -rp "Всё равно переустанавливать? Введи ПЕРЕУСТАНОВИТЬ: " REINST_CONFIRM
+  [[ "$REINST_CONFIRM" == "ПЕРЕУСТАНОВИТЬ" ]] || { info "Отменено, ничего не изменено."; exit 0; }
 fi
 
 # =============================================================================
@@ -1433,6 +1471,20 @@ elif [[ -f "$(dirname "$0")/xm.sh" ]]; then
 else
   warn "xm.sh не найден рядом с setup.sh"
   warn "Скопируй xm.sh вручную: sudo cp xm.sh /usr/local/bin/xm && sudo chmod +x /usr/local/bin/xm"
+fi
+
+# Запоминаем, откуда ставился xm. Дальше обновление делается одной командой
+# `sudo xm self-update` — она тянет коммиты отсюда и переустанавливает бинарь.
+# Правку /usr/local/bin/xm руками это заменяет полностью: источник правды —
+# репозиторий, а не единственная копия файла на VPS.
+XM_REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -d "$XM_REPO_DIR/.git" ]]; then
+  echo "$XM_REPO_DIR" > /usr/local/etc/xray/xm-source
+  chmod 644 /usr/local/etc/xray/xm-source
+  success "Источник обновлений: $XM_REPO_DIR  →  sudo xm self-update"
+else
+  warn "setup.sh запущен не из git-чекаута — источник обновлений не записан."
+  warn "Настрой позже: sudo xm self-update --from https://github.com/<user>/xray.git"
 fi
 
 # =============================================================================
