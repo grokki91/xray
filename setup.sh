@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Xray-core · VLESS + REALITY + XHTTP  ·  Auto Setup  v5.5
+#  Xray-core · VLESS + REALITY + XHTTP  ·  Auto Setup  v5.7
 #  Ubuntu 24.04 LTS
 #
 #  Исправления v5 (относительно v4):
@@ -40,6 +40,24 @@
 #   - [FIX-8] Дефолтный список SNI заменён на домены с компактными
 #             сертификатами; microsoft.com убран из дефолтов (оставлен
 #             последней опцией как наглядный пример «слишком большого» cert).
+#
+#  Исправления v5.7 (анти-DPI: ответ на блокировки DoH/DoT):
+#   - [FIX-15] nginx REALITY fallback переведён в режим mimic: зонд с чужим
+#             или отсутствующим SNI получает ответ НАСТОЯЩЕГО сайта, а не
+#             молчаливый обрыв TCP. Прежнее поведение ("порт открыт, TLS не
+#             говорит") — готовая подпись прокси для любого сканера.
+#   - [FIX-16] Секция 11b: dns-блок с DoH по IP-литералу + outbound dns-out +
+#             routing-правило :53 → dns-out. Раньше dns-блока не было вообще:
+#             Xray резолвил домены системным резолвером хостера ОТКРЫТЫМ
+#             текстом, то есть хостер видел полный список посещаемых сайтов.
+#             Плюс plain-DNS клиента (а после блокировок DoH/DoT их
+#             большинство) пересылался с VPS наружу как есть. Теперь сервер
+#             перехватывает :53 из тоннеля и отвечает сам по DoH.
+#             Доступность DoH проверяется ДО правки конфига — иначе включение
+#             убило бы весь резолвинг без единой ошибки в логе.
+#   - queryStrategy подбирается по фактическому стеку VPS (нет IPv6 → UseIPv4,
+#     без бесполезных AAAA, до которых сервер всё равно не дойдёт).
+#   - Бэкапы config.json теперь 600 (внутри приватный ключ REALITY).
 # =============================================================================
 
 set -euo pipefail
@@ -179,6 +197,44 @@ _fetch_server_ip() {
 # =============================================================================
 REALITY_CERT_WARN=7000     # запас до лимита; между warn и limit — риск на части версий
 REALITY_CERT_LIMIT=8192    # захардкоженный буфер REALITY в ряде версий Xray-core
+
+# =============================================================================
+# DNS: DoH-резолверы для сервера
+#
+# ЗАЧЕМ: с августа 2025 массово сообщают об ограничениях DoH/DoT у российских
+# операторов. Проверить это со стороны сервера нельзя, но и не нужно: описанная
+# ниже утечка существует независимо от них. Браузер/ОС, не достучавшись до
+# Secure DNS, откатывается на ОБЫЧНЫЙ DNS.
+# Дальше имя домена видит либо провайдер (VPN выключен), либо — если ничего
+# не делать — хостер VPS, потому что Xray без dns-блока резолвит системным
+# резолвером открытым текстом. Оба канала закрываются DoH на сервере плюс
+# перехватом :53 из тоннеля: клиенту при этом ничего настраивать не нужно.
+#
+# Резолверы заданы IP-ЛИТЕРАЛОМ — нет bootstrap-запроса «а какой IP у
+# dns.google», который ушёл бы открытым. https+local:// = мимо routing,
+# поэтому перехват :53 не зацикливается на самом себе.
+# =============================================================================
+DOH_LIST='["https+local://1.1.1.1/dns-query","https+local://9.9.9.9/dns-query","https+local://8.8.8.8/dns-query"]'
+DOH_IPS=(1.1.1.1 9.9.9.9 8.8.8.8)
+
+# Отвечает ли резолвер по DoH ИМЕННО С ЭТОГО VPS (RFC 8484 wireformat GET —
+# он есть у всех, в отличие от JSON-API).
+_doh_probe() {
+  local ip="$1" b64 code
+  b64=$(python3 -c '
+import base64, struct, sys
+q = struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0)
+for l in sys.argv[1].split("."): q += bytes([len(l)]) + l.encode()
+q += b"\x00" + struct.pack(">HH", 1, 1)
+print(base64.urlsafe_b64encode(q).rstrip(b"=").decode())' example.com 2>/dev/null) || return 1
+  [[ -z "$b64" ]] && return 1
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 \
+         -H 'accept: application/dns-message' \
+         "https://${ip}/dns-query?dns=${b64}" 2>/dev/null) || code="000"
+  [[ "$code" == "200" ]]
+}
+
+_has_ipv6() { ip -6 route get 2001:4860:4860::8888 &>/dev/null; }
 
 _check_cert_size() {
   local host="$1"
@@ -888,11 +944,24 @@ fi
 # nginx-переменные $ssl_preread_server_name и т.п.), а наш SNI подставляем
 # отдельно через sed по плейсхолдеру __DEST_SNI__.
 cat > /etc/nginx/stream-enabled/reality-fallback.conf <<'STREAMEOF'
-# Разрешаем проксировать ТОЛЬКО на наш dest-SNI. Любой другой SNI (или его
-# отсутствие) → пустой апстрим → соединение обрывается. Это не даёт превратить
-# nginx в открытый SNI-релей на произвольный хост.
+# [FIX-15] Любой SNI (в т.ч. чужой и отсутствующий) уходит на ОДИН И ТОТ ЖЕ
+# наш dest-SNI — режим mimic.
+#
+# ПОЧЕМУ НЕ ПУСТОЙ default, КАК БЫЛО: пустой апстрим = nginx принимает TCP и
+# молча закрывает. Настоящий HTTPS-сервер на чужой SNI отвечает либо
+# сертификатом, либо TLS-alert; принять соединение и закрыть его без единого
+# байта TLS — поведение нетипичное и хорошо заметное. Сканеру (Censys/Shodan)
+# хватает одного коннекта, чтобы увидеть «порт открыт, TLS не говорит» — это
+# готовая подпись прокси, и REALITY со всей своей маскировкой тут не помогает.
+# Теперь зонд получает ответ НАСТОЯЩЕГО сайта — то есть ровно то, что он
+# получил бы, постучавшись на реальный edge этого домена.
+#
+# Открытым SNI-релеем сервер при этом НЕ становится: значение справа —
+# константа, один и тот же домен для любого запроса. Выбрать хост назначения
+# извне нельзя. Проверка: sudo xm diag-dpi → блок B.
+# Вернуть прежнее поведение: sudo xm harden --off
 map $ssl_preread_server_name $reality_upstream {
-    default        "";
+    default        __DEST_SNI__;
     __DEST_SNI__   __DEST_SNI__;
 }
 
@@ -1268,6 +1337,74 @@ chown root:nogroup "$XRAY_CONFIG"
 success "config.json записан и защищён (chmod 640, root:nogroup)"
 
 # =============================================================================
+# 11b. DNS: DoH на сервере + перехват :53 из тоннеля
+#
+# Проверяем ДОСТУПНОСТЬ резолверов до правки конфига: если ни один DoH с этого
+# VPS не отвечает (хостер режет :443 к ним), включённый DoH убьёт весь
+# резолвинг и сервер «перестанет работать» без единой ошибки в логе.
+# =============================================================================
+header "DNS: DoH + перехват :53"
+
+DOH_OK=0
+for r in "${DOH_IPS[@]}"; do
+  if _doh_probe "$r"; then info "DoH $r — отвечает"; DOH_OK=$((DOH_OK + 1))
+  else warn "DoH $r — не отвечает с этого VPS"; fi
+done
+
+if [[ "$DOH_OK" -eq 0 ]]; then
+  warn "Ни один DoH-резолвер не доступен с VPS — dns-блок НЕ добавляю."
+  warn "Иначе сломается резолвинг. Домены будет резолвить системный резолвер"
+  warn "хостера открытым текстом. Разберись с сетью и запусти: sudo xm harden"
+else
+  # Нет IPv6 → AAAA бесполезны: клиент получит адрес, до которого сервер не
+  # дойдёт, и это выглядит как «сайт не открывается через VPN».
+  if _has_ipv6; then
+    DNS_QS="UseIP";     DNS_DS="UseIPv4v6"; info "IPv6 на VPS есть → queryStrategy=UseIP"
+  else
+    DNS_QS="UseIPv4";   DNS_DS="UseIPv4";   info "IPv6 на VPS нет → queryStrategy=UseIPv4"
+  fi
+
+  # nonIPQuery=drop: запросы не-A/AAAA (HTTPS/SVCB, TXT) отбрасываются, а не
+  # пересылаются наружу открытым текстом. Поле старое, но на редких сборках
+  # может не приняться — тогда второй заход без него.
+  _write_dns_cfg() {
+    local nonip="$1" tmp
+    tmp=$(mktemp "$(dirname "$XRAY_CONFIG")/config.XXXXXX.json")
+    jq --argjson doh "$DOH_LIST" --arg qs "$DNS_QS" --arg ds "$DNS_DS" --arg nonip "$nonip" '
+        .dns = { servers: $doh, queryStrategy: $qs, disableCache: false, tag: "dns-in" }
+      | .outbounds = ([ .outbounds[]? | select(.protocol != "dns") ]
+                    + [ { protocol: "dns", tag: "dns-out" }
+                        + (if $nonip == "" then {} else { settings: { nonIPQuery: $nonip } } end) ])
+      | .routing.rules = ([ { type: "field", port: 53, network: "tcp,udp", outboundTag: "dns-out" } ]
+                        + [ .routing.rules[]? | select(.outboundTag != "dns-out") ])
+      | (.outbounds[] | select(.protocol == "freedom")).settings.domainStrategy = $ds
+    ' "$XRAY_CONFIG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    chmod 640 "$tmp"; chown root:nogroup "$tmp"; mv "$tmp" "$XRAY_CONFIG"
+    xray -test -config "$XRAY_CONFIG" 2>&1 | grep -q "Configuration OK"
+  }
+
+  # mktemp сразу даёт 600 — в файле приватный ключ REALITY, cp дал бы 644.
+  # Без расширения .json: в каталоге конфигов лишний *.json — лишний риск.
+  CFG_NODNS=$(mktemp "$(dirname "$XRAY_CONFIG")/config.nodns.XXXXXX")
+  cat "$XRAY_CONFIG" > "$CFG_NODNS"
+  if _write_dns_cfg "drop"; then
+    success "DNS: DoH ($DOH_OK резолвера) + перехват :53 → dns-out"
+  else
+    warn "Xray не принял nonIPQuery — повторяю без него"
+    cat "$CFG_NODNS" > "$XRAY_CONFIG"
+    if _write_dns_cfg ""; then
+      success "DNS: DoH ($DOH_OK резолвера) + перехват :53 → dns-out"
+    else
+      warn "dns-блок не принят этой сборкой Xray — возвращаю конфиг без него"
+      cat "$CFG_NODNS" > "$XRAY_CONFIG"
+    fi
+  fi
+  chmod 640 "$XRAY_CONFIG"; chown root:nogroup "$XRAY_CONFIG"
+  rm -f "$CFG_NODNS"
+fi
+
+# =============================================================================
 # 12. ВАЛИДАЦИЯ КОНФИГА
 # =============================================================================
 header "Валидация конфига"
@@ -1555,6 +1692,18 @@ echo ""
 echo -e "${BOLD}NTP drift:${NC}"
 chronyc tracking 2>/dev/null | grep "System time" | sed 's/^/  /' || echo "  (синхронизируется...)"
 echo ""
+echo -e "${BOLD}DNS:${NC}"
+if jq -e '.dns.servers // empty' "$XRAY_CONFIG" >/dev/null 2>&1; then
+  echo -e "  Резолвинг на сервере идёт по DoH, :53 из тоннеля перехватывается."
+  echo -e "  Клиенту настраивать Secure DNS не нужно — и блокировки DoH/DoT"
+  echo -e "  у провайдера на него больше не влияют, пока VPN включён."
+else
+  echo -e "  ${YELLOW}dns-блок не добавлен (DoH был недоступен с VPS).${NC}"
+  echo -e "  ${YELLOW}Домены резолвит системный резолвер хостера открытым текстом.${NC}"
+  echo -e "  ${YELLOW}Повтори позже: ${BOLD}sudo xm harden${NC}"
+fi
+echo ""
+echo -e "${YELLOW}Устойчивость к DPI:  ${BOLD}xm diag-dpi${NC}"
 echo -e "${YELLOW}Диагностика сервера: ${BOLD}xm diag${NC}"
 echo -e "${YELLOW}Данные клиента:      ${BOLD}cat $CLIENT_FILE${NC}"
 echo -e "${YELLOW}QR-коды повторно:    ${BOLD}xm qr${NC}  |  Оба: ${BOLD}xm qr --both${NC}"
