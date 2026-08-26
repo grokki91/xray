@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  xm — Xray Manager Helper  v5.6
+#  xm — Xray Manager Helper  v5.7
 #  Использование: xm [команда]
 #
 #  Команды:
@@ -14,7 +14,8 @@
 #   Fail2ban:    ban-list / ban-ssh-stat / unban
 #   Логи:        log / log-live / log-clear
 #   Инфо:        info / paths / uuid / pubkey
-#   Диагностика: diag / diag-dpi / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
+#   Анти-DPI:    harden [--check|--off] / pq status|on|off
+#   Диагностика: diag / diag-dpi [--quick] / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
 # =============================================================================
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -120,9 +121,330 @@ _jails() {
     | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' ' '
 }
 
+# Бэкап config.json. Каталог 700, файл 600: внутри приватный ключ REALITY,
+# а cp по умолчанию создал бы 644 — ключ стал бы читаем любому пользователю
+# системы. Печатает путь к бэкапу.
+_backup_config() {
+  local suffix="${1:-}" path
+  mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+  path="$BACKUP_DIR/config_$(date +%Y%m%d_%H%M%S)${suffix:+_$suffix}.json"
+  cp "$CONFIG" "$path" && chmod 600 "$path" && echo "$path"
+}
+
 _url_encode() {
   python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"
 }
+
+# ─── DNS: DoH на сервере + перехват :53 ──────────────────────────────────────
+#
+# ЗАЧЕМ: с августа 2025 массово сообщают об ограничениях DoH/DoT (dns.google,
+# 1.1.1.1:853 и т.п.) у российских операторов. Насколько это системно —
+# со стороны сервера не проверить, но и не нужно: утечки ниже существуют
+# независимо от этих сообщений, просто блокировка DoH делает их массовыми.
+# Сам VPN такая блокировка не ломает, но ломает ЛОГИКУ клиента: браузер/ОС,
+# не достучавшись до Secure DNS, откатывается на ОБЫЧНЫЙ DNS. Дальше два сценария утечки:
+#   1) VPN выключен/split-режим → запрос уходит провайдеру открытым текстом,
+#      и он видит имя заблокированного домена + может подменить ответ (НСДИ);
+#   2) VPN включён → запрос идёт в тоннель, но НАШ сервер по умолчанию
+#      резолвит его системным резолвером хостера тоже открытым текстом.
+# Оба закрываются здесь: сервер сам перехватывает :53 из тоннеля и отвечает
+# по DoH. Клиенту при этом ничего настраивать не надо — он даже не знает.
+#
+# Резолверы заданы IP-ЛИТЕРАЛОМ: нет bootstrap-зависимости от резолвера
+# хостера (иначе первый же запрос «а какой IP у dns.google» ушёл бы открытым).
+# https+local:// = запрос идёт мимо routing → нет петли с перехватом :53.
+DOH_LIST='["https+local://1.1.1.1/dns-query","https+local://9.9.9.9/dns-query","https+local://8.8.8.8/dns-query"]'
+DOH_IPS=(1.1.1.1 9.9.9.9 8.8.8.8)
+
+_has_ipv6() { ip -6 route get 2001:4860:4860::8888 &>/dev/null; }
+
+# DoH прописан в конфиге?
+_dns_doh_on() {
+  [[ $(jq '[.dns.servers[]? | select(type=="string") | select(startswith("https"))] | length' \
+       "$CONFIG" 2>/dev/null || echo 0) -gt 0 ]]
+}
+
+# Перехват :53 включён? Нужны И dns-outbound, И правило маршрутизации на него.
+_dns_hijack_on() {
+  jq -e '([.outbounds[]? | select(.protocol=="dns")] | length) > 0
+     and ([.routing.rules[]? | select(.outboundTag=="dns-out")] | length) > 0' \
+     "$CONFIG" >/dev/null 2>&1
+}
+
+# nginx-fallback отвечает на чужой SNI (mimic), а не рвёт соединение?
+# Смотрим ТОЛЬКО внутрь map $reality_upstream: во втором map ($log_probe)
+# свой default 1;, и по нему легко получить ложное «включено».
+_ngx_mimic_on() {
+  awk '
+    /map[[:space:]]+\$ssl_preread_server_name[[:space:]]+\$reality_upstream/ { inblk=1; next }
+    inblk && $1 == "default" { if ($2 != "\"\";") found=1; inblk=0; next }
+    inblk && /\}/ { inblk=0 }
+    END { exit !found }
+  ' /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null
+}
+
+# DNS-запрос в wireformat RFC 8484, base64url — для проверки DoH через curl.
+# JSON-API (?name=) есть не у всех резолверов, wireformat обязателен у всех.
+_dns_wire_b64() {
+  python3 -c '
+import base64, struct, sys
+q = struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0)   # ID=0 — так требует RFC для GET
+for l in sys.argv[1].split("."): q += bytes([len(l)]) + l.encode()
+q += b"\x00" + struct.pack(">HH", 1, 1)             # QTYPE=A, QCLASS=IN
+print(base64.urlsafe_b64encode(q).rstrip(b"=").decode())' "$1" 2>/dev/null
+}
+
+# _doh_probe <ip> [домен] → печатает RTT в мс, код 0 = резолвер отвечает.
+# Проверяет ИМЕННО то, что нужно: доходит ли DoH с ЭТОГО VPS до резолвера.
+_doh_probe() {
+  local ip="$1" b64 code t0 t1
+  b64=$(_dns_wire_b64 "${2:-example.com}") || return 1
+  [[ -z "$b64" ]] && return 1
+  t0=$(date +%s%N)
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 \
+         -H 'accept: application/dns-message' \
+         "https://${ip}/dns-query?dns=${b64}" 2>/dev/null) || code="000"
+  t1=$(date +%s%N)
+  [[ "$code" == "200" ]] || return 1
+  echo $(( (t1 - t0) / 1000000 ))
+}
+
+# ─── Локальный тоннель к самому себе (общая база selftest и живых DPI-тестов) ─
+#
+# ПОЧЕМУ ЭТО ЕДИНСТВЕННАЯ ЧЕСТНАЯ ПРОВЕРКА: REALITY при провале хендшейка
+# НЕ ПИШЕТ НИЧЕГО в лог — это штатная ветка протокола, а не ошибка. Поэтому
+# «в логах пусто» ничего не доказывает. Здесь поднимается настоящий VLESS-
+# клиент на loopback: сеть, провайдер и клиентское приложение исключены.
+TUN_PORT=""; TUN_PID=""; TUN_CFG=""; TUN_LOG=""; TUN_SNI=""; TUN_SRVPORT=""
+
+_tunnel_up() {
+  local net="${1:-xhttp}" idx=0 fb="PUBLIC KEY" uuid port sni sid pub path_v mode
+  [[ "$net" == "tcp" ]] && { idx=1; fb="PUBLIC KEY2"; }
+  uuid=$(jq -r ".inbounds[$idx].settings.clients[0].id" "$CONFIG" 2>/dev/null)
+  port=$(jq -r ".inbounds[$idx].port" "$CONFIG" 2>/dev/null)
+  sni=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.serverNames[0]" "$CONFIG" 2>/dev/null)
+  sid=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.shortIds[0]" "$CONFIG" 2>/dev/null)
+  pub=$(_get_pubkey "$idx" "$fb")
+  [[ -z "$pub" || ${#pub} -lt 30 ]] && return 1
+
+  TUN_PORT=$(( 20000 + RANDOM % 10000 )); TUN_SNI="$sni"; TUN_SRVPORT="$port"
+  TUN_CFG=$(mktemp /tmp/xm-tunnel.XXXXXX.json)
+  TUN_LOG=$(mktemp /tmp/xm-tunnel.XXXXXX.log)
+
+  if [[ "$net" == "xhttp" ]]; then
+    path_v=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
+    mode=$(jq   -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
+    jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
+          --arg p "$path_v" --arg m "$mode" --argjson port "$port" --argjson sp "$TUN_PORT" '{
+      log:{loglevel:"warning"},
+      inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:true}}],
+      outbounds:[{protocol:"vless",
+        settings:{vnext:[{address:"127.0.0.1",port:$port,users:[{id:$uuid,encryption:"none"}]}]},
+        streamSettings:{network:"xhttp",security:"reality",
+          realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid},
+          xhttpSettings:{path:$p,host:$sni,mode:$m}}}]}' > "$TUN_CFG"
+  else
+    jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
+          --argjson port "$port" --argjson sp "$TUN_PORT" '{
+      log:{loglevel:"warning"},
+      inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:true}}],
+      outbounds:[{protocol:"vless",
+        settings:{vnext:[{address:"127.0.0.1",port:$port,
+          users:[{id:$uuid,encryption:"none",flow:"xtls-rprx-vision"}]}]},
+        streamSettings:{network:"tcp",security:"reality",
+          realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid}}}]}' > "$TUN_CFG"
+  fi
+
+  xray run -c "$TUN_CFG" >"$TUN_LOG" 2>&1 &
+  TUN_PID=$!
+  sleep 2
+  kill -0 "$TUN_PID" 2>/dev/null || return 1
+  return 0
+}
+
+# Причина отказа из лога локального клиента (вызывать ДО _tunnel_down)
+_tunnel_hint() { grep -iE "failed|EOF|reject|reality" "$TUN_LOG" 2>/dev/null | tail -3; }
+
+_tunnel_down() {
+  [[ -n "$TUN_PID" ]] && { kill "$TUN_PID" 2>/dev/null; wait "$TUN_PID" 2>/dev/null; }
+  rm -f "$TUN_CFG" "$TUN_LOG" 2>/dev/null
+  TUN_PID=""; TUN_CFG=""; TUN_LOG=""
+}
+
+# HTTP-код запроса через поднятый тоннель (пустой URL → проверка выхода в сеть)
+_tunnel_code() {
+  local url="${1:-https://api.ipify.org}" code
+  code=$(curl -s -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time 15 -o /dev/null \
+         -w '%{http_code}' "$url" 2>/dev/null) || true
+  echo "${code:-000}"
+}
+
+# _socks_dns <resolver_ip> <домен> → OK | TIMEOUT | ERR
+# DNS поверх TCP через SOCKS5 тоннеля. Резолвер 192.0.2.1 (RFC 5737 TEST-NET-1)
+# заведомо мёртв и не маршрутизируется — ответ физически может прийти ТОЛЬКО
+# если сервер перехватывает :53 и отвечает сам. Бинарный тест перехвата.
+_socks_dns() {
+  python3 - "$TUN_PORT" "$1" "$2" <<'PY' 2>/dev/null || echo "ERR"
+import socket, struct, sys
+sp, rip, name = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+def query(n):
+    b = struct.pack(">HHHHHH", 0x2a2a, 0x0100, 1, 0, 0, 0)
+    for l in n.split("."):
+        b += bytes([len(l)]) + l.encode()
+    return b + b"\x00" + struct.pack(">HH", 1, 1)
+try:
+    s = socket.create_connection(("127.0.0.1", sp), 5)
+    s.settimeout(8)
+    s.sendall(b"\x05\x01\x00")
+    if s.recv(2) != b"\x05\x00":
+        print("ERR"); sys.exit()
+    s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(rip) + struct.pack(">H", 53))
+    rep = s.recv(10)
+    if len(rep) < 2 or rep[1] != 0:
+        print("TIMEOUT"); sys.exit()
+    p = query(name)
+    s.sendall(struct.pack(">H", len(p)) + p)
+    hdr = s.recv(2)
+    if len(hdr) < 2:
+        print("TIMEOUT"); sys.exit()
+    need, data = struct.unpack(">H", hdr)[0], b""
+    while len(data) < need:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    print("OK" if len(data) >= 12 else "TIMEOUT")
+except socket.timeout:
+    print("TIMEOUT")
+except Exception:
+    print("ERR")
+PY
+}
+
+# _tls_probe <host:port> <sni|-> → cert | alert | closed
+# Что увидит сканер (Censys/Shodan/ТСПУ), постучавшись на порт:
+#   cert   — полноценный TLS-ответ с сертификатом (как настоящий сайт)
+#   alert  — TLS-отказ (тоже нормально: так отвечают многие CDN)
+#   closed — TCP приняли и молча закрыли, ни байта TLS. Для веб-сервера
+#            нетипично; это и есть подпись «порт открыт, TLS не говорит».
+# Вердикт всегда СРАВНИТЕЛЬНЫЙ: тот же зонд шлём на реальный сайт-маску.
+_tls_probe() {
+  local target="$1" sn="$2" out
+  if [[ "$sn" == "-" ]]; then
+    out=$(echo | timeout 8 openssl s_client -connect "$target" -noservername 2>&1) || true
+  else
+    out=$(echo | timeout 8 openssl s_client -connect "$target" -servername "$sn" 2>&1) || true
+  fi
+  if printf '%s' "$out" | grep -q "BEGIN CERTIFICATE"; then echo "cert"
+  elif printf '%s' "$out" | grep -qiE "alert|handshake fail|wrong version"; then echo "alert"
+  else echo "closed"; fi
+}
+
+# ─── Хардening: DoH на сервере + перехват :53 + mimic-fallback ───────────────
+#
+# Одна идемпотентная команда, закрывающая два разных канала утечки:
+#   [DNS]   сервер резолвит домены клиентов ЧЕРЕЗ DoH, а не системным
+#           резолвером хостера, и сам перехватывает :53 из тоннеля;
+#   [PROBE] nginx-fallback на чужой/пустой SNI отдаёт ответ НАСТОЯЩЕГО сайта,
+#           а не молча рвёт TCP (обрыв — самая заметная подпись прокси).
+# Всё обратимо: xm harden --off.
+
+# JSON-патч конфига. Порядок outbounds не меняем: freedom обязан остаться
+# первым (первый outbound = дефолтный маршрут).
+_harden_patch() {
+  local qs="$1" ds="$2" nonip="$3"
+  jq --argjson doh "$DOH_LIST" --arg qs "$qs" --arg ds "$ds" --arg nonip "$nonip" '
+      .dns = { servers: $doh, queryStrategy: $qs, disableCache: false, tag: "dns-in" }
+    | .outbounds = ([ .outbounds[]? | select(.protocol != "dns") ]
+                  + [ { protocol: "dns", tag: "dns-out" }
+                      + (if $nonip == "" then {} else { settings: { nonIPQuery: $nonip } } end) ])
+    | .routing.rules = ([ { type: "field", port: 53, network: "tcp,udp", outboundTag: "dns-out" } ]
+                      + [ .routing.rules[]? | select(.outboundTag != "dns-out") ])
+    | (.outbounds[] | select(.protocol == "freedom")).settings.domainStrategy = $ds
+  ' "$CONFIG"
+}
+
+_harden_unpatch() {
+  jq '  del(.dns)
+      | .outbounds = [ .outbounds[]? | select(.protocol != "dns") ]
+      | .routing.rules = [ .routing.rules[]? | select(.outboundTag != "dns-out") ]
+  ' "$CONFIG"
+}
+
+# Переключение поведения nginx-fallback на чужой SNI.
+# ВАЖНО: правим default ТОЛЬКО в map $reality_upstream. В файле есть второй
+# map ($log_probe) со своим default 1; — тронуть его значит сломать фильтр
+# логирования и начать писать IP всех своих клиентов на диск.
+_ngx_map_default() {
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import re, sys
+path, target = sys.argv[1], sys.argv[2]
+try:
+    src = open(path).read()
+except OSError:
+    sys.exit(1)
+def fix(m):
+    body = re.sub(r'(?m)^([ \t]*)default([ \t]+)\S+;',
+                  lambda d: d.group(1) + 'default' + d.group(2) + target + ';',
+                  m.group(2), count=1)
+    return m.group(1) + body + m.group(3)
+out, n = re.subn(r'(map\s+\$ssl_preread_server_name\s+\$reality_upstream\s*\{)(.*?)(\})',
+                 fix, src, count=1, flags=re.S)
+if n != 1:
+    sys.exit(1)
+open(path, 'w').write(out)
+PY
+}
+
+# _ngx_fallback_mode <mimic|strict> — правит и живой конфиг, и шаблон
+# (из шаблона регенерируется конфиг при xm set-sni), проверяет и перезагружает.
+_ngx_fallback_mode() {
+  local mode="$1" conf="/etc/nginx/stream-enabled/reality-fallback.conf"
+  local tmpl="/etc/nginx/reality-fallback.conf.tmpl" sni bak target
+  [[ -f "$conf" ]] || { warn "$conf не найден — nginx-fallback не тронут"; return 1; }
+  sni=$(_get_nginx_sni)
+  [[ -z "$sni" ]] && { warn "Не читается SNI из nginx-map — nginx-fallback не тронут"; return 1; }
+  [[ "$mode" == "mimic" ]] && target="$sni" || target='""'
+
+  mkdir -p "$BACKUP_DIR"
+  bak="$BACKUP_DIR/reality-fallback_$(date +%Y%m%d_%H%M%S)_harden.conf.bak"
+  cp "$conf" "$bak"
+  if ! _ngx_map_default "$conf" "$target"; then
+    fail "Не удалось изменить map \$reality_upstream в $conf"; return 1
+  fi
+  # Шаблон живёт с плейсхолдером — туда пишем __DEST_SNI__, иначе set-sni
+  # регенерирует конфиг обратно в strict.
+  [[ -f "$tmpl" ]] && _ngx_map_default "$tmpl" \
+    "$([[ "$mode" == "mimic" ]] && echo '__DEST_SNI__' || echo '""')"
+
+  if ! nginx -t 2>/dev/null; then
+    fail "nginx -t не прошёл — откат"; cp "$bak" "$conf"; nginx -t &>/dev/null; return 1
+  fi
+  systemctl reload nginx || { fail "nginx reload не удался — откат"; cp "$bak" "$conf"; systemctl reload nginx; return 1; }
+  return 0
+}
+
+# ─── ML-DSA-65: post-quantum подпись REALITY ─────────────────────────────────
+#
+# ЧТО ДАЁТ: сервер подписывает «подпись сертификата + сырые ClientHello и
+# ServerHello» post-quantum ключом. Клиент с mldsa65Verify это проверяет.
+# Смысл — MITM: тот, у кого есть публичный ключ REALITY (он раздаётся в URI,
+# и утечь может элементарно), теоретически может встать посередине. С ML-DSA
+# не может, в том числе задним числом «накопил сейчас — расшифровал потом».
+#
+# ЦЕНА: наш Certificate вырастает примерно на 3.3 КБ. Если у домена-маски
+# сертификат маленький, длина нашего ответа начинает отличаться от настоящего
+# сайта — то есть мы меняем одну зацепку для DPI на другую. Поэтому включать
+# имеет смысл, когда у dest сертификат от ~3500 б.
+#
+# СОВМЕСТИМОСТЬ: клиенты БЕЗ mldsa65Verify продолжают работать как раньше —
+# сервер просто не требует проверки. Поэтому включение безопасно.
+_parse_mldsa() {
+  MLDSA_SEED=$(echo "$1"   | grep -iE "^[[:space:]]*(seed|private)"           | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+  MLDSA_VERIFY=$(echo "$1" | grep -iE "^[[:space:]]*(verify|public|password)" | awk '{print $NF}' | head -1 | tr -d '[:space:]')
+}
+
+_pq_on() { jq -e '.inbounds[0].streamSettings.realitySettings.mldsa65Seed // empty' "$CONFIG" >/dev/null 2>&1; }
 
 _make_uri_xhttp() {
   local uuid="$1" comment="$2"
@@ -224,74 +546,27 @@ _sni_cert_gate() {
 }
 
 # =============================================================================
-# _selftest <xhttp|tcp> — поднимает локальный VLESS-клиент и ходит через
-# СВОЙ ЖЕ сервер. Единственная проверка, дающая бинарный ответ «сервер или
-# клиент». REALITY при провале хендшейка молчит, поэтому пустой лог — норма,
-# а не признак здоровья. Печатает HTTP-код.
+# _selftest <xhttp|tcp> — живой хендшейк через loopback поверх _tunnel_up.
+# Единственная проверка, дающая бинарный ответ «сервер или клиент»: REALITY
+# при провале молчит, поэтому пустой лог — норма, а не признак здоровья.
 # =============================================================================
 _selftest() {
-  local net="$1" idx=0
-  [[ "$net" == "tcp" ]] && idx=1
-  local uuid port sni sid pub path_v mode sport tmpcfg log code cpid
-  uuid=$(jq -r ".inbounds[$idx].settings.clients[0].id" "$CONFIG")
-  port=$(jq -r ".inbounds[$idx].port" "$CONFIG")
-  sni=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.serverNames[0]" "$CONFIG")
-  sid=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.shortIds[0]" "$CONFIG")
-  # Метка fallback-поля в client-info.txt зависит от inbound'а. Прежняя строка
-  # была склеена из двух правок и подставляла в fallback сам ключ — при пустом
-  # privateKey в config.json selftest падал на «не вычислить публичный ключ».
-  local fb="PUBLIC KEY"
-  [[ "$idx" -eq 1 ]] && fb="PUBLIC KEY2"
-  pub=$(_get_pubkey "$idx" "$fb")
-  [[ -z "$pub" || ${#pub} -lt 30 ]] && { fail "Не вычислить публичный ключ (xm pubkey)"; return 1; }
-
-  sport=$(( 20000 + RANDOM % 10000 ))
-  tmpcfg=$(mktemp /tmp/xm-selftest.XXXXXX.json)
-  log=$(mktemp /tmp/xm-selftest.XXXXXX.log)
-
-  if [[ "$net" == "xhttp" ]]; then
-    path_v=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
-    mode=$(jq   -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
-    jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
-          --arg p "$path_v" --arg m "$mode" --argjson port "$port" --argjson sp "$sport" '{
-      log:{loglevel:"warning"},
-      inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:false}}],
-      outbounds:[{protocol:"vless",
-        settings:{vnext:[{address:"127.0.0.1",port:$port,users:[{id:$uuid,encryption:"none"}]}]},
-        streamSettings:{network:"xhttp",security:"reality",
-          realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid},
-          xhttpSettings:{path:$p,host:$sni,mode:$m}}}]}' > "$tmpcfg"
-  else
-    jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
-          --argjson port "$port" --argjson sp "$sport" '{
-      log:{loglevel:"warning"},
-      inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:false}}],
-      outbounds:[{protocol:"vless",
-        settings:{vnext:[{address:"127.0.0.1",port:$port,
-          users:[{id:$uuid,encryption:"none",flow:"xtls-rprx-vision"}]}]},
-        streamSettings:{network:"tcp",security:"reality",
-          realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid}}}]}' > "$tmpcfg"
+  local net="$1" code
+  if ! _tunnel_up "$net"; then
+    fail "Не поднять локальный клиент — нет публичного ключа? (sudo xm pubkey)"
+    _tunnel_down; return 1
   fi
-
-  info "Транспорт: $net | порт: $port | SNI: $sni"
-  xray run -c "$tmpcfg" >"$log" 2>&1 &
-  cpid=$!; sleep 2
-  # [FIX-14] см. setup.sh: curl при неудаче сам печатает "000", и `|| echo "000"`
-  # давал склейку "000000" вместо кода. Разделяем вывод и обработку ошибки.
-  code=$(curl -s -x "socks5h://127.0.0.1:${sport}" --max-time 15 -o /dev/null \
-         -w '%{http_code}' https://api.ipify.org 2>/dev/null) || true
-  code=${code:-000}
-  kill "$cpid" 2>/dev/null; wait "$cpid" 2>/dev/null
-
+  info "Транспорт: $net | порт: $TUN_SRVPORT | SNI: $TUN_SNI"
+  code=$(_tunnel_code "https://api.ipify.org")
   if [[ "$code" == "200" ]]; then
     ok "Трафик прошёл (HTTP 200) — сервер исправен по транспорту $net"
     ok "Значит проблема НА КЛИЕНТЕ: креды, приложение или сеть до сервера"
   else
     fail "Трафик НЕ прошёл (код: $code) — виноват сервер, не клиент"
-    grep -iE "failed|EOF|reject|reality" "$log" 2>/dev/null | tail -5 | sed 's/^/    /'
+    _tunnel_hint | sed 's/^/    /'
     warn "Дальше: sudo xm sni-scan  |  sudo xm reality-debug on"
   fi
-  rm -f "$tmpcfg" "$log"
+  _tunnel_down
   [[ "$code" == "200" ]]
 }
 
@@ -368,10 +643,7 @@ status)   systemctl status xray --no-pager ;;
 
 # ─── Конфиг ──────────────────────────────────────────────────────────────────
 edit)
-    mkdir -p "$BACKUP_DIR"
-    STAMP=$(date +%Y%m%d_%H%M%S)
-    cp "$CONFIG" "$BACKUP_DIR/config_${STAMP}.json"
-    echo -e "${GREEN}Бэкап: $BACKUP_DIR/config_${STAMP}.json${NC}"
+    echo -e "${GREEN}Бэкап: $(_backup_config)${NC}"
     nano "$CONFIG"
     ;;
 
@@ -413,9 +685,8 @@ set-sni)
     fi
 
     # Бэкапы для отката: config.json + nginx-conf
-    mkdir -p "$BACKUP_DIR"; STAMP=$(date +%Y%m%d_%H%M%S)
-    CFG_BACKUP="$BACKUP_DIR/config_${STAMP}_before_setsni.json"
-    cp "$CONFIG" "$CFG_BACKUP"
+    STAMP=$(date +%Y%m%d_%H%M%S)
+    CFG_BACKUP=$(_backup_config before_setsni)
     # Бэкап кладём в $BACKUP_DIR, а НЕ рядом в stream-enabled/: nginx включает
     # оттуда файлы по маске, и любой лишний файл в этом каталоге — риск второго
     # server{} на 127.0.0.1:10443 и падения nginx -t после смены домена.
@@ -500,10 +771,7 @@ set-sni)
 
 # ─── Бэкапы ──────────────────────────────────────────────────────────────────
 backup)
-    mkdir -p "$BACKUP_DIR"
-    STAMP=$(date +%Y%m%d_%H%M%S)
-    cp "$CONFIG" "$BACKUP_DIR/config_${STAMP}.json"
-    echo -e "${GREEN}Бэкап: $BACKUP_DIR/config_${STAMP}.json${NC}"
+    echo -e "${GREEN}Бэкап: $(_backup_config)${NC}"
     ;;
 
 restore)
@@ -829,7 +1097,8 @@ add-tcp)
     echo ""
     echo -e "${CYAN}Проверка доступности dest ${SNI}...${NC}"
     HTTP_CODE=$(curl -svo /dev/null "https://${SNI}" \
-      --max-time 8 --connect-timeout 4 -w "%{http_code}" 2>/dev/null || echo "000")
+      --max-time 8 --connect-timeout 4 -w "%{http_code}" 2>/dev/null) || true
+    HTTP_CODE=${HTTP_CODE:-000}
     if [[ "$HTTP_CODE" =~ ^[23] || "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]]; then
       ok "dest доступен (HTTP $HTTP_CODE)"
     else
@@ -1277,7 +1546,7 @@ uuid) xray uuid ;;
 
 diag)
     echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║       Xray Full Diagnostic  v5.6         ║${NC}"
+    echo -e "${BOLD}${CYAN}║       Xray Full Diagnostic  v5.7         ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}\n"
 
     ISSUES=0
@@ -1370,7 +1639,8 @@ for svc in xray nginx fail2ban chrony; do
     fi
     info "Проверяю реальный upstream: $CHECK_HOST"
     HTTP_CODE=$(curl -svo /dev/null "https://${CHECK_HOST}" \
-      --max-time 8 --connect-timeout 4 -w "%{http_code}" 2>/dev/null || echo "000")
+      --max-time 8 --connect-timeout 4 -w "%{http_code}" 2>/dev/null) || true
+    HTTP_CODE=${HTTP_CODE:-000}
     if [[ "$HTTP_CODE" =~ ^[1-5][0-9][0-9]$ ]]; then
       ok "upstream ${CHECK_HOST} отвечает (HTTP $HTTP_CODE) — путь fallback до реального сайта жив"
     else
@@ -1519,136 +1789,344 @@ for svc in xray nginx fail2ban chrony; do
     ;;
 
 dpi|diag-dpi)
-    echo -e "\n${BOLD}${CYAN}[ DPI / Active Probe Resistance ]${NC}\n"
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm diag-dpi${NC}"; exit 1; }
+    QUICK=false; [[ "${2:-}" == "--quick" ]] && QUICK=true
+
+    echo -e "\n${BOLD}${CYAN}[ Устойчивость к DPI и активному зондированию ]${NC}\n"
+
+    DPI_CRIT=0; DPI_WARN=0
+    dfail() { fail "$*"; DPI_CRIT=$((DPI_CRIT + 1)); }
+    dwarn() { warn "$*"; DPI_WARN=$((DPI_WARN + 1)); }
 
     PORT=$(jq -r '.inbounds[0].port' "$CONFIG")
     SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
     SERVER_IP=$(_get_server_ip)
+    info "Цель: ${SERVER_IP}:${PORT} | домен-маска: ${SNI}"
+    $QUICK && info "--quick: живые тесты через тоннель пропускаются"
 
+# ══ A. Согласованность источников SNI ════════════════════════════════════════
     sep
-    echo -e "${BOLD}Тест 0: Синхронизация SNI (источники правды)${NC}"
-    # Тесты ниже гоняют зонды по serverNames[0]. Если host/nginx-map расходятся —
-    # живой клиент шлёт другой SNI, а тесты этого не заметят. Поэтому сверяем сначала.
+    echo -e "${BOLD}A. Согласованность домена-маски${NC}"
+    # Все зонды ниже гоняются по serverNames[0]. Если host/nginx-map расходятся —
+    # живой клиент шлёт другой SNI, и тесты меряют не то, что видит DPI.
     SNI_HOST_D=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host // ""' "$CONFIG")
-    NGX_CONF_D="/etc/nginx/stream-enabled/reality-fallback.conf"
-    NGX_SNI_D=$(grep -oE '^[[:space:]]*[a-zA-Z0-9._-]+[[:space:]]+[a-zA-Z0-9._-]+;' "$NGX_CONF_D" 2>/dev/null | grep -v 'default' | head -1 | awk '{print $1}')
+    NGX_SNI_D=$(_get_nginx_sni)
     DSYNC=0
-    [[ -n "$SNI_HOST_D" && "$SNI_HOST_D" != "$SNI" ]] && { fail "xhttpSettings.host=$SNI_HOST_D ≠ serverNames[0]=$SNI — URI клиента шлёт не тот SNI"; DSYNC=1; }
-    [[ -n "$NGX_SNI_D"  && "$NGX_SNI_D"  != "$SNI" ]] && { fail "nginx map=$NGX_SNI_D ≠ serverNames[0]=$SNI — fallback уводит не туда"; DSYNC=1; }
+    [[ -n "$SNI_HOST_D" && "$SNI_HOST_D" != "$SNI" ]] && { dfail "xhttpSettings.host=$SNI_HOST_D ≠ serverNames[0]=$SNI — URI клиента шлёт не тот SNI"; DSYNC=1; }
+    [[ -n "$NGX_SNI_D"  && "$NGX_SNI_D"  != "$SNI" ]] && { dfail "nginx map=$NGX_SNI_D ≠ serverNames[0]=$SNI — fallback уводит не туда"; DSYNC=1; }
     if _has_tcp_inbound; then
       SNI_TCP_D=$(jq -r '.inbounds[1].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
-      [[ "$SNI_TCP_D" != "$SNI" ]] && { fail "TCP serverNames[0]=$SNI_TCP_D ≠ XHTTP=$SNI"; DSYNC=1; }
+      [[ "$SNI_TCP_D" != "$SNI" ]] && { dfail "TCP serverNames[0]=$SNI_TCP_D ≠ XHTTP=$SNI"; DSYNC=1; }
     fi
     [[ "$DSYNC" -eq 0 ]] \
       && ok "Все источники SNI согласованы ($SNI) — тесты ниже валидны" \
-      || warn "Есть рассинхрон SNI (см. выше). Исправь: xm set-sni $SNI — иначе тесты ниже вводят в заблуждение"
+      || warn "Есть рассинхрон. Исправь: sudo xm set-sni $SNI — иначе результаты ниже вводят в заблуждение"
 
+# ══ B. Активное зондирование ═════════════════════════════════════════════════
     sep
-    echo -e "${BOLD}Тест 1: Active probe resistance (главный тест REALITY)${NC}"
-    # Зонд с целевым SNI прозрачно форвардится на fallback → реальный сайт, поэтому
-    # ДОЛЖЕН получить успешный хендшейк с настоящим сертификатом. Сравниваем cert
-    # нашего сервера с cert реального $SNI (fingerprint/issuer). -tls1_3 проверяет TLS 1.3.
-    OUR_CERT=$(echo | timeout 6 openssl s_client \
-      -connect "${SERVER_IP}:${PORT}" -servername "$SNI" -tls1_3 2>/dev/null \
-      | openssl x509 -noout -issuer -subject -fingerprint -sha256 2>/dev/null || echo "")
-    REAL_CERT=$(echo | timeout 6 openssl s_client \
-      -connect "${SNI}:443" -servername "$SNI" -tls1_3 2>/dev/null \
-      | openssl x509 -noout -issuer -subject -fingerprint -sha256 2>/dev/null || echo "")
+    echo -e "${BOLD}B. Активное зондирование (что видит сканер на нашем порту)${NC}"
+    echo -e "  ${CYAN}Принцип: любой ответ нашего порта должен совпадать с ответом${NC}"
+    echo -e "  ${CYAN}настоящего ${SNI}:443. Различие = признак, по которому нас находят.${NC}"
 
+    # B1 — валидный SNI. Зонд прозрачно форвардится на fallback → реальный сайт,
+    # поэтому ДОЛЖЕН получить настоящий сертификат.
+    echo -e "\n  ${BOLD}B1. Зонд с валидным SNI ($SNI) — сертификат${NC}"
+    OUR_CERT=$(echo | timeout 8 openssl s_client -connect "${SERVER_IP}:${PORT}" -servername "$SNI" -tls1_3 2>/dev/null \
+      | openssl x509 -noout -issuer -subject -fingerprint -sha256 2>/dev/null || echo "")
+    REAL_CERT=$(echo | timeout 8 openssl s_client -connect "${SNI}:443" -servername "$SNI" -tls1_3 2>/dev/null \
+      | openssl x509 -noout -issuer -subject -fingerprint -sha256 2>/dev/null || echo "")
     if [[ -z "$OUR_CERT" ]]; then
-      fail "Наш сервер НЕ отдал сертификат по TLS 1.3 — зонд получает reset/сбой вместо валидного хендшейка. Это ПАЛИТ сервер для DPI!"
-      warn "Проверь fallback: xm diag → блок [6], и: ss -tlnp | grep 10443"
+      dfail "Наш сервер НЕ отдал сертификат по TLS 1.3 — зонд получает сбой вместо валидного хендшейка. ПАЛИТ сервер."
+      warn "Проверь fallback: sudo xm diag → блок [6], и: ss -tlnp | grep 10443"
     else
       OUR_FP=$(echo "$OUR_CERT"  | grep -i "Fingerprint" | sed 's/.*=//' | tr -d '[:space:]')
       REAL_FP=$(echo "$REAL_CERT" | grep -i "Fingerprint" | sed 's/.*=//' | tr -d '[:space:]')
       OUR_ISS=$(echo "$OUR_CERT"  | grep -i "^issuer")
       REAL_ISS=$(echo "$REAL_CERT" | grep -i "^issuer")
-      echo "$OUR_CERT"  | grep -iE "^issuer|^subject" | sed 's/^/    наш:  /'
-      [[ -n "$REAL_CERT" ]] && echo "$REAL_CERT" | grep -iE "^issuer|^subject" | sed 's/^/    сайт: /'
-
       if [[ -n "$REAL_FP" && "$OUR_FP" == "$REAL_FP" ]]; then
-        ok "Сертификат ИДЕНТИЧЕН реальному $SNI (совпал fingerprint) — зонд неотличим от настоящего сайта"
+        ok "Сертификат ИДЕНТИЧЕН реальному $SNI — зонд неотличим от настоящего сайта"
       elif [[ -n "$REAL_ISS" && "$OUR_ISS" == "$REAL_ISS" ]]; then
-        ok "Issuer совпадает с реальным $SNI (leaf-сертификат отличается — обычное дело для CDN/гео). Зонд видит валидный cert того же CA."
+        ok "Issuer совпадает с $SNI (leaf отличается — обычное дело для CDN/гео)"
       elif [[ -n "$REAL_CERT" ]]; then
-        warn "Issuer/сертификат НЕ совпадает с реальным $SNI — fallback может проксировать не на тот сайт. Сверь issuer выше."
+        dwarn "Issuer не совпадает с реальным $SNI — fallback может проксировать не туда"
+        echo "$OUR_CERT"  | grep -iE "^issuer" | sed 's/^/      наш:  /'
+        echo "$REAL_CERT" | grep -iE "^issuer" | sed 's/^/      сайт: /'
       else
-        info "Эталонный сертификат $SNI не получен (сайт недоступен для сравнения). Но наш сервер валидный хендшейк отдаёт — путь fallback жив."
+        info "Эталон $SNI недоступен для сравнения, но наш хендшейк валиден — путь fallback жив"
       fi
     fi
 
-    sep
-    echo -e "${BOLD}Тест 2: HTTP на порту 80${NC}"
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-      "http://${SERVER_IP}" --max-time 5 -H "Host: ${SNI}" 2>/dev/null || echo "000")
-    [[ "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]] \
-      && ok "Порт 80 → redirect $HTTP_CODE" \
-      || warn "Порт 80 вернул: $HTTP_CODE (ожидался 301/302)"
+    # B2/B3 — главные тесты на «молчаливый обрыв». Настоящий HTTPS-сервер на
+    # чужой/пустой SNI отвечает по TLS (сертификат или alert). Если мы вместо
+    # этого принимаем TCP и молча закрываем — это подпись «порт открыт, TLS не
+    # говорит», по которой сканер отделяет прокси от веб-сервера за секунду.
+    for CASE_N in B2 B3; do
+      if [[ "$CASE_N" == "B2" ]]; then
+        PSNI="example.com"; PLABEL="с ЧУЖИМ SNI (example.com)"
+      else
+        PSNI="-";           PLABEL="БЕЗ SNI"
+      fi
+      echo -e "\n  ${BOLD}${CASE_N}. Зонд ${PLABEL}${NC}"
+      OUR_R=$(_tls_probe "${SERVER_IP}:${PORT}" "$PSNI")
+      REAL_R=$(_tls_probe "${SNI}:443" "$PSNI")
+      info "Наш сервер: $OUR_R   |   Реальный $SNI: $REAL_R"
+      # Порядок веток важен: если эталон сам не отвечает с этого VPS, сравнивать
+      # не с чем, и «у нас closed, у него closed» — не повод рапортовать «ок».
+      if [[ "$REAL_R" == "closed" ]]; then
+        dwarn "Эталон $SNI не отвечает с этого VPS — сравнивать не с чем. Проверь сеть VPS и повтори."
+      elif [[ "$OUR_R" == "closed" ]]; then
+        dfail "Мы принимаем TCP и молча закрываем, а $SNI отвечает по TLS ($REAL_R). Настоящий HTTPS-сервер так не делает — это подпись прокси. Исправь: ${BOLD}sudo xm harden${NC}"
+      elif [[ "$OUR_R" == "$REAL_R" ]]; then
+        ok "Реакция совпадает с реальным сайтом ($OUR_R) — по этому зонду неотличимо"
+      else
+        info "Реакции разные ($OUR_R vs $REAL_R), но обе на уровне TLS — сканеру не за что зацепиться"
+      fi
+    done
 
-    sep
-    echo -e "${BOLD}Тест 3: REALITY fallback (nginx stream)${NC}"
-    if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:10443"; then
-      ok "stream-fallback слушает 127.0.0.1:10443"
+    # B4 — голый HTTP на TLS-порт. Настоящий веб-сервер отвечает 400 Bad Request.
+    echo -e "\n  ${BOLD}B4. Открытый HTTP-запрос на TLS-порт${NC}"
+    # curl при неудаче сам печатает "000" И возвращает !=0 — `|| echo 000`
+    # склеил бы два кода в "000000" (см. FIX-14). Ошибку глушим отдельно.
+    OUR_H=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://${SERVER_IP}:${PORT}/" 2>/dev/null) || true
+    REAL_H=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://${SNI}:443/" 2>/dev/null) || true
+    OUR_H=${OUR_H:-000}; REAL_H=${REAL_H:-000}
+    info "Наш сервер: HTTP $OUR_H   |   Реальный $SNI: HTTP $REAL_H"
+    if [[ "$REAL_H" == "000" ]]; then
+      info "Эталон $SNI не ответил с этого VPS — сравнивать не с чем, тест пропускаю"
+    elif [[ "$OUR_H" == "$REAL_H" ]]; then
+      ok "Ответ совпадает с реальным сайтом"
+    elif [[ "$OUR_H" == "000" ]]; then
+      dwarn "Мы обрываем, $SNI отвечает $REAL_H — отличие. Лечится тем же: sudo xm harden"
     else
-      fail "stream-fallback не слушает 127.0.0.1:10443 — REALITY dest мёртв"
+      info "Коды разные ($OUR_H vs $REAL_H) — слабый признак, критичным не считаю"
     fi
 
-    sep
-    echo -e "${BOLD}Тест 4: Ответ на случайный путь (сравнение с реальным сайтом)${NC}"
-    # --resolve: curl идёт на наш IP:PORT, но предъявляет в TLS (SNI) и Host именно $SNI.
-    # На случайный путь наш сервер должен отвечать тем же кодом, что и реальный сайт.
+    # B5 — случайный путь ПОВЕРХ валидного TLS: --resolve гонит curl на наш IP,
+    # но SNI/Host предъявляет настоящие.
+    echo -e "\n  ${BOLD}B5. Случайный путь через валидный SNI${NC}"
     RAND_PATH="/$(openssl rand -hex 8)"
-    OUR_RAND=$(curl -sk -o /dev/null -w "%{http_code}" \
-      --resolve "${SNI}:${PORT}:${SERVER_IP}" \
-      "https://${SNI}:${PORT}${RAND_PATH}" --max-time 6 2>/dev/null || echo "000")
-    REAL_RAND=$(curl -s -o /dev/null -w "%{http_code}" \
-      "https://${SNI}${RAND_PATH}" --max-time 6 2>/dev/null || echo "000")
+    OUR_RAND=$(curl -sk -o /dev/null -w "%{http_code}" --resolve "${SNI}:${PORT}:${SERVER_IP}" \
+      "https://${SNI}:${PORT}${RAND_PATH}" --max-time 8 2>/dev/null) || true
+    REAL_RAND=$(curl -s -o /dev/null -w "%{http_code}" "https://${SNI}${RAND_PATH}" --max-time 8 2>/dev/null) || true
+    OUR_RAND=${OUR_RAND:-000}; REAL_RAND=${REAL_RAND:-000}
     info "Наш сервер: HTTP $OUR_RAND   |   Реальный $SNI: HTTP $REAL_RAND"
     if [[ "$OUR_RAND" == "000" ]]; then
-      warn "Наш сервер оборвал соединение (000) — fallback до реального сайта не доходит. Зонд с валидным SNI получит аномалию."
+      dfail "Наш сервер оборвал соединение — fallback до реального сайта не доходит"
     elif [[ "$OUR_RAND" == "$REAL_RAND" ]]; then
       ok "Ответ ($OUR_RAND) совпадает с реальным $SNI — по HTTP неотличимо"
     else
-      warn "Ответ нашего сервера ($OUR_RAND) ≠ ответу реального сайта ($REAL_RAND). Часто это гео/балансировка CDN, но проверь, что fallback идёт на нужный сайт."
+      dwarn "Ответ ($OUR_RAND) ≠ ответу реального сайта ($REAL_RAND) — часто гео/балансировка CDN, но проверь fallback"
     fi
 
-    sep
-    echo -e "${BOLD}Тест 5: xPaddingBytes${NC}"
-    PADDING=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.xPaddingBytes // ""' "$CONFIG")
-    [[ -n "$PADDING" ]] && ok "xPaddingBytes: $PADDING" || warn "xPaddingBytes не задан"
+    # B6 — порт 80
+    echo -e "\n  ${BOLD}B6. Порт 80${NC}"
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://${SERVER_IP}" --max-time 5 -H "Host: ${SNI}" 2>/dev/null) || true
+    HTTP_CODE=${HTTP_CODE:-000}
+    [[ "$HTTP_CODE" == "301" || "$HTTP_CODE" == "302" ]] \
+      && ok "Порт 80 → redirect $HTTP_CODE (как у обычного веб-сервера)" \
+      || dwarn "Порт 80 вернул $HTTP_CODE (ожидался 301/302)"
 
+# ══ C. Параметры REALITY ═════════════════════════════════════════════════════
     sep
-    echo -e "${BOLD}Тест 6: uTLS fingerprint${NC}"
+    echo -e "${BOLD}C. Параметры REALITY${NC}"
+
+    if ss -tlnp 2>/dev/null | grep -q "127.0.0.1:10443"; then
+      ok "stream-fallback слушает 127.0.0.1:10443"
+    else
+      dfail "stream-fallback не слушает 127.0.0.1:10443 — REALITY dest мёртв, любой зонд получит обрыв"
+    fi
+
+    _ngx_mimic_on \
+      && ok "nginx-fallback в режиме mimic (чужой SNI уходит на реальный сайт)" \
+      || dwarn "nginx-fallback в режиме strict (чужой SNI → обрыв). Включить mimic: sudo xm harden"
+
+    MAX_TD=$(jq -r '.inbounds[0].streamSettings.realitySettings.maxTimeDiff // 0' "$CONFIG")
+    if [[ "$MAX_TD" -le 10000 ]]; then
+      ok "maxTimeDiff: ${MAX_TD} мс — узкое окно, replay-зонд не пройдёт"
+    elif [[ "$MAX_TD" -le 30000 ]]; then
+      dwarn "maxTimeDiff: ${MAX_TD} мс — допустимо, но лучше 10000"
+    else
+      dwarn "maxTimeDiff: ${MAX_TD} мс — широкое окно для replay-атак, снизь до 10000"
+    fi
+
+    SID_N=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds | length' "$CONFIG" 2>/dev/null || echo 0)
+    SID_EMPTY=$(jq -r '[.inbounds[0].streamSettings.realitySettings.shortIds[]? | select(. == "")] | length' "$CONFIG" 2>/dev/null || echo 0)
+    if [[ "$SID_EMPTY" -gt 0 ]]; then
+      dfail "Среди shortIds есть ПУСТОЙ — сервер примет клиента без shortId, это дыра в аутентификации REALITY"
+    elif [[ "$SID_N" -ge 2 ]]; then
+      ok "shortIds: $SID_N — пустых нет"
+    else
+      dwarn "shortIds: $SID_N — держи 2-3, чтобы менять клиентам shortId без смены ключа"
+    fi
+
+    # Размер Certificate у dest: превышение буфера REALITY рвёт хендшейк молча.
+    CERT_EST=$(_check_cert_size "$SNI")
+    if [[ "$CERT_EST" == "-1" ]]; then
+      dwarn "Сертификат $SNI не получен — размер не проверить (сайт недоступен с VPS?)"
+    elif [[ "$CERT_EST" -ge "$REALITY_CERT_LIMIT" ]]; then
+      dfail "Certificate у $SNI ~${CERT_EST} б ≥ лимита REALITY (${REALITY_CERT_LIMIT}) — хендшейк будет рваться. sudo xm sni-scan"
+    elif [[ "$CERT_EST" -ge "$REALITY_CERT_WARN" ]]; then
+      dwarn "Certificate у $SNI ~${CERT_EST} б — близко к лимиту ${REALITY_CERT_LIMIT}"
+    else
+      ok "Certificate у $SNI ~${CERT_EST} б — с запасом ниже лимита REALITY"
+    fi
+
+    # ML-DSA-65: post-quantum подпись REALITY. Защищает от MITM тем, у кого
+    # утёк публичный ключ. Цена — наш Certificate растёт примерно на 3.3 КБ,
+    # поэтому у dest он должен быть НЕ МЕНЬШЕ ~3500 б, иначе размер ответа
+    # начинает отличаться от настоящего сайта — новый признак вместо старого.
+    if jq -e '.inbounds[0].streamSettings.realitySettings.mldsa65Seed // empty' "$CONFIG" >/dev/null 2>&1; then
+      ok "ML-DSA-65 (post-quantum) включён"
+      [[ "$CERT_EST" != "-1" && "$CERT_EST" -lt 3500 ]] && \
+        dwarn "…но Certificate у $SNI всего ~${CERT_EST} б (<3500): наш ответ заметно длиннее настоящего сайта. Либо домен покрупнее, либо sudo xm pq off"
+    else
+      info "ML-DSA-65 выключен (штатно). Включить: sudo xm pq on — см. xm pq status"
+    fi
+
+# ══ D. Профиль трафика ═══════════════════════════════════════════════════════
+    sep
+    echo -e "${BOLD}D. Профиль трафика (статистика пакетов)${NC}"
+    PADDING=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.xPaddingBytes // ""' "$CONFIG")
+    [[ -n "$PADDING" ]] \
+      && ok "xPaddingBytes: $PADDING — длины запросов размазаны" \
+      || dwarn "xPaddingBytes не задан — длины XHTTP-запросов дают стабильный паттерн"
+
+    XMODE=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode // "auto"' "$CONFIG")
+    XPATH=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path // ""' "$CONFIG")
+    info "XHTTP mode: $XMODE | path: $XPATH"
+    [[ "$XPATH" == "/" || -z "$XPATH" ]] && dwarn "path = «/» — слишком голо, возьми путь похожий на статику/API реального сайта"
+
     FP=$(_get_fp)
     case "$FP" in
-      chrome|edge)     ok "Fingerprint: $FP — высокий traffic pool" ;;
-      randomized)      ok "Fingerprint: randomized — вариативный" ;;
-      firefox)         info "Fingerprint: firefox — уникален, но валиден" ;;
-      *)               warn "Fingerprint: $FP — проверь поддержку" ;;
+      chrome|edge) ok "uTLS fingerprint: $FP — самый массовый фон" ;;
+      randomized)  ok "uTLS fingerprint: randomized — вариативный" ;;
+      firefox)     info "uTLS fingerprint: firefox — валиден, но реже в фоне" ;;
+      *)           dwarn "uTLS fingerprint: $FP — проверь, что клиент его реально поддерживает" ;;
     esac
 
+# ══ E. DNS ═══════════════════════════════════════════════════════════════════
     sep
-    echo -e "${BOLD}Тест 7: Реакция на зонды (поведение как у реального сайта)${NC}"
-    # Настоящий сайт не банит сканеры. Если мы баним — это отличие,
-    # по которому сервер отделяется от www.apple.com.
+    echo -e "${BOLD}E. DNS — где имя домена может уйти открытым текстом${NC}"
+    echo -e "  ${CYAN}Клиент, не достучавшись до Secure DNS (а об ограничениях DoH/DoT у${NC}"
+    echo -e "  ${CYAN}операторов сообщают с августа 2025), откатывается на обычный DNS.${NC}"
+    echo -e "  ${CYAN}Дальше вопрос только в том, кто увидит имя домена — и увидит ли.${NC}"
+
+    echo -e "\n  ${BOLD}E1. Резолвинг на сервере${NC}"
+    if _dns_doh_on; then
+      ok "dns-блок с DoH настроен: $(jq -r '[.dns.servers[]? | select(type=="string")] | join(", ")' "$CONFIG")"
+      QSTRAT=$(jq -r '.dns.queryStrategy // "UseIP"' "$CONFIG")
+      if _has_ipv6; then
+        info "queryStrategy: $QSTRAT (у VPS есть IPv6)"
+      elif [[ "$QSTRAT" == "UseIPv4" ]]; then
+        ok "queryStrategy: UseIPv4 — у VPS нет IPv6, лишние AAAA не запрашиваются"
+      else
+        dwarn "queryStrategy=$QSTRAT, но IPv6 у VPS нет: клиент может получить AAAA, до которого сервер не дойдёт"
+      fi
+      jq -e '.dns.clientIp // empty' "$CONFIG" >/dev/null 2>&1 \
+        && dfail "Задан dns.clientIp — сервер шлёт EDNS Client Subnet, то есть сам сообщает резолверу твою подсеть. Убери." \
+        || ok "dns.clientIp не задан — EDNS Client Subnet не утекает"
+    else
+      dfail "dns-блок не настроен: Xray резолвит домены системным резолвером хостера ОТКРЫТЫМ ТЕКСТОМ — хостер видит полный список сайтов. Исправь: ${BOLD}sudo xm harden${NC}"
+    fi
+
+    echo -e "\n  ${BOLD}E2. Доступность DoH-резолверов с этого VPS${NC}"
+    DOH_ALIVE=0
+    for r in "${DOH_IPS[@]}"; do
+      if RTT=$(_doh_probe "$r"); then ok "$r — ${RTT} мс"; DOH_ALIVE=$((DOH_ALIVE + 1))
+      else warn "$r — не отвечает"; fi
+    done
+    [[ "$DOH_ALIVE" -eq 0 ]] && dfail "Ни один DoH-резолвер не доступен с VPS — DoH включать нельзя, сломается резолвинг"
+
+    echo -e "\n  ${BOLD}E3. Перехват :53 из тоннеля${NC}"
+    if _dns_hijack_on; then
+      ok "routing :53 → dns-out: plain-DNS клиента до внешнего резолвера не доходит, сервер отвечает сам по DoH"
+    else
+      dfail "Перехвата :53 нет. Клиент с обычным DNS (а после блокировок DoH это большинство) шлёт запрос в тоннель, и наш VPS пересылает его открытым UDP. Исправь: ${BOLD}sudo xm harden${NC}"
+    fi
+
+    if ! $QUICK; then
+      echo -e "\n  ${BOLD}E4-E5. Живые тесты через свой же тоннель${NC}"
+      if _tunnel_up xhttp; then
+        TCODE=$(_tunnel_code "https://api.ipify.org")
+        [[ "$TCODE" == "200" ]] \
+          && ok "Базовый трафик через тоннель проходит (HTTP 200)" \
+          || dfail "Через тоннель трафик не идёт (код $TCODE) — сначала почини это: sudo xm selftest"
+
+        # E4 — резолвер 192.0.2.1 (RFC 5737) не существует и не маршрутизируется.
+        # Ответ может прийти ТОЛЬКО от перехвата на сервере. Бинарный тест.
+        DNSR=$(_socks_dns "192.0.2.1" "example.com")
+        case "$DNSR" in
+          OK)      ok "E4: DNS-запрос на заведомо мёртвый 192.0.2.1:53 получил ответ → перехват работает, наружу не ушло" ;;
+          TIMEOUT) dfail "E4: запрос на 192.0.2.1:53 ушёл наружу и умер по таймауту → перехвата НЕТ, plain-DNS клиента покидает VPS как есть" ;;
+          *)       dwarn "E4: тест не отработал (SOCKS/python) — проверь вручную" ;;
+        esac
+
+        # E5 — ловим утечку по факту: уникальное имя, которого нет ни в одном
+        # кэше, и смотрим, всплывёт ли оно в открытом DNS с сервера.
+        if command -v tcpdump &>/dev/null; then
+          RTAG="x$(openssl rand -hex 5)"
+          SNIFF=$(mktemp /tmp/xm-dnssniff.XXXXXX)
+          tcpdump -lnn -i any -s 256 'port 53' >"$SNIFF" 2>/dev/null &
+          TPID=$!
+          sleep 1
+          if kill -0 "$TPID" 2>/dev/null; then
+            curl -s -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time 8 -o /dev/null \
+                 "http://${RTAG}.example.com/" 2>/dev/null || true
+            sleep 1
+            kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
+            if grep -q "$RTAG" "$SNIFF" 2>/dev/null; then
+              dfail "E5: имя ${RTAG}.example.com засветилось в ОТКРЫТОМ DNS с сервера — хостер видит, какие домены ты открываешь"
+              grep -m2 "$RTAG" "$SNIFF" | sed 's/^/      /'
+            else
+              ok "E5: уникальное имя в открытом DNS с сервера не появилось — резолвинг идёт только внутри DoH"
+            fi
+          else
+            warn "E5: tcpdump не смог слушать — тест пропущен"
+          fi
+          rm -f "$SNIFF"
+        else
+          info "E5: tcpdump не установлен — тест на утечку пропущен (sudo apt install -y tcpdump)"
+        fi
+        _tunnel_down
+      else
+        _tunnel_down
+        dwarn "Локальный клиент не поднялся — живые DNS-тесты пропущены (sudo xm selftest)"
+      fi
+    fi
+
+# ══ F. Поведение и логи ══════════════════════════════════════════════════════
+    sep
+    echo -e "${BOLD}F. Поведение и логи${NC}"
+    # Настоящий сайт не банит сканеры. Если баним мы — это отличие, по которому
+    # сервер отделяется от www.apple.com.
     if fail2ban-client status 2>/dev/null | grep -qi "reality\|xray"; then
-      warn "Есть fail2ban-джейл по трафику REALITY — бан сканеров демаскирует сервер"
+      dwarn "Есть fail2ban-джейл по трафику REALITY — бан сканеров демаскирует сервер"
     else
       ok "Зонды не банятся (только rate-limit) — реакция как у настоящего CDN"
     fi
+
+    ACC=$(jq -r '.log.access // "<не задано>"' "$CONFIG")
+    [[ "$ACC" == "none" ]] \
+      && ok "Xray access-лог выключен — «кто куда ходил» на диск не пишется" \
+      || dfail "log.access=$ACC — Xray пишет IP клиента → адрес назначения. Задай \"access\":\"none\""
+
     PROBES=$(wc -l < /var/log/nginx/reality_fallback.log 2>/dev/null || echo 0)
     info "Зондов с чужим SNI в логе: $PROBES (свои клиенты сюда не пишутся)"
 
+# ══ Итог ═════════════════════════════════════════════════════════════════════
     sep
-    echo -e "${BOLD}Тест 8: maxTimeDiff${NC}"
-    MAX_TD=$(jq -r '.inbounds[0].streamSettings.realitySettings.maxTimeDiff // 0' "$CONFIG")
-    if [[ "$MAX_TD" -le 10000 ]]; then
-      ok "maxTimeDiff: ${MAX_TD} мс — оптимально"
-    elif [[ "$MAX_TD" -le 30000 ]]; then
-      warn "maxTimeDiff: ${MAX_TD} мс — допустимо, но можно снизить до 10000"
+    if [[ "$DPI_CRIT" -eq 0 && "$DPI_WARN" -eq 0 ]]; then
+      echo -e "${GREEN}${BOLD}  Чисто: критичных нареканий и предупреждений нет.${NC}"
     else
-      warn "maxTimeDiff: ${MAX_TD} мс — широкое окно для replay-атак, рекомендуется 10000"
+      echo -e "  ${RED}${BOLD}Критично: $DPI_CRIT${NC}   ${YELLOW}${BOLD}Предупреждений: $DPI_WARN${NC}"
+      echo ""
+      echo -e "  Что делать по порядку:"
+      echo -e "    ${BOLD}sudo xm harden${NC}        DoH + перехват :53 + mimic-fallback (закрывает большинство пунктов выше)"
+      echo -e "    ${BOLD}sudo xm selftest${NC}      если что-то из живых тестов не прошло"
+      echo -e "    ${BOLD}sudo xm sni-scan${NC}      если ругается на сертификат домена-маски"
+      echo -e "    ${BOLD}sudo xm diag${NC}          общее состояние сервера"
     fi
+    echo ""
     ;;
 
 diag-ntp)
@@ -1848,10 +2326,261 @@ sni-scan)
     fi
     ;;
 
+harden)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm harden${NC}"; exit 1; }
+    MODE="${2:-apply}"
+    echo -e "\n${BOLD}${CYAN}[ Хардening: DNS-over-HTTPS + перехват :53 + mimic-fallback ]${NC}\n"
+
+    sep
+    echo -e "${BOLD}Текущее состояние${NC}"
+    _dns_doh_on    && ok "DoH на сервере: включён"          || warn "DoH на сервере: ВЫКЛЮЧЕН (резолвит системный резолвер хостера открытым текстом)"
+    _dns_hijack_on && ok "Перехват :53 из тоннеля: включён" || warn "Перехват :53: ВЫКЛЮЧЕН (plain-DNS клиента уходит с VPS как есть)"
+    _ngx_mimic_on  && ok "nginx-fallback: mimic (чужой SNI → ответ настоящего сайта)" \
+                   || warn "nginx-fallback: strict (чужой SNI → молчаливый обрыв TCP — подпись прокси)"
+
+    if [[ "$MODE" == "--check" ]]; then
+      sep; info "Режим --check: ничего не изменено. Применить: ${BOLD}sudo xm harden${NC}"; exit 0
+    fi
+
+    if [[ "$MODE" == "--off" ]]; then
+      sep
+      echo -e "${BOLD}Откат${NC}"
+      ok "Бэкап: $(_backup_config before_unharden)"
+      if _harden_unpatch | _atomic_write_config && xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+        systemctl restart xray; ok "dns-блок, dns-out и перехват :53 убраны, Xray перезапущен"
+      else
+        fail "Откат конфига не удался — восстанови вручную: xm restore"; exit 1
+      fi
+      _ngx_fallback_mode strict && ok "nginx-fallback вернулся в strict"
+      warn "DNS снова резолвится системным резолвером хостера — открытым текстом"
+      exit 0
+    fi
+
+    # ── 1. Доступен ли DoH С ЭТОГО VPS ──────────────────────────────────────
+    # Проверяем ДО правки конфига: если ни один резолвер не отвечает (хостер
+    # режет :443 к ним, или VPS сам в РФ), включённый DoH убьёт весь резолвинг.
+    sep
+    echo -e "${BOLD}Шаг 1: доступность DoH-резолверов с этого VPS${NC}"
+    DOH_OK=0
+    for r in "${DOH_IPS[@]}"; do
+      if RTT=$(_doh_probe "$r"); then
+        ok "$r — отвечает (${RTT} мс)"; DOH_OK=$((DOH_OK + 1))
+      else
+        warn "$r — не отвечает по DoH (:443 закрыт/режется)"
+      fi
+    done
+    if [[ "$DOH_OK" -eq 0 ]]; then
+      fail "Ни один DoH-резолвер недоступен с этого VPS — включать DoH НЕЛЬЗЯ (сломается весь резолвинг)"
+      warn "Проверь вручную: curl -v --max-time 6 https://1.1.1.1/dns-query"
+      exit 1
+    fi
+    info "Доступно резолверов: $DOH_OK из ${#DOH_IPS[@]} — этого достаточно"
+
+    # ── 2. Стратегия адресов под фактический стек VPS ───────────────────────
+    # Если у VPS нет IPv6, AAAA-ответы бесполезны: клиент получит адрес,
+    # до которого сервер не дойдёт → «сайт не открывается через VPN».
+    if _has_ipv6; then
+      QS="UseIP"; DS="UseIPv4v6"; info "IPv6 на VPS есть → queryStrategy=UseIP"
+    else
+      QS="UseIPv4"; DS="UseIPv4"; info "IPv6 на VPS нет → queryStrategy=UseIPv4 (без бесполезных AAAA)"
+    fi
+
+    # ── 3. Патч конфига с проверкой и откатом ───────────────────────────────
+    sep
+    echo -e "${BOLD}Шаг 2: конфиг Xray${NC}"
+    HBAK=$(_backup_config before_harden); ok "Бэкап: $HBAK"
+
+    _harden_restore() {
+      cp "$HBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+      systemctl restart xray 2>/dev/null || true
+    }
+
+    # nonIPQuery=drop: запросы не-A/AAAA (HTTPS/SVCB, TXT) отбрасываются, а не
+    # пересылаются наружу открытым текстом. Приватность важнее ECH-подсказок.
+    # Поле старое (legacy), но на редких сборках может не приняться — тогда
+    # второй заход без него.
+    if ! _harden_patch "$QS" "$DS" "drop" | _atomic_write_config; then
+      fail "jq-патч не сработал — конфиг не тронут"; exit 1
+    fi
+    if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+      warn "Xray не принял nonIPQuery — повторяю без него"
+      cp "$HBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+      _harden_patch "$QS" "$DS" "" | _atomic_write_config
+      if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+        fail "Конфиг невалиден — откат"; xray -test -config "$CONFIG" 2>&1 | tail -5 | sed 's/^/    /'
+        _harden_restore; exit 1
+      fi
+    fi
+    ok "config.json: dns(DoH) + outbound dns-out + routing :53 → dns-out"
+
+    systemctl restart xray; sleep 2
+    if ! systemctl is-active --quiet xray; then
+      fail "Xray не поднялся с новым конфигом — откат"
+      journalctl -u xray -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+      _harden_restore; exit 1
+    fi
+    ok "Xray перезапущен"
+
+    # ── 4. Живая проверка: не сломали ли резолвинг ──────────────────────────
+    sep
+    echo -e "${BOLD}Шаг 3: живая проверка через свой же тоннель${NC}"
+    if _tunnel_up xhttp; then
+      CODE=$(_tunnel_code "https://api.ipify.org")
+      _tunnel_down
+      if [[ "$CODE" == "200" ]]; then
+        ok "Трафик и резолвинг через тоннель работают (HTTP $CODE)"
+      else
+        fail "Через тоннель трафик не идёт (код $CODE) — откат конфига"
+        _harden_restore
+        warn "Конфиг возвращён. Разберись: sudo xm selftest, затем повтори xm harden"
+        exit 1
+      fi
+    else
+      _tunnel_down
+      warn "Локальный клиент не поднялся — живую проверку пропускаю (проверь: sudo xm selftest)"
+    fi
+
+    # ── 5. nginx mimic ──────────────────────────────────────────────────────
+    sep
+    echo -e "${BOLD}Шаг 4: поведение fallback на чужой SNI${NC}"
+    if _ngx_mimic_on; then
+      ok "Уже в режиме mimic — ничего не меняю"
+    elif _ngx_fallback_mode mimic; then
+      ok "nginx-fallback: чужой/пустой SNI теперь уходит на реальный $(_get_nginx_sni) вместо обрыва"
+      info "Релей идёт только на этот один домен — открытым SNI-релеем сервер не становится"
+    else
+      warn "Режим fallback не изменён (см. выше) — активное зондирование остаётся заметным"
+    fi
+
+    sep
+    echo -e "${GREEN}${BOLD}  Готово.${NC}"
+    echo -e "  Проверить эффект: ${BOLD}sudo xm diag-dpi${NC}"
+    echo -e "  Откатить всё:     ${BOLD}sudo xm harden --off${NC}"
+    echo -e "  ${YELLOW}Если какое-то приложение (мессенджер) начнёт капризничать с DNS —${NC}"
+    echo -e "  ${YELLOW}это nonIPQuery=drop. Откат: sudo xm harden --off${NC}"
+    ;;
+
+pq)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm pq ${2:-status}${NC}"; exit 1; }
+    PQ_ACT="${2:-status}"
+    PQ_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
+    echo -e "\n${BOLD}${CYAN}[ ML-DSA-65 · post-quantum подпись REALITY ]${NC}\n"
+
+    case "$PQ_ACT" in
+      status)
+        _pq_on && ok "Сейчас: ВКЛЮЧЕНО" || info "Сейчас: выключено"
+        PQ_EST=$(_check_cert_size "$PQ_SNI")
+        if [[ "$PQ_EST" == "-1" ]]; then
+          warn "Размер сертификата $PQ_SNI не измерить — сайт недоступен с VPS"
+        else
+          info "Certificate у $PQ_SNI: ~${PQ_EST} б"
+          if [[ "$PQ_EST" -lt 3500 ]]; then
+            warn "Меньше 3500 б: с ML-DSA наш ответ станет заметно длиннее ответа настоящего сайта."
+            warn "Это меняет одну зацепку для DPI на другую. Взвесь: MITM-стойкость против маскировки."
+          elif [[ $((PQ_EST + 3400)) -ge "$REALITY_CERT_LIMIT" ]]; then
+            warn "~${PQ_EST} + 3.3 КБ подписи ≥ лимита REALITY (${REALITY_CERT_LIMIT} б) — хендшейк может рваться."
+          else
+            ok "Размер подходит: и маскировка не страдает, и в лимит REALITY укладываемся"
+          fi
+        fi
+        echo -e "\n  Включить:  ${BOLD}sudo xm pq on${NC}    Выключить: ${BOLD}sudo xm pq off${NC}"
+        ;;
+
+      on)
+        if _pq_on; then ok "Уже включено. Ключи для клиентов: grep MLDSA65 $CLIENT_FILE"; exit 0; fi
+        if ! xray help 2>&1 | grep -qi "mldsa65" && ! xray mldsa65 >/dev/null 2>&1; then
+          fail "Эта сборка Xray не знает команды mldsa65 — обнови ядро: sudo xm update"; exit 1
+        fi
+        PQ_EST=$(_check_cert_size "$PQ_SNI")
+        if [[ "$PQ_EST" != "-1" && $((PQ_EST + 3400)) -ge "$REALITY_CERT_LIMIT" ]]; then
+          fail "Certificate $PQ_SNI ~${PQ_EST} б + 3.3 КБ подписи не влезает в лимит REALITY (${REALITY_CERT_LIMIT} б) — хендшейк сломается. Смени домен-маску: sudo xm sni-scan"
+          exit 1
+        fi
+        if [[ "$PQ_EST" != "-1" && "$PQ_EST" -lt 3500 ]]; then
+          warn "У $PQ_SNI сертификат ~${PQ_EST} б (<3500) — наш ответ станет длиннее настоящего сайта."
+          read -rp "Всё равно включить? [y/N]: " C; [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено."; exit 0; }
+        fi
+
+        PQBAK=$(_backup_config before_pq); ok "Бэкап: $PQBAK"
+
+        _parse_mldsa "$(xray mldsa65 2>/dev/null)"
+        if [[ ${#MLDSA_SEED} -lt 30 || ${#MLDSA_VERIFY} -lt 30 ]]; then
+          fail "Не удалось распарсить вывод xray mldsa65 — включение отменено"; exit 1
+        fi
+        SEED0="$MLDSA_SEED"; VERIFY0="$MLDSA_VERIFY"
+        SEED1=""; VERIFY1=""
+        if _has_tcp_inbound; then
+          _parse_mldsa "$(xray mldsa65 2>/dev/null)"
+          SEED1="$MLDSA_SEED"; VERIFY1="$MLDSA_VERIFY"
+        fi
+
+        if _has_tcp_inbound && [[ -n "$SEED1" ]]; then
+          JQ_PQ='.inbounds[0].streamSettings.realitySettings.mldsa65Seed = $s0
+               | .inbounds[1].streamSettings.realitySettings.mldsa65Seed = $s1'
+        else
+          JQ_PQ='.inbounds[0].streamSettings.realitySettings.mldsa65Seed = $s0'
+        fi
+        if ! jq --arg s0 "$SEED0" --arg s1 "$SEED1" "$JQ_PQ" "$CONFIG" | _atomic_write_config; then
+          fail "Не удалось записать config.json — ничего не изменено"; exit 1
+        fi
+
+        if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+          fail "Xray не принял mldsa65Seed — откат"
+          xray -test -config "$CONFIG" 2>&1 | tail -5 | sed 's/^/    /'
+          cp "$PQBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+        fi
+        systemctl restart xray; sleep 2
+
+        # Клиент в selftest БЕЗ mldsa65Verify. Если он прошёл — обратная
+        # совместимость на месте и старые клиенты не отвалятся.
+        if _tunnel_up xhttp; then
+          PQCODE=$(_tunnel_code "https://api.ipify.org"); _tunnel_down
+        else
+          _tunnel_down; PQCODE="000"
+        fi
+        if [[ "$PQCODE" != "200" ]]; then
+          fail "После включения трафик через тоннель не идёт (код $PQCODE) — откат"
+          cp "$PQBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+          systemctl restart xray; exit 1
+        fi
+        ok "Включено. Клиент БЕЗ mldsa65Verify по-прежнему работает (HTTP 200) — старые конфиги не сломались"
+
+        # Verify-ключи длинные (~2.6 КБ) — храним в client-info.txt.
+        sed -i '/^MLDSA65 VERIFY/d' "$CLIENT_FILE" 2>/dev/null
+        {
+          echo "MLDSA65 VERIFY: ${VERIFY0}"
+          [[ -n "$VERIFY1" ]] && echo "MLDSA65 VERIFY2: ${VERIFY1}"
+        } >> "$CLIENT_FILE"
+        chmod 600 "$CLIENT_FILE"
+        sep
+        echo -e "${BOLD}Клиентам (по желанию — без этого тоже работает):${NC}"
+        echo -e "  В настройках REALITY добавь поле ${BOLD}mldsa65Verify${NC} (в некоторых"
+        echo -e "  клиентах — «Post-quantum» / параметр ${BOLD}pqv${NC} в ссылке)."
+        echo -e "  Ключи лежат тут:  ${BOLD}grep MLDSA65 $CLIENT_FILE${NC}"
+        echo -e "  Откатить:         ${BOLD}sudo xm pq off${NC}"
+        ;;
+
+      off)
+        if ! _pq_on; then info "Уже выключено."; exit 0; fi
+        _backup_config before_pqoff >/dev/null
+        if jq 'del(.inbounds[].streamSettings.realitySettings.mldsa65Seed)' "$CONFIG" | _atomic_write_config \
+           && xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+          systemctl restart xray
+          sed -i '/^MLDSA65 VERIFY/d' "$CLIENT_FILE" 2>/dev/null
+          ok "ML-DSA-65 выключен, Xray перезапущен"
+        else
+          fail "Не удалось выключить — восстанови: sudo xm restore"; exit 1
+        fi
+        ;;
+
+      *) echo -e "  Использование: ${BOLD}xm pq status|on|off${NC}" ;;
+    esac
+    ;;
+
 # ─── Помощь ──────────────────────────────────────────────────────────────────
 *)
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║       xm — Xray Manager  v5.6            ║${NC}"
+    echo -e "${BOLD}${CYAN}║       xm — Xray Manager  v5.7            ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${BOLD}Сервис:${NC}"
@@ -1885,12 +2614,17 @@ sni-scan)
     echo -e "${BOLD}Логи:${NC}     xm log / log-live / log-clear"
     echo -e "${BOLD}Инфо:${NC}     xm info / paths / uuid / pubkey"
     echo ""
+    echo -e "${BOLD}${GREEN}Анти-DPI и анонимность:${NC}"
+    echo -e "  ${GREEN}xm harden${NC}                        DoH на сервере + перехват :53 + mimic-fallback"
+    echo    "  xm harden --check | --off        Показать состояние / откатить"
+    echo -e "  ${GREEN}xm pq status|on|off${NC}              ML-DSA-65: post-quantum подпись REALITY"
+    echo ""
     echo -e "${BOLD}${GREEN}Диагностика:${NC}"
     echo -e "  ${GREEN}xm selftest [--tcp|--all]${NC}        Живой хендшейк через loopback — НАЧИНАЙ С НЕЁ"
+    echo -e "  ${GREEN}xm diag-dpi [--quick]${NC}            Устойчивость к DPI: зонды, DNS-утечки, профиль трафика"
     echo -e "  ${GREEN}xm sni-scan${NC}                      Замер доменов-масок (cert/h2/RTT)"
     echo -e "  ${GREEN}xm reality-debug on|off${NC}          Почему REALITY отказывает (авто-off 15 мин)"
     echo -e "  ${GREEN}xm diag${NC}                          Полная диагностика"
-    echo -e "  ${GREEN}xm dpi${NC}                           Устойчивость к DPI"
     echo    "  Прочее: pubkey / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log"
     ;;
 esac
