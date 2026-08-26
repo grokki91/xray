@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  xm — Xray Manager Helper  v5.7
+#  xm — Xray Manager Helper  v5.8
 #  Использование: xm [команда]
 #
 #  Команды:
@@ -9,12 +9,13 @@
 #   Бэкапы:      backup / restore / backups
 #   Клиенты:     clients / add-client / del-client / uri / qr
 #   TCP:         add-tcp
-#   Обновление:  update [--check] / update-geo
+#   Обновление:  self-update [--check|--force|--from] / update [--check] / update-geo
 #   Nginx:       nginx-status / nginx-log / nginx-reload / nginx-probes
 #   Fail2ban:    ban-list / ban-ssh-stat / unban
 #   Логи:        log / log-live / log-clear
 #   Инфо:        info / paths / uuid / pubkey
 #   Анти-DPI:    harden [--check|--off] / pq status|on|off
+#   Соседи:      neighbors — что ещё живёт на сервере и что трогает xm
 #   Диагностика: diag / diag-dpi [--quick] / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
 # =============================================================================
 
@@ -25,6 +26,11 @@ CONFIG="/usr/local/etc/xray/config.json"
 BACKUP_DIR="/usr/local/etc/xray/backups"
 LOG="/var/log/xray/error.log"
 CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
+XM_BIN="/usr/local/bin/xm"
+# Путь к git-чекауту репозитория, из которого ставился xm. Пишется setup.sh и
+# xm self-update — чтобы обновление знало, откуда тянуть, и не приходилось
+# каждый раз вспоминать, куда именно был сделан clone.
+XM_SRC_FILE="/usr/local/etc/xray/xm-source"
 
 # Пороги размера TLS Certificate для совместимости с REALITY (см. setup.sh)
 REALITY_CERT_WARN=7000
@@ -119,6 +125,27 @@ _has_tcp_inbound() {
 _jails() {
   fail2ban-client status 2>/dev/null \
     | sed -n 's/.*Jail list:[[:space:]]*//p' | tr -d ' ' | tr ',' ' '
+}
+
+# Каталог с git-чекаутом репозитория. Порядок поиска: записанный путь, затем
+# типовые места. Пустой вывод и код 1 — чекаут не найден.
+_xm_repo() {
+  local d
+  if [[ -f "$XM_SRC_FILE" ]]; then
+    d=$(head -1 "$XM_SRC_FILE" 2>/dev/null | tr -d '[:space:]')
+    [[ -n "$d" && -d "$d/.git" && -f "$d/xm.sh" ]] && { echo "$d"; return 0; }
+  fi
+  for d in /opt/xray /root/xray /home/*/xray; do
+    [[ -d "$d/.git" && -f "$d/xm.sh" ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+# Тег последнего релиза Xray-core. Пусто = GitHub недоступен.
+_xray_latest_ver() {
+  curl -fsSL --proto '=https' --tlsv1.2 --max-time 10 \
+    https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
+    | jq -r '.tag_name // empty'
 }
 
 # Бэкап config.json. Каталог 700, файл 600: внутри приватный ключ REALITY,
@@ -1252,9 +1279,7 @@ update)
 
     # --check: только сравнить с последним релизом на GitHub, ничего не менять
     if [[ "${2:-}" == "--check" ]]; then
-      LATEST=$(curl -fsSL --proto '=https' --tlsv1.2 --max-time 10 \
-        https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null \
-        | jq -r '.tag_name // empty')
+      LATEST=$(_xray_latest_ver)
       if [[ -z "$LATEST" ]]; then
         fail "Не удалось получить информацию о релизах с GitHub API"
         exit 1
@@ -1275,9 +1300,7 @@ update)
     [[ "$UPD_CONFIRM" =~ ^[Yy]$ ]] || { info "Отменено."; exit 0; }
 
     # Шаг 1: бэкап конфига (точка отката)
-    mkdir -p "$BACKUP_DIR"
-    UPD_BACKUP="$BACKUP_DIR/config_$(date +%Y%m%d_%H%M%S)_before_update.json"
-    cp "$CONFIG" "$UPD_BACKUP"
+    UPD_BACKUP=$(_backup_config before_update)
     ok "Бэкап конфига: $UPD_BACKUP"
 
     # Шаг 2: скачиваем официальный установщик во временный файл (URL захардкожен)
@@ -1546,7 +1569,7 @@ uuid) xray uuid ;;
 
 diag)
     echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║       Xray Full Diagnostic  v5.7         ║${NC}"
+    echo -e "${BOLD}${CYAN}║       Xray Full Diagnostic  v5.8         ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}\n"
 
     ISSUES=0
@@ -2577,10 +2600,297 @@ pq)
     esac
     ;;
 
+# ─── Обновление самого xm из git-чекаута ─────────────────────────────────────
+# Заменяет ручной цикл «nano xm.sh → сохранил → скопировал». Источник правды —
+# репозиторий, локальные правки на сервере не переживают обновление (и это
+# правильно: правки надо коммитить, а не держать в единственном экземпляре
+# на VPS). Ничего кроме /usr/local/bin/xm команда не трогает.
+self-update)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm self-update${NC}"; exit 1; }
+    SU_CHECK=false; SU_FORCE=false; SU_FROM=""
+    shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --check) SU_CHECK=true ;;
+        --force) SU_FORCE=true ;;
+        --from)  shift; SU_FROM="${1:-}" ;;
+        *) echo -e "${RED}Неизвестный аргумент: $1${NC}"
+           echo    "  xm self-update [--check] [--force] [--from <url|путь>]"; exit 1 ;;
+      esac
+      shift
+    done
+
+    echo -e "\n${BOLD}${CYAN}[ Обновление xm из репозитория ]${NC}\n"
+    command -v git >/dev/null 2>&1 || { fail "git не установлен: sudo apt install -y git"; exit 1; }
+
+    # ── Откуда тянем ────────────────────────────────────────────────────────
+    if [[ -n "$SU_FROM" ]]; then
+      if [[ "$SU_FROM" == *://* || "$SU_FROM" == git@* ]]; then
+        REPO="/opt/xray"
+        if [[ -d "$REPO/.git" ]]; then
+          info "Меняю remote у $REPO на $SU_FROM"
+          git -C "$REPO" remote set-url origin "$SU_FROM" || { fail "не удалось сменить remote"; exit 1; }
+        elif [[ -e "$REPO" ]]; then
+          fail "$REPO уже существует и это не git-репозиторий — убери его или укажи другой путь"; exit 1
+        else
+          info "Клонирую $SU_FROM → $REPO"
+          git clone --quiet "$SU_FROM" "$REPO" || { fail "клонирование не удалось"; exit 1; }
+        fi
+      else
+        REPO="${SU_FROM%/}"
+        [[ -d "$REPO/.git" && -f "$REPO/xm.sh" ]] || { fail "$REPO — не git-чекаут этого репозитория"; exit 1; }
+      fi
+    else
+      REPO=$(_xm_repo) || {
+        fail "Git-чекаут репозитория не найден"
+        echo "  Он ищется по записи в $XM_SRC_FILE, затем в /opt/xray, /root/xray, /home/*/xray."
+        echo "  Укажи явно или склонируй:"
+        echo -e "    ${BOLD}sudo xm self-update --from https://github.com/<user>/xray.git${NC}"
+        echo -e "    ${BOLD}sudo xm self-update --from /путь/к/чекауту${NC}"
+        exit 1; }
+    fi
+    ok "Источник: $REPO"
+
+    # Ветка: текущая; при detached HEAD или отсутствии её на origin — main.
+    BR=$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null || echo "")
+    [[ -z "$BR" ]] && BR="main"
+    git -C "$REPO" fetch --quiet origin 2>/dev/null || { fail "git fetch не прошёл — проверь сеть и доступ к репозиторию"; exit 1; }
+    git -C "$REPO" rev-parse --verify --quiet "origin/$BR" >/dev/null 2>&1 || BR="main"
+    git -C "$REPO" rev-parse --verify --quiet "origin/$BR" >/dev/null 2>&1 \
+      || { fail "На origin нет ни текущей ветки, ни main"; exit 1; }
+    info "Ветка: $BR"
+
+    LOCAL_SHA=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
+    REMOTE_SHA=$(git -C "$REPO" rev-parse --short "origin/$BR" 2>/dev/null)
+    AHEAD=$(git -C "$REPO" rev-list --count "HEAD..origin/$BR" 2>/dev/null || echo 0)
+
+    if [[ "$AHEAD" -gt 0 ]]; then
+      info "Новых коммитов: $AHEAD ($LOCAL_SHA → $REMOTE_SHA)"
+      git -C "$REPO" log --oneline --no-decorate "HEAD..origin/$BR" | head -10 | sed 's/^/      /'
+    else
+      ok "Чекаут уже на $REMOTE_SHA — новых коммитов нет"
+    fi
+
+    # Установленный xm мог разойтись с репозиторием, даже когда коммитов нет:
+    # правили руками на сервере. Сравниваем по факту, а не по git.
+    DIVERGED=false
+    [[ -f "$XM_BIN" ]] && ! cmp -s "$REPO/xm.sh" "$XM_BIN" && DIVERGED=true
+    $DIVERGED && warn "Установленный $XM_BIN отличается от xm.sh в репозитории (правили руками?)"
+
+    if $SU_CHECK; then
+      sep
+      if [[ "$AHEAD" -gt 0 ]] || $DIVERGED; then
+        info "Есть что обновить. Применить: ${BOLD}sudo xm self-update${NC}"
+      else
+        ok "Всё актуально, делать нечего"
+      fi
+      exit 0
+    fi
+
+    # ── Локальные правки в чекауте ──────────────────────────────────────────
+    if [[ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]]; then
+      warn "В чекауте есть незакоммиченные изменения:"
+      git -C "$REPO" status --short | head -10 | sed 's/^/      /'
+      if $SU_FORCE; then
+        warn "--force: выбрасываю их (git reset --hard)"
+      else
+        fail "Обновление остановлено, чтобы не потерять правки."
+        echo "  Сохранить их:   cd $REPO && git stash"
+        echo "  Или выбросить:  sudo xm self-update --force"
+        exit 1
+      fi
+    fi
+
+    if [[ "$AHEAD" -gt 0 ]] || $SU_FORCE; then
+      git -C "$REPO" checkout --quiet "$BR" 2>/dev/null || true
+      if ! git -C "$REPO" reset --hard --quiet "origin/$BR" 2>/dev/null; then
+        fail "Не удалось перевести чекаут на origin/$BR"; exit 1
+      fi
+      ok "Чекаут на origin/$BR ($(git -C "$REPO" rev-parse --short HEAD))"
+    fi
+
+    # ── Установка ───────────────────────────────────────────────────────────
+    [[ -f "$REPO/xm.sh" ]] || { fail "В $REPO нет xm.sh"; exit 1; }
+    if ! bash -n "$REPO/xm.sh" 2>/dev/null; then
+      fail "Новый xm.sh не проходит проверку синтаксиса — НЕ устанавливаю"
+      bash -n "$REPO/xm.sh" 2>&1 | head -5 | sed 's/^/      /'
+      exit 1
+    fi
+    ok "Синтаксис нового xm.sh в порядке"
+
+    OLD_V=$(grep -m1 -oE 'xm — Xray Manager Helper +v[0-9.]+' "$XM_BIN" 2>/dev/null | grep -oE 'v[0-9.]+' || echo "?")
+    if [[ -f "$XM_BIN" ]]; then
+      mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+      XM_BAK="$BACKUP_DIR/xm_$(date +%Y%m%d_%H%M%S).bak"
+      cp "$XM_BIN" "$XM_BAK"; ok "Бэкап текущего xm: $XM_BAK"
+    fi
+
+    # ВАЖНО: устанавливаем через mv, а не cp/install поверх файла.
+    # bash читает скрипт ПО МЕРЕ выполнения — а сейчас выполняется как раз
+    # /usr/local/bin/xm. Перезапись на месте меняет содержимое под открытым
+    # дескриптором, и остаток текущего запуска пойдёт по новому смещению в
+    # новом тексте: в лучшем случае синтаксическая ошибка, в худшем — кусок
+    # чужой команды. mv в пределах одной ФС — это rename: у работающего
+    # процесса остаётся старый inode, он доигрывает себя целым.
+    install -m 755 "$REPO/xm.sh" "${XM_BIN}.new" || { fail "Не записать ${XM_BIN}.new"; exit 1; }
+    mv -f "${XM_BIN}.new" "$XM_BIN" || { fail "Не удалось заменить $XM_BIN"; rm -f "${XM_BIN}.new"; exit 1; }
+    NEW_V=$(grep -m1 -oE 'xm — Xray Manager Helper +v[0-9.]+' "$XM_BIN" 2>/dev/null | grep -oE 'v[0-9.]+' || echo "?")
+    ok "Установлен $XM_BIN  (${OLD_V} → ${NEW_V})"
+
+    mkdir -p "$(dirname "$XM_SRC_FILE")"
+    echo "$REPO" > "$XM_SRC_FILE"; chmod 644 "$XM_SRC_FILE"
+
+    # ── Что ещё стоит обновить ──────────────────────────────────────────────
+    sep
+    echo -e "${BOLD}Что ещё стоит проверить${NC}"
+
+    CUR_X=$(xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 || echo "")
+    LAT_X=$(_xray_latest_ver | grep -oE '[0-9]+(\.[0-9]+)+' | head -1 || echo "")
+    if [[ -n "$CUR_X" && -n "$LAT_X" && "$CUR_X" != "$LAT_X" ]]; then
+      warn "Xray-core $CUR_X → доступен $LAT_X          ${BOLD}sudo xm update${NC}"
+    elif [[ -n "$CUR_X" ]]; then
+      ok "Xray-core $CUR_X — актуальная версия"
+    else
+      info "Версию Xray-core не определить          sudo xm update --check"
+    fi
+
+    GEO="/usr/local/share/xray/geoip.dat"
+    if [[ -f "$GEO" ]]; then
+      GEO_AGE=$(( ( $(date +%s) - $(stat -c %Y "$GEO") ) / 86400 ))
+      [[ "$GEO_AGE" -gt 30 ]] \
+        && warn "geoip.dat не обновлялся $GEO_AGE дн.          ${BOLD}sudo xm update-geo${NC}" \
+        || ok "geo-базы свежие ($GEO_AGE дн.)"
+    fi
+
+    if _dns_doh_on && _dns_hijack_on && _ngx_mimic_on; then
+      ok "Анти-DPI хардening применён полностью"
+    else
+      warn "Хардening применён не весь                ${BOLD}sudo xm harden${NC}"
+      _dns_doh_on    || echo "        · DoH на сервере выключен — домены резолвит хостер открытым текстом"
+      _dns_hijack_on || echo "        · перехват :53 выключен"
+      _ngx_mimic_on  || echo "        · nginx-fallback рвёт соединение на чужой SNI"
+    fi
+
+    sep
+    echo -e "  Дальше:  ${BOLD}sudo xm diag-dpi${NC}   проверить устойчивость к DPI"
+    echo -e "           ${BOLD}sudo xm neighbors${NC}  что ещё живёт на этом сервере"
+    echo ""
+    ;;
+
+# ─── Кто ещё живёт на этом сервере ───────────────────────────────────────────
+# Нужно, когда VPN стоит не на выделенной машине, а рядом с чем-то своим.
+# Показывает чужие сервисы и — главное — что именно трогает каждая команда xm,
+# чтобы не выяснять это методом «запустил и посмотрел, что отвалилось».
+neighbors)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm neighbors${NC}"; exit 1; }
+    echo -e "\n${BOLD}${CYAN}[ Соседи по серверу ]${NC}\n"
+
+    sep
+    echo -e "${BOLD}nginx · HTTP-сайты (sites-enabled)${NC}"
+    OUR_DEFSRV=0; FOREIGN_DEFSRV=""
+    if [[ -d /etc/nginx/sites-enabled ]]; then
+      shopt -s nullglob
+      for f in /etc/nginx/sites-enabled/*; do
+        n=$(basename "$f")
+        # default_server на :80 может быть только один на весь nginx. Если он
+        # объявлен дважды — nginx -t падает и НЕ поднимается ни наш сайт, ни чужой.
+        # Комментарии срезаем: закомментированный default_server конфликта не даёт.
+        # Без якоря ^ — в однострочных конфигах listen стоит после "server {".
+        if sed 's/#.*//' "$f" 2>/dev/null | grep -qE '\blisten\b[^;]*\bdefault_server\b'; then D=1; else D=0; fi
+        if [[ "$n" == "fallback" ]]; then
+          info "$n — наш (REALITY fallback, :80 → 301 https)"
+          [[ "$D" -eq 1 ]] && OUR_DEFSRV=1
+        else
+          warn "$n — ЧУЖОЙ, xm его не трогает"
+          [[ "$D" -eq 1 ]] && FOREIGN_DEFSRV="$FOREIGN_DEFSRV $n"
+        fi
+      done
+      shopt -u nullglob
+    else
+      info "каталог /etc/nginx/sites-enabled отсутствует"
+    fi
+    if [[ "$OUR_DEFSRV" -eq 1 && -n "$FOREIGN_DEFSRV" ]]; then
+      fail "КОНФЛИКТ: default_server на :80 объявлен и у нас, и в:$FOREIGN_DEFSRV"
+      warn "nginx -t упадёт → не поднимется НИ ОДИН сайт. Убери default_server у одного из них."
+    fi
+
+    sep
+    echo -e "${BOLD}nginx · stream (наш тракт REALITY)${NC}"
+    if [[ -d /etc/nginx/stream-enabled ]]; then
+      shopt -s nullglob
+      for f in /etc/nginx/stream-enabled/*; do
+        n=$(basename "$f")
+        [[ "$n" == "reality-fallback.conf" ]] \
+          && info "$n — наш (ssl_preread → $(_get_nginx_sni))" \
+          || warn "$n — ЧУЖОЙ в нашем каталоге. Проверь, что он не слушает 127.0.0.1:10443"
+      done
+      shopt -u nullglob
+    else
+      info "каталог /etc/nginx/stream-enabled отсутствует"
+    fi
+
+    sep
+    echo -e "${BOLD}Кто слушает порты${NC}"
+    XP=$(jq -r '.inbounds[0].port' "$CONFIG" 2>/dev/null || echo "")
+    XP2=$(jq -r '.inbounds[1].port // ""' "$CONFIG" 2>/dev/null || echo "")
+    SSHP=$(_get_ssh_port)
+    echo    "  порт     процесс        чей"
+    ss -tlnp 2>/dev/null | tail -n +2 | awk '
+      { a=$4; sub(/.*:/, "", a); p="?";
+        if (match($0, /users:\(\("[^"]+"/)) p=substr($0, RSTART+9, RLENGTH-10);
+        print a, p }' | sort -n -u | while read -r port proc; do
+      case "$port" in
+        "$XP"|"$XP2") who="наш (xray)" ;;
+        80|10443)     who="наш (nginx)" ;;
+        "$SSHP")      who="системный (ssh)" ;;
+        *)            who="ЧУЖОЙ — не наш, xm его не трогает" ;;
+      esac
+      printf "  %-8s %-14s %s\n" "$port" "$proc" "$who"
+    done
+
+    sep
+    echo -e "${BOLD}Свои systemd-юниты (не из пакетов)${NC}"
+    shopt -s nullglob
+    FOUND_UNIT=0
+    for u in /etc/systemd/system/*.service; do
+      n=$(basename "$u")
+      case "$n" in
+        xray.service|xray-sni-watch.service) info "$n — наш" ;;
+        *) warn "$n — ЧУЖОЙ ($(systemctl is-active "$n" 2>/dev/null))" ;;
+      esac
+      FOUND_UNIT=1
+    done
+    shopt -u nullglob
+    [[ "$FOUND_UNIT" -eq 0 ]] && info "кастомных юнитов в /etc/systemd/system нет"
+
+    sep
+    echo -e "${BOLD}UFW${NC}"
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+      ufw status 2>/dev/null | tail -n +3 | sed 's/^/  /'
+      warn "Если чужой сервис слушает наружу — его порт должен быть в этом списке"
+    else
+      warn "UFW не активен"
+    fi
+
+    sep
+    echo -e "${BOLD}Что трогает каждая команда${NC}"
+    echo -e "  ${GREEN}xm self-update${NC}   только /usr/local/bin/xm — больше ничего"
+    echo -e "  ${GREEN}xm harden${NC}        config.json + stream-enabled/reality-fallback.conf,"
+    echo    "                   затем nginx reload — и только если nginx -t прошёл"
+    echo -e "  ${GREEN}xm set-sni${NC}       то же самое плюс перезапуск xray"
+    echo -e "  ${GREEN}xm update${NC}        бинарь xray + перезапуск xray"
+    echo -e "  ${GREEN}xm diag*${NC}         ничего не меняет, только читает"
+    echo -e "  ${RED}setup.sh --reinstall${NC}  ОПАСНО для соседей: переписывает nginx.conf,"
+    echo    "                   сносит sites-enabled/default и всё из stream-enabled/,"
+    echo    "                   включает ufw, переписывает fail2ban, генерирует новые"
+    echo    "                   ключи REALITY (все выданные клиентам URI умирают)."
+    echo ""
+    ;;
+
 # ─── Помощь ──────────────────────────────────────────────────────────────────
 *)
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${CYAN}║       xm — Xray Manager  v5.7            ║${NC}"
+    echo -e "${BOLD}${CYAN}║       xm — Xray Manager  v5.8            ║${NC}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${BOLD}Сервис:${NC}"
@@ -2606,8 +2916,10 @@ pq)
     echo -e "  ${GREEN}xm add-tcp${NC}                       Добавить XTLS-Vision/TCP inbound"
     echo ""
     echo -e "${BOLD}${GREEN}Обновление:${NC}"
-    echo -e "  ${GREEN}xm autoupd on|off|now|log|status${NC}  Автопатчи безопасности ОС (20:30 МСК)"
+    echo -e "  ${GREEN}xm self-update [--check|--force]${NC}  Обновить сам xm из git-чекаута репозитория"
+    echo    "  xm self-update --from <url|путь>  Указать/сменить источник (склонирует в /opt/xray)"
     echo -e "  ${GREEN}xm update [--check]${NC} / ${GREEN}update-geo${NC}   Xray-core / geoip.dat / geosite.dat"
+    echo -e "  ${GREEN}xm autoupd on|off|now|log|status${NC}  Автопатчи безопасности ОС (20:30 МСК)"
     echo ""
     echo -e "${BOLD}Nginx:${NC}    xm nginx-status / nginx-log / nginx-reload / nginx-probes"
     echo -e "${BOLD}Fail2ban:${NC} xm ban-list / ban-ssh-stat / unban [IP]"
@@ -2625,6 +2937,7 @@ pq)
     echo -e "  ${GREEN}xm sni-scan${NC}                      Замер доменов-масок (cert/h2/RTT)"
     echo -e "  ${GREEN}xm reality-debug on|off${NC}          Почему REALITY отказывает (авто-off 15 мин)"
     echo -e "  ${GREEN}xm diag${NC}                          Полная диагностика"
+    echo -e "  ${GREEN}xm neighbors${NC}                     Кто ещё живёт на сервере и что трогает xm"
     echo    "  Прочее: pubkey / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log"
     ;;
 esac
