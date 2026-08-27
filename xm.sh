@@ -182,6 +182,7 @@ _url_encode() {
 # https+local:// = запрос идёт мимо routing → нет петли с перехватом :53.
 DOH_LIST='["https+local://1.1.1.1/dns-query","https+local://9.9.9.9/dns-query","https+local://8.8.8.8/dns-query"]'
 DOH_IPS=(1.1.1.1 9.9.9.9 8.8.8.8)
+RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/xm-dot.conf
 
 _has_ipv6() { ip -6 route get 2001:4860:4860::8888 &>/dev/null; }
 
@@ -196,6 +197,50 @@ _dns_hijack_on() {
   jq -e '([.outbounds[]? | select(.protocol=="dns")] | length) > 0
      and ([.routing.rules[]? | select(.outboundTag=="dns-out")] | length) > 0' \
      "$CONFIG" >/dev/null 2>&1
+}
+
+# systemd-resolved переведён на DoT в СТРОГОМ режиме?
+# Засчитываем только "yes". При "opportunistic" резолвед молча сваливается в
+# открытый UDP, как только :853 не отвечает, — то есть даёт ровно ту утечку,
+# от которой мы защищаемся, и не оставляет ни одного признака.
+_resolved_dot_on() {
+  resolvectl status 2>/dev/null \
+    | grep -qiE '^[[:space:]]*DNSOverTLS setting:[[:space:]]*yes[[:space:]]*$'
+}
+
+# Классификация DNS-дампа по АДРЕСУ ИСТОЧНИКА пакета. Источник — единственное,
+# что отличает три РАЗНЫЕ вещи, которые прошлая версия теста валила в одну:
+#   wire — есть пакет с источником вне петли: имя физически покинуло машину
+#   stub — только 127.x → 127.0.0.53: спросили локальный резолвер, а что он
+#          сделает дальше, решает _resolved_dot_on, а не этот дамп
+#   none — запроса не было вовсе
+# Ответы резолвера тоже содержат имя, и это не мешает: у ответа с провода
+# источник тоже внешний, то есть вывод только подтверждается.
+_dns_leak_class() {
+  local f="$1" n="$2" src cls="none"
+  while read -r src; do
+    [[ -z "$src" ]] && continue
+    if [[ "$src" == 127.* || "$src" == "::1" ]]; then
+      [[ "$cls" == "none" ]] && cls="stub"
+    else
+      cls="wire"; break
+    fi
+  done < <(grep -F "$n" "$f" 2>/dev/null \
+           | awk '$2=="IP"||$2=="IP6"{s=$3; sub(/\.[0-9]+$/,"",s); print s}')
+  echo "$cls"
+}
+
+# Человеческая формулировка для класса утечки. Вынесена отдельно, потому что
+# «хостер видит, какие домены ты открываешь» верно ровно для одного из трёх
+# случаев, а печаталось раньше для всех.
+_e5_where() {
+  case "$1" in
+    wire) echo "ушло С МАШИНЫ открытым UDP/53 — имя видит любой на пути, хостер в первую очередь" ;;
+    stub) _resolved_dot_on \
+            && echo "ушло в системный резолвер; тот на строгом DoT, поэтому открытым текстом на провод не попадёт — но резолвит имя не Xray" \
+            || echo "ушло в системный резолвер, а он без DoT — значит через миллисекунду будет на проводе открытым текстом" ;;
+    *)    echo "не запрашивалось" ;;
+  esac
 }
 
 # nginx-fallback отвечает на чужой SNI (mimic), а не рвёт соединение?
@@ -242,6 +287,10 @@ _doh_probe() {
 # НЕ ПИШЕТ НИЧЕГО в лог — это штатная ветка протокола, а не ошибка. Поэтому
 # «в логах пусто» ничего не доказывает. Здесь поднимается настоящий VLESS-
 # клиент на loopback: сеть, провайдер и клиентское приложение исключены.
+# У клиента есть СВОЙ dns-блок с теми же DoH. Резолвить ему нечего (адрес
+# outbound — литерал 127.0.0.1, домен из SOCKS уходит внутрь VLESS строкой),
+# но пока блока не было, при разборе утечки его нельзя было исключить иначе
+# как рассуждением. Теперь исключается конфигом.
 TUN_PORT=""; TUN_PID=""; TUN_CFG=""; TUN_LOG=""; TUN_SNI=""; TUN_SRVPORT=""
 
 _tunnel_up() {
@@ -262,8 +311,10 @@ _tunnel_up() {
     path_v=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
     mode=$(jq   -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
     jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
-          --arg p "$path_v" --arg m "$mode" --argjson port "$port" --argjson sp "$TUN_PORT" '{
+          --arg p "$path_v" --arg m "$mode" --argjson port "$port" --argjson sp "$TUN_PORT" \
+          --argjson doh "$DOH_LIST" '{
       log:{loglevel:"warning"},
+      dns:{servers:$doh, queryStrategy:"UseIPv4"},
       inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:true}}],
       outbounds:[{protocol:"vless",
         settings:{vnext:[{address:"127.0.0.1",port:$port,users:[{id:$uuid,encryption:"none"}]}]},
@@ -272,8 +323,9 @@ _tunnel_up() {
           xhttpSettings:{path:$p,host:$sni,mode:$m}}}]}' > "$TUN_CFG"
   else
     jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
-          --argjson port "$port" --argjson sp "$TUN_PORT" '{
+          --argjson port "$port" --argjson sp "$TUN_PORT" --argjson doh "$DOH_LIST" '{
       log:{loglevel:"warning"},
+      dns:{servers:$doh, queryStrategy:"UseIPv4"},
       inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:true}}],
       outbounds:[{protocol:"vless",
         settings:{vnext:[{address:"127.0.0.1",port:$port,
@@ -345,6 +397,40 @@ except socket.timeout:
     print("TIMEOUT")
 except Exception:
     print("ERR")
+PY
+}
+
+# _socks_connect <домен> <порт> → OK | FAIL
+# SOCKS5 CONNECT с ATYP=DOMAIN (0x03): имя уезжает в тоннель строкой, клиент
+# теста его не резолвит ПО ПОСТРОЕНИЮ. Это и есть атрибуция: что бы ни всплыло
+# в DNS-дампе после такого запроса — резолвил сервер. curl с socks5h делает то
+# же самое, но доказать это по дампу нельзя, а здесь доказывать нечего.
+_socks_connect() {
+  python3 - "$TUN_PORT" "$1" "$2" <<'PY' 2>/dev/null || echo "FAIL"
+import socket, struct, sys
+sp, host, port = int(sys.argv[1]), sys.argv[2], int(sys.argv[3])
+try:
+    s = socket.create_connection(("127.0.0.1", sp), 5)
+    s.settimeout(8)
+    s.sendall(b"\x05\x01\x00")
+    if s.recv(2) != b"\x05\x00":
+        print("FAIL"); sys.exit()
+    h = host.encode()
+    s.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + struct.pack(">H", port))
+    rep = s.recv(10)
+    good = len(rep) >= 2 and rep[1] == 0
+    if good:
+        # Данные обязательны. SOCKS-инбаунд отвечает на CONNECT сразу, а
+        # дозванивается до цели только когда пойдёт трафик. Без этой строки
+        # сервер имя не резолвит вовсе, и тест покажет ложную чистоту.
+        try:
+            s.sendall(b"GET / HTTP/1.1\r\nHost: " + h + b"\r\nConnection: close\r\n\r\n")
+            s.recv(1)
+        except Exception:
+            pass
+    print("OK" if good else "FAIL")
+except Exception:
+    print("FAIL")
 PY
 }
 
@@ -421,6 +507,37 @@ if n != 1:
     sys.exit(1)
 open(path, 'w').write(out)
 PY
+}
+
+# nginx резолвит апстрим fallback сам и МИМО системного резолвера: в конфиге
+# стоит resolver 1.1.1.1 8.8.8.8 valid=30s, то есть открытый UDP/53 раз в
+# полминуты — только чтобы отдать proxy_pass адрес домена-маски. Браузинг это
+# не раскрывает (домен-маска и так публичен), но это постоянный открытый
+# маячок, который противоречит остальному harden. Переводим на стаб: после
+# шага DoT он ходит по :853, а кэш становится общим с остальной машиной.
+# Возврат 0 — что-то изменили, 1 — менять было нечего.
+_ngx_resolver_local() {
+  local f rc=1
+  for f in /etc/nginx/stream-enabled/reality-fallback.conf /etc/nginx/reality-fallback.conf.tmpl; do
+    [[ -f "$f" ]] || continue
+    grep -qE '^[[:space:]]*resolver[[:space:]]' "$f" || continue
+    grep -qE '^[[:space:]]*resolver[[:space:]]+127\.0\.0\.53([[:space:]]|;)' "$f" && continue
+    sed -i -E 's|^([[:space:]]*)resolver[[:space:]]+[^;]*;|\1resolver 127.0.0.53 valid=300s ipv6=off;|' "$f" && rc=0
+  done
+  return $rc
+}
+
+# Обратная операция для harden --off. Возврат 0 — что-то вернули на место.
+# Обходим файлы по одному: sed на несуществующем файле вернул бы ошибку на
+# весь вызов, и nginx не перезагрузился бы после реальной правки соседнего.
+_ngx_resolver_public() {
+  local f rc=1
+  for f in /etc/nginx/stream-enabled/reality-fallback.conf /etc/nginx/reality-fallback.conf.tmpl; do
+    [[ -f "$f" ]] || continue
+    grep -qE '^[[:space:]]*resolver[[:space:]]+127\.0\.0\.53([[:space:]]|;)' "$f" || continue
+    sed -i -E 's|^([[:space:]]*)resolver[[:space:]]+127\.0\.0\.53[^;]*;|\1resolver 1.1.1.1 8.8.8.8 valid=30s ipv6=off;|' "$f" && rc=0
+  done
+  return $rc
 }
 
 # _ngx_fallback_mode <mimic|strict> — правит и живой конфиг, и шаблон
@@ -2048,6 +2165,14 @@ dpi|diag-dpi)
       jq -e '.dns.clientIp // empty' "$CONFIG" >/dev/null 2>&1 \
         && dfail "Задан dns.clientIp — сервер шлёт EDNS Client Subnet, то есть сам сообщает резолверу твою подсеть. Убери." \
         || ok "dns.clientIp не задан — EDNS Client Subnet не утекает"
+      # Стаб системы — часть модели угроз, а не соседняя тема: измерено, что
+      # в него попадают в том числе имена, пришедшие из тоннеля (см. E5).
+      # Пока он ходит открытым UDP, каждое такое попадание — имя на проводе.
+      if _resolved_dot_on; then
+        ok "systemd-resolved: DNSOverTLS=yes — что попало в системный резолвер, уходит по :853, а не открытым UDP"
+      else
+        dwarn "systemd-resolved без строгого DoT: всё, что попадёт в системный резолвер (а туда попадает не только не-Xray), уйдёт с VPS открытым UDP/53. Исправить: ${BOLD}sudo xm harden${NC}"
+      fi
     else
       dfail "dns-блок не настроен: Xray резолвит домены системным резолвером хостера ОТКРЫТЫМ ТЕКСТОМ — хостер видит полный список сайтов. Исправь: ${BOLD}sudo xm harden${NC}"
     fi
@@ -2084,24 +2209,47 @@ dpi|diag-dpi)
           *)       dwarn "E4: тест не отработал (SOCKS/python) — проверь вручную" ;;
         esac
 
-        # E5 — ловим утечку по факту: уникальное имя, которого нет ни в одном
-        # кэше, и смотрим, всплывёт ли оно в открытом DNS с сервера.
+        # E5 — утечка по факту, с атрибуцией. Два имени с РАЗНОЙ судьбой внутри
+        # DoH, и разница между ними — это и есть диагноз:
+        #   мёртвое имя (случайное под example.com) — DoH обязан вернуть NXDOMAIN;
+        #   живое имя  (one.one.one.one)            — DoH обязан вернуть адрес.
+        # Течёт только мёртвое → сервер сваливается в системный резолвер лишь
+        # когда свой DoH не разрешил имя. Течёт и живое → своим DoH он для
+        # исходящих соединений не пользуется вообще, и dns-блок декоративен.
+        # one.one.one.one выбран потому, что он гарантированно резолвится и на
+        # этом сервере не нужен больше никому: в дампе он однозначно наш.
         if command -v tcpdump &>/dev/null; then
-          RTAG="x$(openssl rand -hex 5)"
+          DEADN="x$(openssl rand -hex 5).example.com"
+          LIVEN="one.one.one.one"
           SNIFF=$(mktemp /tmp/xm-dnssniff.XXXXXX)
           tcpdump -lnn -i any -s 256 'port 53' >"$SNIFF" 2>/dev/null &
           TPID=$!
           sleep 1
           if kill -0 "$TPID" 2>/dev/null; then
-            curl -s -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time 8 -o /dev/null \
-                 "http://${RTAG}.example.com/" 2>/dev/null || true
+            _socks_connect "$LIVEN" 80 >/dev/null
+            _socks_connect "$DEADN" 80 >/dev/null
             sleep 1
             kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
-            if grep -q "$RTAG" "$SNIFF" 2>/dev/null; then
-              dfail "E5: имя ${RTAG}.example.com засветилось в ОТКРЫТОМ DNS с сервера — хостер видит, какие домены ты открываешь"
-              grep -m2 "$RTAG" "$SNIFF" | sed 's/^/      /'
-            else
-              ok "E5: уникальное имя в открытом DNS с сервера не появилось — резолвинг идёт только внутри DoH"
+
+            CL_LIVE=$(_dns_leak_class "$SNIFF" "$LIVEN")
+            CL_DEAD=$(_dns_leak_class "$SNIFF" "$DEADN")
+
+            case "${CL_LIVE}:${CL_DEAD}" in
+              none:none)
+                ok "E5: ни живое, ни несуществующее имя в системный резолвер не попали — сервер резолвит только своим DoH" ;;
+              none:*)
+                dwarn "E5: живое имя сервер резолвит своим DoH, но НЕСУЩЕСТВУЮЩЕЕ $(_e5_where "$CL_DEAD"). Течёт класс имён, который DoH не разрешил: опечатки, снятые с делегирования домены, всё заблокированное на уровне резолвера" ;;
+              *)
+                dfail "E5: даже ЖИВОЕ имя $(_e5_where "$CL_LIVE") — свой DoH для исходящих соединений сервер не использует, dns-блок в конфиге ни на что не влияет" ;;
+            esac
+            info "Имена теста: живое $LIVEN → $CL_LIVE, несуществующее $DEADN → $CL_DEAD"
+
+            # Печатаем ВЕСЬ дамп по обоим именам. Раньше показывались первые две
+            # строки, а решает вопрос как раз то, что за ними: есть ли пакет с
+            # источником вне петли.
+            if [[ "$CL_LIVE" != "none" || "$CL_DEAD" != "none" ]]; then
+              echo -e "      ${BOLD}Дамп целиком по обоим именам:${NC}"
+              grep -F -e "$LIVEN" -e "$DEADN" "$SNIFF" | sed 's/^/      /'
             fi
           else
             warn "E5: tcpdump не смог слушать — тест пропущен"
@@ -2238,6 +2386,39 @@ diag-fw)
       fail "UFW не активен!"
     fi
 
+    # Открытое правило без слушателя — не защита и не удобство, а лишняя
+    # строка в чужом скане портов. Сверяем разрешённые правила с реальными
+    # слушателями: IPv6-дубли («(v6)» во втором поле) пропускаем, чтобы не
+    # ругаться дважды на одно и то же правило.
+    sep
+    echo -e "${BOLD}Правила UFW без слушателя:${NC}"
+    LTCP=$(ss -tlnH 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' | sort -un)
+    LUDP=$(ss -ulnH 2>/dev/null | awk '{n=split($4,a,":"); print a[n]}' | sort -un)
+    UFW_JUNK=0
+    while read -r uport uproto; do
+      [[ -z "$uport" ]] && continue
+      # Правило без протокола («443 ALLOW») открывает и tcp, и udp — такому
+      # достаточно слушателя в любом из двух списков, иначе будет ложный крик.
+      case "$uproto" in
+        tcp) L="$LTCP" ;;
+        udp) L="$LUDP" ;;
+        *)   L="$LTCP"$'\n'"$LUDP"; uproto="tcp+udp" ;;
+      esac
+      grep -qx "$uport" <<<"$L" || {
+        warn "${uport}/${uproto} открыт, но на этом порту никто не слушает"
+        UFW_JUNK=$((UFW_JUNK + 1))
+      }
+    done < <(ufw status 2>/dev/null \
+             | awk '$2=="ALLOW"{n=split($1,a,"/");
+                     if (a[1] !~ /^[0-9]+$/) next;
+                     if (n==2 && (a[2]=="tcp"||a[2]=="udp")) print a[1], a[2];
+                     else if (n==1) print a[1], "any"}')
+    if [[ "$UFW_JUNK" -eq 0 ]]; then
+      ok "Каждое разрешённое правило соответствует живому слушателю"
+    else
+      info "Убрать: sudo ufw delete allow <порт>/<proto> — и проверить, что SSH при этом остался разрешён"
+    fi
+
     sep
     echo -e "${BOLD}fail2ban:${NC}"
     if systemctl is-active --quiet fail2ban; then
@@ -2360,6 +2541,8 @@ harden)
     _dns_hijack_on && ok "Перехват :53 из тоннеля: включён" || warn "Перехват :53: ВЫКЛЮЧЕН (plain-DNS клиента уходит с VPS как есть)"
     _ngx_mimic_on  && ok "nginx-fallback: mimic (чужой SNI → ответ настоящего сайта)" \
                    || warn "nginx-fallback: strict (чужой SNI → молчаливый обрыв TCP — подпись прокси)"
+    _resolved_dot_on && ok "Системный резолвер: строгий DoT" \
+                     || warn "Системный резолвер: открытый UDP/53 (всё, что попадёт в стаб, видит хостер)"
 
     if [[ "$MODE" == "--check" ]]; then
       sep; info "Режим --check: ничего не изменено. Применить: ${BOLD}sudo xm harden${NC}"; exit 0
@@ -2375,7 +2558,14 @@ harden)
         fail "Откат конфига не удался — восстанови вручную: xm restore"; exit 1
       fi
       _ngx_fallback_mode strict && ok "nginx-fallback вернулся в strict"
-      warn "DNS снова резолвится системным резолвером хостера — открытым текстом"
+      if [[ -f "$RESOLVED_DROPIN" ]]; then
+        rm -f "$RESOLVED_DROPIN"; systemctl restart systemd-resolved 2>/dev/null
+        ok "systemd-resolved: наш DoT-drop-in убран"
+      fi
+      if _ngx_resolver_public && nginx -t &>/dev/null && systemctl reload nginx; then
+        ok "nginx-fallback: resolver вернулся на 1.1.1.1 8.8.8.8"
+      fi
+      warn "DNS снова резолвится открытым текстом — и системный, и nginx"
       exit 0
     fi
 
@@ -2399,7 +2589,59 @@ harden)
     fi
     info "Доступно резолверов: $DOH_OK из ${#DOH_IPS[@]} — этого достаточно"
 
-    # ── 2. Стратегия адресов под фактический стек VPS ───────────────────────
+    # ── 2. Системный резолвер и его потребители ─────────────────────────────
+    # Почему это в harden, который «про путь VPN»: замерено, что в системный
+    # резолвер попадают в том числе имена, пришедшие из тоннеля (см. E5).
+    # Пока стаб ходит открытым UDP, каждое такое попадание — имя на проводе,
+    # и никакой dns-блок внутри Xray этого не отменяет.
+    sep
+    echo -e "${BOLD}Шаг 2: системный резолвер и его потребители${NC}"
+    if ! command -v resolvectl &>/dev/null; then
+      warn "systemd-resolved не найден — шаг пропущен, системный резолвинг остаётся открытым"
+    elif _resolved_dot_on; then
+      ok "systemd-resolved уже DNSOverTLS=yes — не трогаю"
+    else
+      RBAK=""
+      if [[ -f "$RESOLVED_DROPIN" ]]; then
+        RBAK="${RESOLVED_DROPIN}.bak_$(date +%Y%m%d_%H%M%S)"; cp "$RESOLVED_DROPIN" "$RBAK"
+      fi
+      mkdir -p "$(dirname "$RESOLVED_DROPIN")"
+      # FallbackDNS пустой — обязателен. С непустым resolved при недоступном
+      # :853 молча уходит в открытый UDP: та же утечка, но уже без признаков.
+      cat > "$RESOLVED_DROPIN" <<'RESOLVEDEOF'
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net
+FallbackDNS=
+DNSOverTLS=yes
+Domains=~.
+RESOLVEDEOF
+      systemctl restart systemd-resolved 2>/dev/null; sleep 1
+      if _resolved_dot_on && resolvectl query example.com &>/dev/null; then
+        ok "systemd-resolved: DNSOverTLS=yes, апстримы 1.1.1.1 и 9.9.9.9 по :853"
+      else
+        fail "DoT не поднялся (хостер режет :853?) — откат этого шага"
+        if [[ -n "$RBAK" ]]; then cp "$RBAK" "$RESOLVED_DROPIN"; else rm -f "$RESOLVED_DROPIN"; fi
+        systemctl restart systemd-resolved 2>/dev/null
+        warn "Системный резолвинг остаётся открытым; остальные шаги harden продолжаю"
+      fi
+    fi
+
+    # Правим resolver в nginx только когда стабу есть чем ответить: иначе
+    # fallback перестанет находить апстрим, и зонд получит обрыв вместо сайта.
+    if [[ -f /etc/nginx/stream-enabled/reality-fallback.conf ]]; then
+      if ! resolvectl query example.com &>/dev/null; then
+        warn "Системный резолвер не отвечает — resolver в nginx не трогаю"
+      elif ! _ngx_resolver_local; then
+        ok "nginx-fallback: resolver уже локальный — не трогаю"
+      elif nginx -t &>/dev/null && systemctl reload nginx; then
+        ok "nginx-fallback: resolver → 127.0.0.53 valid=300s, открытых запросов к 1.1.1.1/8.8.8.8 больше нет"
+      else
+        fail "nginx -t не прошёл после правки resolver — откат"
+        _ngx_resolver_public; nginx -t &>/dev/null && systemctl reload nginx
+      fi
+    fi
+
+    # ── 3. Стратегия адресов под фактический стек VPS ───────────────────────
     # Если у VPS нет IPv6, AAAA-ответы бесполезны: клиент получит адрес,
     # до которого сервер не дойдёт → «сайт не открывается через VPN».
     if _has_ipv6; then
@@ -2408,9 +2650,9 @@ harden)
       QS="UseIPv4"; DS="UseIPv4"; info "IPv6 на VPS нет → queryStrategy=UseIPv4 (без бесполезных AAAA)"
     fi
 
-    # ── 3. Патч конфига с проверкой и откатом ───────────────────────────────
+    # ── 4. Патч конфига с проверкой и откатом ───────────────────────────────
     sep
-    echo -e "${BOLD}Шаг 2: конфиг Xray${NC}"
+    echo -e "${BOLD}Шаг 3: конфиг Xray${NC}"
     HBAK=$(_backup_config before_harden); ok "Бэкап: $HBAK"
 
     _harden_restore() {
@@ -2444,9 +2686,9 @@ harden)
     fi
     ok "Xray перезапущен"
 
-    # ── 4. Живая проверка: не сломали ли резолвинг ──────────────────────────
+    # ── 5. Живая проверка: не сломали ли резолвинг ──────────────────────────
     sep
-    echo -e "${BOLD}Шаг 3: живая проверка через свой же тоннель${NC}"
+    echo -e "${BOLD}Шаг 4: живая проверка через свой же тоннель${NC}"
     if _tunnel_up xhttp; then
       CODE=$(_tunnel_code "https://api.ipify.org")
       _tunnel_down
@@ -2463,9 +2705,9 @@ harden)
       warn "Локальный клиент не поднялся — живую проверку пропускаю (проверь: sudo xm selftest)"
     fi
 
-    # ── 5. nginx mimic ──────────────────────────────────────────────────────
+    # ── 6. nginx mimic ──────────────────────────────────────────────────────
     sep
-    echo -e "${BOLD}Шаг 4: поведение fallback на чужой SNI${NC}"
+    echo -e "${BOLD}Шаг 5: поведение fallback на чужой SNI${NC}"
     if _ngx_mimic_on; then
       ok "Уже в режиме mimic — ничего не меняю"
     elif _ngx_fallback_mode mimic; then
@@ -2854,8 +3096,15 @@ neighbors)
     FOUND_UNIT=0
     for u in /etc/systemd/system/*.service; do
       n=$(basename "$u")
+      # Симлинк здесь — это алиас или enable-ссылка на юнит ИЗ ПАКЕТА:
+      # sshd→ssh, syslog→rsyslog, chronyd→chrony, dbus-org.freedesktop.*,
+      # iscsi, systemd-timesyncd. Соседом это не является, а в списке из
+      # десятка таких строк тонут настоящие соседи. Отличаем по -L.
+      [[ -L "$u" ]] && continue
       case "$n" in
-        xray.service|xray-sni-watch.service) info "$n — наш" ;;
+        # xray@.service — шаблонный юнит официального установщика Xray,
+        # ставится вместе с xray.service и тоже наш.
+        xray.service|xray@*.service|xray-sni-watch.service) info "$n — наш" ;;
         *) warn "$n — ЧУЖОЙ ($(systemctl is-active "$n" 2>/dev/null))" ;;
       esac
       FOUND_UNIT=1
