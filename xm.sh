@@ -16,6 +16,7 @@
 #   Инфо:        info / paths / uuid / pubkey
 #   Анти-DPI:    harden [--check|--off] / pq status|on|off
 #   Соседи:      neighbors — что ещё живёт на сервере и что трогает xm
+#   DNS-утечки:  dns-watch [секунд] — кто шлёт открытый DNS, с атрибуцией
 #   Диагностика: diag / diag-dpi [--quick] / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
 # =============================================================================
 
@@ -3052,6 +3053,111 @@ self-update)
 # Нужно, когда VPN стоит не на выделенной машине, а рядом с чем-то своим.
 # Показывает чужие сервисы и — главное — что именно трогает каждая команда xm,
 # чтобы не выяснять это методом «запустил и посмотрел, что отвалилось».
+dns-watch)
+    # Пассивный поиск открытого DNS с этой машины, с атрибуцией источника.
+    # Зачем отдельная команда, если E5 в diag-dpi что-то ловит попутно: у E5
+    # окно в три секунды, привязанное к его собственным запросам, и молчание
+    # там не значит ничего. Утечку соседа — контейнера, забытого демона,
+    # приложения со своим resolver — видно только на нормальном окне.
+    #
+    # Атрибуции две, потому что источники бывают двух разных видов:
+    #   локальный процесс — пакет идёт через OUTPUT, и iptables --log-uid
+    #     ставит на него UID владельца сокета;
+    #   контейнер — пакет форвардится, владельца у него нет вовсе, зато адрес
+    #     источника принадлежит docker-сети, и по нему находится имя.
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm dns-watch [секунд]${NC}"; exit 1; }
+    command -v tcpdump &>/dev/null || { fail "Нужен tcpdump: sudo apt install -y tcpdump"; exit 1; }
+    DW_SECS="${2:-60}"
+    [[ "$DW_SECS" =~ ^[0-9]+$ ]] || { fail "Использование: sudo xm dns-watch [секунд]"; exit 1; }
+
+    echo -e "\n${BOLD}${CYAN}[ Открытый DNS с этой машины — кто и куда ]${NC}\n"
+    _resolved_dot_on \
+      && ok "Системный резолвер на строгом DoT: что ушло в 127.0.0.53, на проводе не в открытом виде" \
+      || warn "Системный резолвер без DoT: что ушло в 127.0.0.53, через миллисекунду будет на проводе"
+
+    DW_CAP=$(mktemp /tmp/xm-dnswatch.XXXXXX)
+    DW_RULE=0
+    if iptables -I OUTPUT -p udp --dport 53 -j LOG --log-prefix "XMDNS " --log-uid 2>/dev/null; then
+      DW_RULE=1
+    else
+      warn "iptables не дал повесить метку UID — локальные процессы будут без UID"
+    fi
+    # trap, а не удаление в конце: иначе прерванная по Ctrl-C команда оставила
+    # бы в OUTPUT правило, которое пишет в лог ядра каждый DNS-запрос машины.
+    _dw_cleanup() {
+      [[ "$DW_RULE" -eq 1 ]] && \
+        iptables -D OUTPUT -p udp --dport 53 -j LOG --log-prefix "XMDNS " --log-uid 2>/dev/null
+      rm -f "$DW_CAP"
+    }
+    trap _dw_cleanup EXIT INT TERM
+
+    DW_T0=$(date '+%Y-%m-%d %H:%M:%S')
+    info "Слушаю ${DW_SECS} с. Чем больше реального трафика в это время, тем полнее картина."
+    timeout "$DW_SECS" tcpdump -lnn -i any -s 256 'port 53' >"$DW_CAP" 2>/dev/null
+
+    # Ключ — пара «адрес источника + порт», а не один порт: у форвардящегося
+    # пакета контейнера владельца нет, но после NAT он выходит с адреса хоста,
+    # и по одному лишь совпадению порта ему приписался бы чужой UID.
+    DW_UIDMAP=$(journalctl -k --since "$DW_T0" 2>/dev/null \
+                | sed -n 's/.*XMDNS .*SRC=\([0-9.]*\) .*SPT=\([0-9]*\) .*UID=\([0-9]*\).*/\1|\2 \3/p' \
+                | sort -u)
+    DW_CMAP=""
+    if command -v docker &>/dev/null; then
+      DW_CMAP=$(docker ps -q 2>/dev/null \
+                | xargs -r docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}{{.Name}}' 2>/dev/null \
+                | awk '{n=$NF; sub(/^\//,"",n); for(i=1;i<NF;i++) if ($i != "") print $i, n}')
+    fi
+
+    # Дедупликация по источнику и DNS-ID: при -i any один и тот же пакет виден
+    # на veth, на мосте и на eth0 после NAT, и без неё счётчик врёт втрое.
+    DW_ROWS=$(awk '$2=="IP"||$2=="IP6"{
+                     dst=$5; sub(/:$/,"",dst); if (dst !~ /\.53$/) next
+                     src=$3; sport=src; sub(/.*\./,"",sport); sub(/\.[0-9]+$/,"",src)
+                     nm=""
+                     for (i=1;i<=NF;i++) if ($i ~ /^[A-Z0-9]+\?$/) { nm=$(i+1); sub(/\.$/,"",nm); break }
+                     id=$6; sub(/\+.*$/,"",id)
+                     k=src"|"id"|"nm; if (k in seen) next; seen[k]=1
+                     if (src ~ /^127\./ || src=="::1") { loop++; next }
+                     cnt[src]++
+                     if (!(src in port)) port[src]=sport
+                     if (nm != "" && !(src in ex)) ex[src]=nm
+                   }
+                   END{ printf "LOOP|%d\n", loop+0
+                        for (s in cnt) printf "WIRE|%s|%d|%s|%s\n", s, cnt[s], port[s], ex[s] }' "$DW_CAP")
+
+    sep
+    DW_LOOP=0; DW_N=0
+    while IFS='|' read -r dwtag dwsrc dwcnt dwport dwname; do
+      case "$dwtag" in
+        LOOP) DW_LOOP="$dwsrc" ;;
+        WIRE)
+          DW_N=$((DW_N + 1))
+          dwwho=""
+          dwcont=$(awk -v ip="$dwsrc" '$1==ip{print $2; exit}' <<< "$DW_CMAP")
+          if [[ -n "$dwcont" ]]; then
+            # Совпал адрес контейнера — значит пакет форвардился и владельца
+            # у него нет. UID тут искать нечего, любой найденный будет чужим.
+            dwwho="контейнер $dwcont"
+          else
+            dwuid=$(awk -v k="${dwsrc}|${dwport}" '$1==k{print $2; exit}' <<< "$DW_UIDMAP")
+            [[ -n "$dwuid" ]] && dwwho="UID $dwuid ($(getent passwd "$dwuid" 2>/dev/null | cut -d: -f1))"
+          fi
+          fail "$dwsrc — $dwcnt запр. открытым текстом${dwname:+ (напр. $dwname)}${dwwho:+  —  $dwwho}"
+          ;;
+      esac
+    done <<< "$DW_ROWS"
+
+    if [[ "$DW_N" -eq 0 ]]; then
+      ok "За ${DW_SECS} с открытых DNS-запросов с машины не ушло"
+      info "Это не гарантия: источник мог просто промолчать. Для уверенности возьми окно побольше."
+    else
+      echo
+      warn "Каждая строка выше — доменное имя, ушедшее с этого IP открытым текстом"
+      info "Источник из docker-сети — это контейнер: ему подсовывается внешний резолвер, потому что 127.0.0.53 из его namespace недостижим. Перевод стаба на DoT такие запросы не покрывает."
+    fi
+    info "В локальный резолвер (127.0.0.53) за это время ушло запросов: $DW_LOOP"
+    ;;
+
 neighbors)
     [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm neighbors${NC}"; exit 1; }
     echo -e "\n${BOLD}${CYAN}[ Соседи по серверу ]${NC}\n"
@@ -3216,6 +3322,7 @@ neighbors)
     echo -e "  ${GREEN}xm reality-debug on|off${NC}          Почему REALITY отказывает (авто-off 15 мин)"
     echo -e "  ${GREEN}xm diag${NC}                          Полная диагностика"
     echo -e "  ${GREEN}xm neighbors${NC}                     Кто ещё живёт на сервере и что трогает xm"
+    echo -e "  ${GREEN}xm dns-watch [секунд]${NC}            Кто на машине шлёт открытый DNS (UID + контейнер)"
     echo    "  Прочее: pubkey / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log"
     ;;
 esac
