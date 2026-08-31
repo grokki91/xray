@@ -646,8 +646,9 @@ apt-get update -qq
 apt-get install -y --no-install-recommends \
   -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
   curl wget unzip uuid-runtime openssl ufw \
-  nginx libnginx-mod-stream fail2ban jq python3 python3-cryptography \
-  chrony qrencode unattended-upgrades
+  nginx libnginx-mod-stream libnginx-mod-http-headers-more-filter \
+  fail2ban jq python3 python3-cryptography \
+  chrony qrencode unattended-upgrades tcpdump
 # python3-cryptography: нужен _derive_pubkey в xm.sh (xm pubkey, xm diag [3b],
 # вычисление publicKey из privateKey). Без него ключи считать нечем — остаётся
 # только фолбэк на client-info.txt, который расходится после ручных правок.
@@ -655,6 +656,12 @@ apt-get install -y --no-install-recommends \
 # libnginx-mod-stream: TCP/stream-модуль nginx — нужен для настоящего
 # REALITY-fallback (ssl_preread + proxy_protocol). Пакет сам включает модуль
 # через /etc/nginx/modules-enabled/*.conf.
+# libnginx-mod-http-headers-more-filter: без него nginx не умеет менять
+# заголовок Server. `server_tokens off` убирает только ВЕРСИЮ, само слово
+# nginx остаётся — и наш :80 отвечает "Server: nginx" там, где домен-маска
+# отвечает своим именем. Одного `curl -I` хватает, чтобы увидеть отличие.
+# tcpdump: нужен живому тесту утечки DNS (xm diag-dpi, тест E5). Без него
+# тест молча пропускается, и утечка остаётся незамеченной.
 success "Зависимости установлены"
 
 # =============================================================================
@@ -939,15 +946,62 @@ chown -R www-data:www-data /var/www/fallback
 
 # --- HTTP vhost: только :80 → 301 (обычное поведение веб-сервера) -------------
 # Прежний внутренний vhost на :8080 удалён: в тракт REALITY он не входил.
+# [FIX-17] :80 больше не выдаёт себя заголовками.
+#
+# ЧТО БЫЛО НЕ ТАК (замерено на живом сервере одним `curl -I`):
+#   Server: nginx                    ← домен-маска отвечает своим именем
+#   Location: https://203.0.113.10/    ← редирект НА СОБСТВЕННЫЙ IP
+# Вторая строка хуже первой: на голый IP не редиректит ни один настоящий сайт.
+# Это прямое заявление «за этим адресом нет виртуалхоста», то есть ровно тот
+# вывод, который мы прячем на :443 всей конструкцией с REALITY и mimic.
+# `server_tokens off` тут не помогает — он убирает только версию, слово nginx
+# остаётся. Значение Server берём с ЖИВОГО домена-маски, а не выдумываем.
+# ВАЖНО: скрипт идёт под `set -euo pipefail`, а grep без совпадения возвращает
+# 1 и роняет весь конвейер. Домен-маска вполне может не отдать Server —
+# это не повод обрывать установку, поэтому каждый шаг гасится явно.
+DEST_SRV=""
+for scheme in https http; do
+  DEST_SRV=$( { curl -sI --max-time 8 "${scheme}://${DEST_SNI}/" 2>/dev/null || true; } \
+             | { grep -im1 '^server:' || true; } | tr -d '\r' \
+             | sed 's/^[Ss]erver:[[:space:]]*//') || DEST_SRV=""
+  [[ -n "$DEST_SRV" ]] && break || true
+done
+# Санитайзер: значение уходит в конфиг nginx через sed, поэтому всё, кроме
+# безобидного набора символов, отбрасываем целиком.
+[[ "$DEST_SRV" =~ ^[A-Za-z0-9._/\ -]{1,64}$ ]] || DEST_SRV=""
+
+if [[ -n "$DEST_SRV" ]] && grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null; then
+  NGX_SRV_LINE="more_set_headers \"Server: __DEST_SRV__\";"
+  info "Заголовок Server на :80 будет «$DEST_SRV» — как у $DEST_SNI"
+else
+  NGX_SRV_LINE="# headers-more недоступен — Server остаётся nginx (см. xm diag-dpi, тест B7)"
+  [[ -z "$DEST_SRV" ]] \
+    && warn "Не удалось прочитать Server у $DEST_SNI — заголовок не маскирую" \
+    || warn "Модуль headers-more не найден — заголовок Server не маскируется"
+fi
+
 cat > /etc/nginx/sites-available/fallback <<'NGINXEOF'
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
     server_tokens off;
-    return 301 https://$host$request_uri;
+    __NGX_SRV_LINE__
+
+    # Редирект на ИМЯ домена-маски, а не на $host. При запросе по IP $host
+    # равен IP, и Location получался вида https://<наш IP>/ — подпись сервера
+    # без сайта. Теперь ответ совпадает с тем, что отдаёт настоящий сайт.
+    return 301 https://__DEST_SNI__$request_uri;
+
+    # Лог выключен намеренно. Здесь копились адреса всех, кто трогал :80
+    # (29565 строк на живом сервере), а ценности в них нет: зонды видны в
+    # reality_fallback.log, свои клиенты на :80 вообще не ходят.
+    access_log off;
 }
 NGINXEOF
+
+sed -i "s|__NGX_SRV_LINE__|${NGX_SRV_LINE}|; s/__DEST_SRV__/${DEST_SRV}/; s/__DEST_SNI__/${DEST_SNI}/" \
+  /etc/nginx/sites-available/fallback
 
 rm -f /etc/nginx/sites-enabled/default
 ln -sf /etc/nginx/sites-available/fallback /etc/nginx/sites-enabled/fallback
@@ -1358,7 +1412,13 @@ jq -n \
       ]
     },
     policy: {
-      levels: { "0": { handshake: 4, connIdle: 300, uplinkOnly: 2, downlinkOnly: 5, bufferSize: 512 } },
+      # handshake=8, а не дефолтные 4. В это окно входит НЕ только TLS с
+      # клиентом: REALITY на каждое входящее соединение сам дозванивается до
+      # dest, а dest у нас — внешний CDN через nginx, задан именем и
+      # резолвится в рантайме. Замерено на живом сервере: при холодном
+      # резолвере первое соединение до dest заняло 10.0 с, при тёплом — 0.02 с.
+      # С handshake=4 клиент, попавший в холодный кэш, просто не войдёт.
+      levels: { "0": { handshake: 8, connIdle: 300, uplinkOnly: 2, downlinkOnly: 5, bufferSize: 512 } },
       system: { statsInboundUplink: false, statsInboundDownlink: false }
     }
   }' > "$XRAY_CONFIG"
@@ -1603,6 +1663,25 @@ if ! $SELFTEST_OK; then
 fi
 
 # =============================================================================
+# 14c. СТАБИЛЬНОСТЬ: сетевой стек + watchdog
+#
+# Ставится ПОСЛЕ selftest намеренно: xm tune поднимает таймер, который умеет
+# перезапускать xray и nginx. Пока установка не дошла до рабочего состояния,
+# такой помощник только мешал бы разбору.
+#
+# Реализация живёт в xm.sh (_tune_write / _wd_install), здесь только вызов —
+# чтобы профиль был в одном месте и `xm tune --off` откатывал ровно то, что
+# поставила установка.
+# =============================================================================
+header "Стабильность: сетевой стек и watchdog"
+
+if command -v xm &>/dev/null; then
+  xm tune || warn "xm tune отработал с замечаниями — проверь: sudo xm tune --check"
+else
+  warn "xm недоступен — сетевой профиль не применён. Позже: sudo xm tune"
+fi
+
+# =============================================================================
 # 15. (перенесено выше — см. блок перед секцией 13)
 # [FIX-13] xm ставится ДО запуска сервиса: при падении на старте Xray скрипт
 # выходит по set -e, и раньше xm просто не успевал установиться — диагностика
@@ -1762,6 +1841,7 @@ else
 fi
 echo ""
 echo -e "${YELLOW}Устойчивость к DPI:  ${BOLD}xm diag-dpi${NC}"
+echo -e "${YELLOW}Стабильность:        ${BOLD}xm tune --check${NC}  (счётчики потерь, watchdog)"
 echo -e "${YELLOW}Диагностика сервера: ${BOLD}xm diag${NC}"
 echo -e "${YELLOW}Данные клиента:      ${BOLD}cat $CLIENT_FILE${NC}"
 echo -e "${YELLOW}QR-коды повторно:    ${BOLD}xm qr${NC}  |  Оба: ${BOLD}xm qr --both${NC}"

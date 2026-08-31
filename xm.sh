@@ -15,6 +15,7 @@
 #   Логи:        log / log-live / log-clear
 #   Инфо:        info / paths / uuid / pubkey
 #   Анти-DPI:    harden [--check|--off] / pq status|on|off
+#   Стабильность: tune [--check|--off] / watchdog on|off|now|status
 #   Соседи:      neighbors — что ещё живёт на сервере и что трогает xm
 #   Диагностика: diag / diag-dpi [--quick] / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
 # =============================================================================
@@ -540,6 +541,77 @@ _ngx_resolver_public() {
   return $rc
 }
 
+# :80 — привести заголовки к тому, что отдаёт домен-маска.
+#
+# ПОЧЕМУ ЭТО АНТИ-DPI, А НЕ КОСМЕТИКА: на :443 мы отдаём чужой валидный
+# сертификат и совпадаем с настоящим сайтом по всем зондам. А :80 рядом
+# отвечал `Server: nginx` и `Location: https://<наш IP>/`. Редирект на голый
+# IP — то, чего не делает ни один сайт: он сообщает сканеру, что виртуалхоста
+# здесь нет, и обесценивает всю маскировку соседнего порта. Одного `curl -I`
+# достаточно. Проверка: xm diag-dpi, тест B7.
+#
+# Правим ТОЧЕЧНО, sed по конкретным директивам: файл мог быть отредактирован
+# руками, и перезапись целиком снесла бы чужие правки.
+_ngx_http80_fix() {
+  local f="/etc/nginx/sites-available/fallback" sni srv cur_srv bak changed=1
+  [[ -f "$f" ]] || { warn "$f не найден — :80 не трогаю"; return 1; }
+  sni=$(_get_nginx_sni)
+  [[ -z "$sni" ]] && { warn "Не читается домен-маска — :80 не трогаю"; return 1; }
+
+  mkdir -p "$BACKUP_DIR"
+  bak="$BACKUP_DIR/fallback_$(date +%Y%m%d_%H%M%S).conf.bak"
+  cp "$f" "$bak"
+
+  # 1. Цель редиректа. Сравниваем с ИТОГОВЫМ желаемым видом, а не ищем $host:
+  # один и тот же код чинит и исходный конфиг (там https://$host), и ситуацию
+  # xm set-sni, где надо заменить один домен на другой. Идемпотентно по
+  # значению: если строка уже правильная, sed вообще не запускается.
+  local sni_esc; sni_esc=$(printf '%s' "$sni" | sed 's/[].[^$*\/]/\\&/g')
+  if ! grep -qE "^[[:space:]]*return[[:space:]]+301[[:space:]]+https://${sni_esc}\\\$request_uri;" "$f"; then
+    sed -i -E "s|^([[:space:]]*)return[[:space:]]+301[[:space:]]+https://[^;]*;|\1return 301 https://${sni}\$request_uri;|" "$f"
+    changed=0
+  fi
+
+  # 2. Server: значение берём с ЖИВОГО домена-маски, не выдумываем. Если строка
+  # уже есть, но домен сменился — обновляем, иначе останется имя чужого сайта.
+  if grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null; then
+    for scheme in https http; do
+      srv=$(curl -sI --max-time 8 "${scheme}://${sni}/" 2>/dev/null \
+            | grep -im1 '^server:' | tr -d '\r' | sed 's/^[Ss]erver:[[:space:]]*//')
+      [[ -n "$srv" ]] && break
+    done
+    if [[ "$srv" =~ ^[A-Za-z0-9._/\ -]{1,64}$ ]]; then
+      cur_srv=$(grep -oE 'more_set_headers[[:space:]]+"Server:[^"]*"' "$f" | head -1 | sed -E 's|.*Server:[[:space:]]*||; s|"$||')
+      if [[ -z "$cur_srv" ]]; then
+        sed -i -E "s|^([[:space:]]*)server_tokens[[:space:]]+off;|\\1server_tokens off;\\n\\1more_set_headers \"Server: ${srv}\";|" "$f"
+        changed=0
+      elif [[ "$cur_srv" != "$srv" ]]; then
+        sed -i -E "s|more_set_headers[[:space:]]+\"Server:[^\"]*\"|more_set_headers \"Server: ${srv}\"|" "$f"
+        changed=0
+      fi
+    else
+      warn "Не удалось прочитать Server у $sni — заголовок оставляю как есть"
+    fi
+  else
+    warn "Модуль headers-more не установлен: sudo apt install -y libnginx-mod-http-headers-more-filter"
+    warn "Без него :80 продолжит отвечать «Server: nginx» вместо имени домена-маски"
+  fi
+
+  # 3. access_log: адреса всех, кто трогал :80, копились без пользы.
+  if ! grep -qE '^[[:space:]]*access_log[[:space:]]+off;' "$f"; then
+    sed -i -E "s|^([[:space:]]*)server_tokens[[:space:]]+off;|\\1server_tokens off;\\n\\1access_log off;|" "$f"
+    changed=0
+  fi
+
+  [[ "$changed" -ne 0 ]] && { rm -f "$bak"; return 2; }
+  if nginx -t &>/dev/null && systemctl reload nginx; then
+    return 0
+  fi
+  fail "nginx -t не прошёл после правки :80 — откат"
+  cp "$bak" "$f"; nginx -t &>/dev/null && systemctl reload nginx
+  return 1
+}
+
 # _ngx_fallback_mode <mimic|strict> — правит и живой конфиг, и шаблон
 # (из шаблона регенерируется конфиг при xm set-sni), проверяет и перезагружает.
 _ngx_fallback_mode() {
@@ -566,6 +638,212 @@ _ngx_fallback_mode() {
   fi
   systemctl reload nginx || { fail "nginx reload не удался — откат"; cp "$bak" "$conf"; systemctl reload nginx; return 1; }
   return 0
+}
+
+# ─── Стабильность: sysctl-профиль и watchdog ─────────────────────────────────
+#
+# ЗАЧЕМ ОТДЕЛЬНО ОТ harden: harden закрывает утечки, tune чинит обрывы.
+# Замерено на живом сервере (51 день аптайма): TcpRetransSegs 1.9 млн при
+# 24.8 млн TX-пакетов — 7.7% ретрансмитов; TcpExtTCPTimeouts 1.38 млн;
+# TcpExtListenOverflows 776 и ListenDrops 1156 — соединения терялись молча
+# в очереди accept, ещё ДО того как их видел Xray. Никакой правкой конфига
+# Xray это не лечится: проблема ниже, в стеке ядра.
+#
+# ЧЕГО ЗДЕСЬ СОЗНАТЕЛЬНО НЕТ — и это часть анти-DPI, а не экономия:
+#   · tcp_fastopen=3 (серверный TFO) — редкость в вебе; включив, мы начинаем
+#     отличаться от домена-маски на уровне TCP, ещё до всякого TLS;
+#   · tcp_timestamps=0 — тоже отличие от типового сервера, плюс ломает PAWS;
+#   · нестандартный initcwnd/initrwnd — уникальный размер первого окна
+#     это стабильная подпись, по которой сервер узнаётся между сессиями.
+# Устойчивость к DPI дороже пары процентов скорости.
+SYSCTL_FILE="/etc/sysctl.d/99-xray-tune.conf"
+WATCHDOG_SVC="/etc/systemd/system/xray-watchdog.service"
+WATCHDOG_TIMER="/etc/systemd/system/xray-watchdog.timer"
+
+_tune_on() { [[ -f "$SYSCTL_FILE" ]]; }
+
+# Профиль пишется целиком, идемпотентно. nf_conntrack_max выставляется
+# отдельно: модуль может быть не загружен, и тогда sysctl -p ругается на весь
+# файл сразу, а не на одну строку.
+_tune_write() {
+  cat > "$SYSCTL_FILE" <<'SYSCTLEOF'
+# Профиль стабильности VPN. Создан xm tune. Откат: sudo xm tune --off
+# Значения подобраны под VPS 1-2 vCPU с клиентами на мобильных сетях.
+
+# BBR + fq: при потерях 2-5% (типичный мобильный интернет) CUBIC режет окно
+# вдвое на каждой потере, BBR держит скорость. Фиксируем явно, чтобы профиль
+# был самодостаточным, даже если кто-то откатит настройки хостера.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+# Буферы. Дефолт 212992 (208 КБ) рассчитан на LAN. При RTT 80-250 мс до
+# клиента столько окна не хватает, и канал простаивает вместо передачи.
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.ipv4.tcp_rmem = 4096 262144 16777216
+net.ipv4.tcp_wmem = 4096 262144 16777216
+
+# Очередь accept. Замерены ListenOverflows — это соединения, где SYN прошёл,
+# а accept не успел: клиент считает, что подключился, сервер молча выбросил.
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.netdev_max_backlog = 16384
+
+# PMTU blackhole — главная причина «подключилось, но ничего не грузится» на
+# мобильных сетях: пакеты в 1500 б не проходят, а ICMP Too Big режется, и
+# соединение висит насмерть. С probing ядро само нащупывает рабочий MTU.
+net.ipv4.tcp_mtu_probing = 1
+
+# Не сбрасывать окно после простоя: иначе каждое возвращение из idle
+# (телефон в кармане) начинается с медленного старта заново.
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# Мобильные клиенты пропадают без FIN. Держать их часами — впустую занятые
+# сокеты; 10 мин до первой пробы и 5 проб по 30 с — разумный компромисс.
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 15
+
+# Сервер сам инициирует исходящее соединение на каждый запрос клиента —
+# дефолтные ~28 тыс. портов кончаются быстрее, чем истекает TIME_WAIT.
+net.ipv4.ip_local_port_range = 10240 65535
+net.ipv4.tcp_tw_reuse = 1
+
+# Замерены UdpRcvbufErrors — потерянные UDP-датаграммы (DNS и QUIC).
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+SYSCTLEOF
+  chmod 644 "$SYSCTL_FILE"
+}
+
+# Применение с отчётом: sysctl -p печатает только то, что принял.
+_tune_apply() {
+  local out rc=0
+  out=$(sysctl -p "$SYSCTL_FILE" 2>&1) || rc=1
+  printf '%s\n' "$out" | grep -vE '^\s*$' | sed 's/^/      /'
+  # conntrack отдельно и без фатальности: на VPS без загруженного модуля
+  # nf_conntrack этой переменной просто нет, и это не ошибка.
+  if [[ -w /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    sysctl -w net.netfilter.nf_conntrack_max=262144 >/dev/null 2>&1 \
+      && ok "nf_conntrack_max = 262144" || true
+  fi
+  return $rc
+}
+
+# Счётчики, по которым видно потери ДО Xray. Все накопительные с загрузки,
+# поэтому смысл имеет доля, а не абсолют: 1.9 млн ретрансмитов сами по себе
+# ничего не значат, 7.7% от отправленного — значат много.
+_tune_counters() {
+  local retr tx to lo ld udperr pct
+  retr=$(nstat -az TcpRetransSegs      2>/dev/null | awk 'NR==2{print $2}')
+  tx=$(nstat -az   TcpOutSegs          2>/dev/null | awk 'NR==2{print $2}')
+  to=$(nstat -az   TcpExtTCPTimeouts   2>/dev/null | awk 'NR==2{print $2}')
+  lo=$(nstat -az   TcpExtListenOverflows 2>/dev/null | awk 'NR==2{print $2}')
+  ld=$(nstat -az   TcpExtListenDrops   2>/dev/null | awk 'NR==2{print $2}')
+  udperr=$(nstat -az UdpRcvbufErrors   2>/dev/null | awk 'NR==2{print $2}')
+
+  local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  if [[ -n "${retr:-}" && -n "${tx:-}" && "${tx:-0}" -gt 0 ]]; then
+    pct=$(awk -v r="$retr" -v t="$tx" 'BEGIN{printf "%.2f", r*100/t}')
+    if   awk -v p="$pct" 'BEGIN{exit !(p<1)}'; then ok   "Ретрансмиты: ${pct}% (${retr} из ${tx}) — норма"
+    elif awk -v p="$pct" 'BEGIN{exit !(p<3)}'; then warn "Ретрансмиты: ${pct}% — заметные потери на пути к клиентам"
+    elif [[ "$cc" == "bbr" ]]; then
+      # BBR уже стоит, а потери всё равно высокие — значит дело не в
+      # алгоритме. Обычно это либо реальные потери на последней миле у
+      # клиентов (мобильный интернет), либо PMTU blackhole: пакеты полного
+      # размера не проходят, ICMP Too Big режется, и ядро молча ретранслирует.
+      fail "Ретрансмиты: ${pct}% при уже включённом BBR — алгоритм ни при чём. Проверь MTU probing ниже и учти, что часть потерь может быть на стороне клиентских сетей"
+    else
+      fail "Ретрансмиты: ${pct}% при cc=${cc:-?} — на потерях CUBIC режет окно вдвое каждый раз. Включи BBR: ${BOLD}sudo xm tune${NC}"
+    fi
+  fi
+  [[ -n "${to:-}" ]] && info "TCP-таймауты: ${to}"
+  if [[ "${lo:-0}" -gt 0 || "${ld:-0}" -gt 0 ]]; then
+    warn "Очередь accept переполнялась: overflows=${lo:-0}, drops=${ld:-0} — это молча потерянные подключения"
+  else
+    ok "Очередь accept не переполнялась"
+  fi
+  [[ "${udperr:-0}" -gt 0 ]] && warn "UDP-датаграмм потеряно по буферу: ${udperr}" \
+                             || ok "UDP-буфер без потерь"
+  info "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null), qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  info "MTU probing: $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null) (нужен 1 — иначе мобильные клиенты виснут на PMTU blackhole)"
+}
+
+# ─── Watchdog ────────────────────────────────────────────────────────────────
+#
+# ЗАЧЕМ: REALITY дозванивается до dest на КАЖДОЕ входящее соединение, а dest
+# в nginx задан ИМЕНЕМ и резолвится в рантайме. Значит сдохший резолвинг = сдохший
+# VPN, причём сразу для всех. Замерено на живом сервере, /var/log/nginx/
+# reality_fallback_error.log:
+#   "www.cloudflare.com could not be resolved (110: Operation timed out)"
+# шесть раз подряд — всё это время сервер принимал TCP и рвал соединение,
+# то есть выдавал ровно ту подпись прокси, ради ухода от которой сделан mimic.
+# Xray при этом жив, systemd ничего не перезапустит: с его точки зрения всё в
+# порядке. Проверять надо именно сквозной путь, а не статус юнитов.
+_wd_check() {
+  local sni rc=0
+  sni=$(_get_nginx_sni)
+  [[ -z "$sni" ]] && sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG" 2>/dev/null)
+  [[ -z "$sni" ]] && { echo "watchdog: не определить домен-маску — пропуск"; return 0; }
+
+  # 1. Резолвинг dest. Именно то, что упало на живом сервере.
+  if ! getent hosts "$sni" >/dev/null 2>&1; then
+    echo "watchdog: $sni не резолвится — перезапускаю systemd-resolved"
+    systemctl restart systemd-resolved 2>/dev/null || true
+    sleep 2
+    getent hosts "$sni" >/dev/null 2>&1 \
+      && echo "watchdog: резолвинг восстановлен" \
+      || { echo "watchdog: резолвинг всё ещё мёртв"; rc=1; }
+  fi
+
+  # 2. Слушает ли nginx REALITY-fallback. Без него dest мёртв целиком.
+  if ! ss -tln 2>/dev/null | grep -q '127.0.0.1:10443'; then
+    echo "watchdog: fallback :10443 не слушает — перезапускаю nginx"
+    nginx -t >/dev/null 2>&1 && systemctl restart nginx 2>/dev/null || true
+    rc=1
+  fi
+
+  # 3. Слушает ли сам Xray свой порт. Restart=on-failure не ловит случай,
+  # когда процесс жив, но порт потерян.
+  local xport
+  xport=$(jq -r '.inbounds[0].port' "$CONFIG" 2>/dev/null)
+  if [[ -n "$xport" && "$xport" != "null" ]] \
+     && ! ss -tln 2>/dev/null | grep -qE "(^|[^0-9:]):${xport}([^0-9]|$)"; then
+    echo "watchdog: Xray не слушает :${xport} — перезапускаю"
+    systemctl restart xray 2>/dev/null || true
+    rc=1
+  fi
+  return $rc
+}
+
+# Юниты пишутся только при включении. Сообщения уходят в journald и НЕ содержат
+# ни одного клиентского адреса — проверяется в diag-dpi, блок F.
+_wd_install() {
+  cat > "$WATCHDOG_SVC" <<'WDSVCEOF'
+[Unit]
+Description=Xray path watchdog (dest resolve + fallback + listener)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xm watchdog --run
+WDSVCEOF
+  cat > "$WATCHDOG_TIMER" <<'WDTIMEREOF'
+[Unit]
+Description=Run Xray path watchdog every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
+WDTIMEREOF
+  systemctl daemon-reload
+  systemctl enable --now xray-watchdog.timer >/dev/null 2>&1
 }
 
 # ─── ML-DSA-65: post-quantum подпись REALITY ─────────────────────────────────
@@ -878,6 +1156,16 @@ set-sni)
         exit 1
       fi
       systemctl reload nginx && ok "nginx map обновлён и перезагружен: $NEW_SNI"
+
+      # :80 тоже содержит домен-маску — в цели редиректа и в заголовке Server.
+      # Без этого шага после смены домена порт 80 продолжал бы называть старый
+      # сайт, а :443 отдавать сертификат нового: рассинхрон, который сканеру
+      # виден одним запросом и который мы же ловим в diag-dpi (тест B7).
+      case "$(_ngx_http80_fix; echo $?)" in
+        0) ok ":80 обновлён под $NEW_SNI (редирект + Server)" ;;
+        2) ok ":80 уже соответствует $NEW_SNI" ;;
+        *) warn ":80 обновить не удалось — проверь: sudo xm diag-dpi (тест B7)" ;;
+      esac
     else
       warn "nginx-conf $NGINX_CONF не найден — проверь REALITY fallback вручную"
     fi
@@ -2066,6 +2354,41 @@ dpi|diag-dpi)
       && ok "Порт 80 → redirect $HTTP_CODE (как у обычного веб-сервера)" \
       || dwarn "Порт 80 вернул $HTTP_CODE (ожидался 301/302)"
 
+    # B7 — ЗАГОЛОВКИ :80, а не только код. Совпадение кода ничего не даёт:
+    # 301 отдают все, а вот `Server:` и цель редиректа — разные. Замерено на
+    # живом сервере: мы отдавали `Server: nginx` и `Location: https://<наш IP>/`,
+    # тогда как домен-маска отдаёт своё имя сервера и редирект НА ДОМЕН.
+    # Редирект на голый IP — то, чего не делает ни один настоящий сайт: он
+    # прямо говорит сканеру, что за этим адресом нет никакого виртуалхоста.
+    echo -e "\n  ${BOLD}B7. Заголовки на :80 (Server и цель редиректа)${NC}"
+    OUR_HDR=$(curl -sI --max-time 6 "http://${SERVER_IP}/" -H "Host: ${SNI}" 2>/dev/null) || true
+    REAL_HDR=$(curl -sI --max-time 6 "http://${SNI}/" 2>/dev/null) || true
+    OUR_SRV=$(printf '%s' "$OUR_HDR"  | grep -im1 '^server:'   | tr -d '\r' | sed 's/^[Ss]erver:[[:space:]]*//')
+    REAL_SRV=$(printf '%s' "$REAL_HDR" | grep -im1 '^server:'   | tr -d '\r' | sed 's/^[Ss]erver:[[:space:]]*//')
+    OUR_LOC=$(printf '%s' "$OUR_HDR"  | grep -im1 '^location:' | tr -d '\r' | sed 's/^[Ll]ocation:[[:space:]]*//')
+    info "Server: наш «${OUR_SRV:-нет}» | $SNI «${REAL_SRV:-нет}»"
+    if [[ -z "$REAL_SRV" ]]; then
+      info "Эталон не отдал Server — сравнивать не с чем"
+    elif [[ "$OUR_SRV" == "$REAL_SRV" ]]; then
+      ok "Server совпадает с доменом-маской"
+    else
+      dwarn "Server отличается («${OUR_SRV:-нет}» вместо «${REAL_SRV}») — сканеру видно, что :80 обслуживает не тот сервер, чей сертификат отдаёт :$PORT"
+    fi
+    if [[ "$OUR_LOC" =~ ^https://([0-9]{1,3}\.){3}[0-9]{1,3}/ ]]; then
+      dfail "Redirect ведёт на голый IP ($OUR_LOC) — настоящий сайт редиректит на своё имя. Это прямая подпись «здесь нет вебсайта»."
+    elif [[ -n "$OUR_LOC" ]]; then
+      ok "Redirect ведёт на имя ($OUR_LOC), а не на IP"
+    fi
+
+    # B8 — НОМЕР ПОРТА. Никакая маскировка TLS не спасает, если сертификат
+    # крупного сайта отдаётся на порту, на котором сайтов не бывает.
+    echo -e "\n  ${BOLD}B8. Номер порта${NC}"
+    if [[ "$PORT" == "443" ]]; then
+      ok "Порт 443 — трафик неотличим от обычного HTTPS по одному только номеру"
+    else
+      dfail "Порт $PORT: сертификат $SNI на нестандартном порту. Настоящие сайты живут на 443, а $PORT — типичный порт прокси и первый кандидат при сканировании. Это отличие видно ДО любого анализа TLS."
+    fi
+
 # ══ C. Параметры REALITY ═════════════════════════════════════════════════════
     sep
     echo -e "${BOLD}C. Параметры REALITY${NC}"
@@ -2265,6 +2588,51 @@ dpi|diag-dpi)
       fi
     fi
 
+# ══ G. Стабильность пути ═════════════════════════════════════════════════════
+# Отдельный блок, потому что обрыв — это не только «неудобно»: сервер, который
+# принимает TCP и рвёт соединение (а именно так он себя ведёт, когда dest не
+# резолвится), выдаёт ту самую подпись прокси, ради ухода от которой сделан
+# весь mimic. Нестабильность здесь = демаскировка.
+    sep
+    echo -e "${BOLD}G. Стабильность пути${NC}"
+
+    # G1 — резолвинг dest. Он в nginx задан ИМЕНЕМ и резолвится в рантайме на
+    # каждое протухание кэша. Замерено: при холодном резолвере первое соединение
+    # до dest заняло 10.0 с, а в error.log лежат «could not be resolved».
+    T0=$(date +%s%N)
+    if getent hosts "$SNI" >/dev/null 2>&1; then
+      T1=$(date +%s%N); RMS=$(( (T1 - T0) / 1000000 ))
+      if [[ "$RMS" -lt 500 ]]; then ok "dest $SNI резолвится за ${RMS} мс"
+      else dwarn "dest $SNI резолвится за ${RMS} мс — медленно; пока идёт резолвинг, REALITY не может дозвониться до dest и рвёт соединения"
+      fi
+    else
+      dfail "dest $SNI НЕ резолвится с этого сервера — REALITY dest мёртв, каждый клиент и каждый зонд получают обрыв. Смотри: sudo xm watchdog now"
+    fi
+
+    NGX_RSLV=$(grep -hoE '^[[:space:]]*resolver[[:space:]]+[^;]+' /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null | head -1 | sed 's/^[[:space:]]*resolver[[:space:]]*//')
+    if [[ "$NGX_RSLV" == 127.0.0.53* ]]; then
+      _resolved_dot_on \
+        && ok "nginx resolver: локальный стаб, и он на строгом DoT — имя dest не уходит открытым" \
+        || dfail "nginx resolver = 127.0.0.53, но systemd-resolved БЕЗ строгого DoT: имя домена-маски уходит открытым UDP, и при тормозах стаба падает весь fallback. Исправь: ${BOLD}sudo xm harden${NC}"
+    elif [[ -n "$NGX_RSLV" ]]; then
+      dwarn "nginx resolver: $NGX_RSLV — открытый UDP/53 за адресом домена-маски мимо всех остальных настроек. Исправит: sudo xm harden"
+    fi
+
+    # G2 — счётчики ядра: потери ДО того, как соединение доходит до Xray.
+    echo ""
+    _tune_counters
+
+    # G3 — watchdog и таймаут хендшейка.
+    echo ""
+    systemctl is-active --quiet xray-watchdog.timer \
+      && ok "watchdog активен — мёртвый резолвинг dest будет починен сам" \
+      || dwarn "watchdog выключен: если dest перестанет резолвиться, VPN ляжет молча и до ручного вмешательства. Включить: ${BOLD}sudo xm tune${NC}"
+    HS_D=$(jq -r '.policy.levels."0".handshake // 0' "$CONFIG" 2>/dev/null)
+    [[ "${HS_D:-0}" -ge 8 ]] \
+      && ok "policy.handshake: ${HS_D} с — переживает медленный резолвинг dest" \
+      || dwarn "policy.handshake: ${HS_D} с — мало: в это окно входит и резолвинг dest, и TLS до CDN. Исправит: ${BOLD}sudo xm tune${NC}"
+    _tune_on || dwarn "sysctl-профиль не применён — дефолтные буферы 208 КБ и нет MTU probing (мобильные клиенты виснут). Исправит: ${BOLD}sudo xm tune${NC}"
+
 # ══ F. Поведение и логи ══════════════════════════════════════════════════════
     sep
     echo -e "${BOLD}F. Поведение и логи${NC}"
@@ -2292,7 +2660,8 @@ dpi|diag-dpi)
       echo -e "  ${RED}${BOLD}Критично: $DPI_CRIT${NC}   ${YELLOW}${BOLD}Предупреждений: $DPI_WARN${NC}"
       echo ""
       echo -e "  Что делать по порядку:"
-      echo -e "    ${BOLD}sudo xm harden${NC}        DoH + перехват :53 + mimic-fallback (закрывает большинство пунктов выше)"
+      echo -e "    ${BOLD}sudo xm harden${NC}        DoH + перехват :53 + mimic-fallback + строгий DoT на стабе"
+    echo -e "    ${BOLD}sudo xm tune${NC}          сетевой стек, таймаут хендшейка, watchdog (блок G)"
       echo -e "    ${BOLD}sudo xm selftest${NC}      если что-то из живых тестов не прошло"
       echo -e "    ${BOLD}sudo xm sni-scan${NC}      если ругается на сертификат домена-маски"
       echo -e "    ${BOLD}sudo xm diag${NC}          общее состояние сервера"
@@ -2530,6 +2899,115 @@ sni-scan)
     fi
     ;;
 
+tune)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm tune${NC}"; exit 1; }
+    echo -e "\n${BOLD}${CYAN}[ Стабильность: сетевой стек и таймауты ]${NC}\n"
+
+    if [[ "${2:-}" == "--check" ]]; then
+      sep; echo -e "${BOLD}Текущее состояние${NC}"
+      _tune_on && ok "sysctl-профиль: применён ($SYSCTL_FILE)" \
+               || warn "sysctl-профиль: НЕ применён (дефолты ядра — буферы 208 КБ, нет MTU probing)"
+      systemctl is-active --quiet xray-watchdog.timer \
+        && ok "watchdog: включён (проверка сквозного пути каждые 2 мин)" \
+        || warn "watchdog: выключен — сдохший резолвинг dest никто не заметит"
+      HS=$(jq -r '.policy.levels."0".handshake // "нет"' "$CONFIG" 2>/dev/null)
+      [[ "$HS" != "нет" && "$HS" -ge 8 ]] \
+        && ok "policy.handshake: ${HS} с — хватает на медленный dest" \
+        || warn "policy.handshake: ${HS} с — при тормозящем резолвинге dest хендшейк не успевает"
+      sep
+      echo -e "${BOLD}Счётчики ядра (накопительные с загрузки)${NC}"
+      _tune_counters
+      sep; info "Режим --check: ничего не изменено. Применить: ${BOLD}sudo xm tune${NC}"
+      exit 0
+    fi
+
+    if [[ "${2:-}" == "--off" ]]; then
+      rm -f "$SYSCTL_FILE" && ok "sysctl-профиль удалён (значения вернутся после перезагрузки)"
+      systemctl disable --now xray-watchdog.timer >/dev/null 2>&1 || true
+      rm -f "$WATCHDOG_SVC" "$WATCHDOG_TIMER"; systemctl daemon-reload
+      ok "watchdog выключен и удалён"
+      warn "policy.handshake не трогаю — верни вручную через xm edit, если нужно"
+      exit 0
+    fi
+
+    # ── 1. sysctl ───────────────────────────────────────────────────────────
+    sep; echo -e "${BOLD}Шаг 1: сетевой стек${NC}"
+    _tune_write && ok "Профиль записан: $SYSCTL_FILE"
+    _tune_apply || warn "Часть параметров ядро не приняло (см. выше) — остальные применены"
+
+    # ── 2. policy.handshake ─────────────────────────────────────────────────
+    # 4 секунды — дефолт Xray, и он рассчитан на dest в той же сети. У нас
+    # dest = внешний CDN через nginx, то есть в эти секунды входит и резолвинг,
+    # и TLS до Cloudflare/Akamai. Замерено: при холодном резолвере первое
+    # соединение до dest занимало 10.0 с. С handshake=4 такой клиент не войдёт.
+    sep; echo -e "${BOLD}Шаг 2: таймаут хендшейка${NC}"
+    HS_NOW=$(jq -r '.policy.levels."0".handshake // 0' "$CONFIG" 2>/dev/null)
+    if [[ "$HS_NOW" -ge 8 ]]; then
+      ok "policy.handshake уже ${HS_NOW} с — не трогаю"
+    else
+      TBAK=$(_backup_config before_tune); ok "Бэкап: $TBAK"
+      if jq '.policy.levels."0".handshake = 8' "$CONFIG" | _atomic_write_config \
+         && xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+        systemctl restart xray
+        ok "policy.handshake: ${HS_NOW} → 8 с, Xray перезапущен"
+      else
+        cp "$TBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        fail "Конфиг не принят — откат из бэкапа"
+      fi
+    fi
+
+    # ── 3. watchdog ─────────────────────────────────────────────────────────
+    sep; echo -e "${BOLD}Шаг 3: watchdog сквозного пути${NC}"
+    _wd_install
+    if systemctl is-active --quiet xray-watchdog.timer; then
+      ok "Таймер xray-watchdog активен — проверка каждые 2 мин"
+      info "Проверяет: резолвится ли dest, слушает ли fallback :10443, слушает ли Xray свой порт"
+    else
+      fail "Таймер не поднялся — смотри: systemctl status xray-watchdog.timer"
+    fi
+
+    sep
+    echo -e "  ${BOLD}Готово.${NC} Проверить: ${BOLD}sudo xm tune --check${NC}"
+    echo -e "  Счётчики ретрансмитов накопительные — разницу видно через сутки."
+    echo -e "  Откатить: ${BOLD}sudo xm tune --off${NC}"
+    echo ""
+    ;;
+
+watchdog)
+    case "${2:-status}" in
+      --run)
+        # Вызывается таймером. Молчит, когда всё в порядке: journald не должен
+        # заполняться строками «всё хорошо» каждые две минуты.
+        # `|| true` обязателен: _wd_check возвращает !=0, когда что-то чинил, а
+        # для Type=oneshot это означало бы «юнит упал». Тогда каждое УСПЕШНОЕ
+        # вмешательство watchdog помечалось бы в systemd как сбой.
+        _wd_check || true ;;
+      on)
+        [[ $EUID -ne 0 ]] && { echo -e "${RED}sudo xm watchdog on${NC}"; exit 1; }
+        _wd_install && ok "watchdog включён (каждые 2 мин)" ;;
+      off)
+        [[ $EUID -ne 0 ]] && { echo -e "${RED}sudo xm watchdog off${NC}"; exit 1; }
+        systemctl disable --now xray-watchdog.timer >/dev/null 2>&1 || true
+        rm -f "$WATCHDOG_SVC" "$WATCHDOG_TIMER"; systemctl daemon-reload
+        ok "watchdog выключен" ;;
+      now)
+        [[ $EUID -ne 0 ]] && { echo -e "${RED}sudo xm watchdog now${NC}"; exit 1; }
+        echo -e "\n${BOLD}Разовая проверка пути:${NC}"
+        if _wd_check; then ok "Путь исправен: dest резолвится, fallback и Xray слушают"; fi ;;
+      *)
+        echo -e "\n${BOLD}${CYAN}[ Watchdog сквозного пути ]${NC}\n"
+        systemctl is-active --quiet xray-watchdog.timer \
+          && ok "Таймер активен" || warn "Таймер выключен (sudo xm watchdog on)"
+        systemctl list-timers xray-watchdog.timer --no-pager 2>/dev/null | sed -n '1,3p' | sed 's/^/  /'
+        echo -e "\n  ${BOLD}Срабатывания за 7 дней:${NC}"
+        journalctl -u xray-watchdog.service --since "7 days ago" --no-pager 2>/dev/null \
+          | grep -c 'watchdog:' | sed 's/^/    записей: /'
+        journalctl -u xray-watchdog.service --since "7 days ago" --no-pager 2>/dev/null \
+          | grep 'watchdog:' | tail -10 | sed 's/^/    /'
+        echo "" ;;
+    esac
+    ;;
+
 harden)
     [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm harden${NC}"; exit 1; }
     MODE="${2:-apply}"
@@ -2716,6 +3194,16 @@ RESOLVEDEOF
     else
       warn "Режим fallback не изменён (см. выше) — активное зондирование остаётся заметным"
     fi
+
+    # ── 6. :80 — заголовки и цель редиректа ─────────────────────────────────
+    sep
+    echo -e "${BOLD}Шаг 5: порт 80${NC}"
+    _ngx_http80_fix; H80_RC=$?
+    case "$H80_RC" in
+      0) ok ":80 приведён к виду домена-маски: редирект на имя, Server как у сайта, лог выключен" ;;
+      2) ok ":80 уже в нужном виде — ничего не меняю" ;;
+      *) warn ":80 остался как есть — см. сообщения выше (xm diag-dpi, тест B7)" ;;
+    esac
 
     sep
     echo -e "${GREEN}${BOLD}  Готово.${NC}"
@@ -3179,6 +3667,11 @@ neighbors)
     echo -e "  ${GREEN}xm harden${NC}                        DoH на сервере + перехват :53 + mimic-fallback"
     echo    "  xm harden --check | --off        Показать состояние / откатить"
     echo -e "  ${GREEN}xm pq status|on|off${NC}              ML-DSA-65: post-quantum подпись REALITY"
+    echo ""
+    echo -e "${BOLD}${GREEN}Стабильность:${NC}"
+    echo -e "  ${GREEN}xm tune${NC}                          Сетевой стек (BBR, буферы, MTU probing) + watchdog + таймауты"
+    echo    "  xm tune --check | --off          Состояние и счётчики потерь / откат"
+    echo -e "  ${GREEN}xm watchdog on|off|now|status${NC}    Присмотр за сквозным путём (резолвинг dest, fallback, слушатель)"
     echo ""
     echo -e "${BOLD}${GREEN}Диагностика:${NC}"
     echo -e "  ${GREEN}xm selftest [--tcp|--all]${NC}        Живой хендшейк через loopback — НАЧИНАЙ С НЕЁ"
