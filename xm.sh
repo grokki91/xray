@@ -741,6 +741,33 @@ _tune_apply() {
   return $rc
 }
 
+# Точка отсчёта для дельт по счётчикам ядра. Накопительное с загрузки не
+# отвечает на вопрос «помогла ли правка»: 6% ретрансмитов могут быть целиком
+# из одного аварийного часа трёхдневной давности, а сегодня быть чисто.
+# Снимок пишется, когда его нет, и заново из xm tune — чтобы эффект правки
+# считался от момента правки.
+COUNTERS_SNAP="/var/lib/xm-counters"
+
+# Пустой снимок хуже отсутствующего: нули в файле дали бы на следующем запуске
+# дельту размером со всю историю с загрузки, то есть тот же неверный вердикт,
+# от которого дельта и заводится. Поэтому сначала в переменную, и только
+# непустое — на диск.
+_counters_snap_write() {
+  local snap
+  snap=$(nstat -az 2>/dev/null | awk -v now="$(date +%s)" '
+      $1=="TcpRetransSegs"        {r=$2}
+      $1=="TcpOutSegs"            {t=$2}
+      $1=="TcpExtTCPTimeouts"     {o=$2}
+      $1=="TcpExtListenOverflows" {l=$2}
+      $1=="TcpExtListenDrops"     {d=$2}
+      $1=="UdpRcvbufErrors"       {u=$2}
+      END { if (t == "" || t+0 == 0) exit 1
+            printf "%d %d %d %d %d %d %d\n", now, r, t, o, l, d, u }')
+  [[ -z "$snap" ]] && return 1
+  mkdir -p "$(dirname "$COUNTERS_SNAP")" 2>/dev/null || return 1
+  ( umask 077; printf '%s\n' "$snap" > "$COUNTERS_SNAP" ) 2>/dev/null
+}
+
 # Счётчики, по которым видно потери ДО Xray. Все накопительные с загрузки,
 # поэтому смысл имеет доля, а не абсолют: 1.9 млн ретрансмитов сами по себе
 # ничего не значат, 7.7% от отправленного — значат много.
@@ -778,6 +805,30 @@ _tune_counters() {
                              || ok "UDP-буфер без потерь"
   info "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null), qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
   info "MTU probing: $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null) (нужен 1 — иначе мобильные клиенты виснут на PMTU blackhole)"
+
+  # Дельта с прошлого снимка. Всё, что выше, — с момента загрузки, и по этим
+  # числам нельзя сказать, идут ли потери прямо сейчас.
+  local s_t s_r s_x s_o s_l s_d s_u d_age d_tx d_retr d_lo d_ld d_pct
+  if [[ -r "$COUNTERS_SNAP" ]] \
+     && read -r s_t s_r s_x s_o s_l s_d s_u < "$COUNTERS_SNAP" \
+     && [[ -n "${s_t:-}" ]]; then
+    d_age=$(( $(date +%s) - s_t ))
+    d_tx=$((   ${tx:-0} - ${s_x:-0} )); d_retr=$(( ${retr:-0} - ${s_r:-0} ))
+    d_lo=$((   ${lo:-0} - ${s_l:-0} )); d_ld=$((  ${ld:-0}  - ${s_d:-0} ))
+    if [[ "$d_tx" -lt 0 || "$d_retr" -lt 0 ]]; then
+      info "Счётчики обнулились (перезагрузка) — точка отсчёта обновлена"
+      _counters_snap_write
+    elif [[ "$d_age" -ge 300 && "$d_tx" -gt 0 ]]; then
+      d_pct=$(awk -v r="$d_retr" -v t="$d_tx" 'BEGIN{printf "%.2f", r*100/t}')
+      info "За $(( d_age / 3600 )) ч $(( (d_age % 3600) / 60 )) мин с прошлого замера: ретрансмиты ${d_pct}%, accept-очередь ${d_lo}/${d_ld}"
+      info "  Вердикт смотри по этой строке, а не по накопительным выше"
+    else
+      info "Точка отсчёта свежая ($(( d_age / 60 )) мин) — дельта появится позже"
+    fi
+  else
+    _counters_snap_write
+    info "Точка отсчёта поставлена — следующий запуск покажет дельту"
+  fi
 }
 
 # ─── Watchdog ────────────────────────────────────────────────────────────────
@@ -2733,24 +2784,51 @@ dpi|diag-dpi)
     # соединение, поэтому каждая строка здесь — это чей-то неудавшийся коннект.
     # Причины принципиально разные и лечатся по-разному, а в одной куче
     # (4738 строк на живом сервере) они неразличимы.
+    #
+    # Считаем в окне 24 ч. Счётчик за всё время сам по себе — не вердикт:
+    # 16 сбросов домена-маски выглядят как авария, но растянутые на шесть
+    # суток это раз в сутки, и мигание «каждые пару секунд» ими не объяснить.
+    # Из-за такой подачи домен-маска один раз уже был обвинён напрасно.
     EL="/var/log/nginx/reality_fallback_error.log"
     if [[ -s "$EL" ]]; then
-      E_RESOLV=$(grep -c 'could not be resolved'    "$EL" 2>/dev/null) || true
-      E_RESET=$(grep -c  'reset by peer'            "$EL" 2>/dev/null) || true
-      E_TMOUT=$(grep -c  'upstream timed out'       "$EL" 2>/dev/null) || true
-      E_NOHOST=$(grep -c 'no host in upstream'      "$EL" 2>/dev/null) || true
+      EL_CUT=$(date -d '24 hours ago' '+%Y/%m/%d %H:%M:%S' 2>/dev/null) || EL_CUT=""
+      # Один проход: накопительно, за сутки и метка последнего реального отказа.
+      # Формат nginx — "2026/08/31 15:56:41", нули на месте, поэтому сравнение
+      # строк работает как сравнение времени, без парсинга дат.
+      read -r E_RESOLV E_RESET E_TMOUT E_NOHOST D_RESOLV D_RESET D_TMOUT D_ALL EL_LAST < <(
+        awk -v cut="$EL_CUT" '
+          { ts = $1 " " $2; rec = (cut != "" && ts >= cut) }
+          /could not be resolved/ { r++; if (rec) dr++ }
+          /reset by peer/         { s++; if (rec) ds++ }
+          /upstream timed out/    { t++; if (rec) dt++ }
+          /no host in upstream/   { n++; next }
+          { last = ts; if (rec) da++ }
+          END { printf "%d %d %d %d %d %d %d %d %s\n",
+                       r, s, t, n, dr, ds, dt, da, (last == "" ? "-" : last) }
+        ' "$EL")
       echo ""
-      info "Отказы fallback (всего строк: $(wc -l < "$EL")):"
-      [[ "${E_RESOLV:-0}" -gt 0 ]] \
-        && dwarn "  ${E_RESOLV} × dest не резолвился — DNS-путь. Лечится: sudo xm harden + sudo xm tune (watchdog)" \
-        || ok "  0 × отказов резолвинга"
-      if [[ "${E_RESET:-0}" -gt 0 || "${E_TMOUT:-0}" -gt 0 ]]; then
-        dwarn "  $(( ${E_RESET:-0} + ${E_TMOUT:-0} )) × сам $SNI сбросил или не ответил — путь ОТ ЭТОГО VPS до домена-маски нестабилен."
-        echo -e "      ${CYAN}Это бьёт по приложениям, которые часто открывают новые соединения${NC}"
+      if [[ -z "$EL_CUT" ]]; then
+        info "Отказы fallback, накопительно: ${E_RESOLV:-0} × резолвинг, $(( ${E_RESET:-0} + ${E_TMOUT:-0} )) × сброс/таймаут (окно за сутки посчитать не удалось)"
+      else
+        info "Отказы fallback за 24 ч: ${D_ALL:-0}. Всего в файле реальных: $(( ${E_RESOLV:-0} + ${E_RESET:-0} + ${E_TMOUT:-0} ))"
+      fi
+      [[ "${D_RESOLV:-0}" -gt 0 ]] \
+        && dwarn "  ${D_RESOLV} × за сутки dest не резолвился — DNS-путь. Лечится: sudo xm harden + sudo xm tune (watchdog)" \
+        || ok "  0 × отказов резолвинга за сутки"
+      if [[ $(( ${D_RESET:-0} + ${D_TMOUT:-0} )) -gt 0 ]]; then
+        dwarn "  $(( ${D_RESET:-0} + ${D_TMOUT:-0} )) × за сутки сам $SNI сбросил или не ответил — путь ОТ ЭТОГО VPS до домена-маски нестабилен."
+        echo -e "      ${CYAN}Бьёт по приложениям, которые часто открывают новые соединения${NC}"
         echo -e "      ${CYAN}(мессенджеры): часть коннектов не проходит, клиент показывает${NC}"
         echo -e "      ${CYAN}«соединение» и переподключается. Подбор живого домена: sudo xm sni-scan${NC}"
       else
-        ok "  0 × сбросов со стороны домена-маски"
+        ok "  0 × сбросов со стороны домена-маски за сутки"
+      fi
+      # Давность последнего отказа. Без неё счётчик за всё время читается как
+      # авария: 16 сбросов выглядят страшно, а если они растянуты на шесть
+      # суток — это раз в сутки, и мигание «каждые пару секунд» не объясняют.
+      if [[ -n "${EL_LAST:-}" && "$EL_LAST" != "-" ]]; then
+        EL_EP=$(date -d "${EL_LAST//\//-}" +%s 2>/dev/null)
+        [[ -n "$EL_EP" ]] && info "  Последний реальный отказ: $EL_LAST ($(( ($(date +%s) - EL_EP) / 3600 )) ч назад)"
       fi
       [[ "${E_NOHOST:-0}" -gt 0 ]] \
         && info "  ${E_NOHOST} × пустой апстрим — следы старого режима strict (до mimic), не текущая проблема"
@@ -3105,8 +3183,11 @@ tune)
     fi
 
     sep
+    _counters_snap_write && ok "Точка отсчёта по счётчикам ядра обновлена"
     echo -e "  ${BOLD}Готово.${NC} Проверить: ${BOLD}sudo xm tune --check${NC}"
-    echo -e "  Счётчики ретрансмитов накопительные — разницу видно через сутки."
+    echo -e "  Счётчики ядра накопительные, поэтому эффект считается от точки"
+    echo -e "  отсчёта выше: вернись через сутки и сравни строку «За N ч ... с"
+    echo -e "  прошлого замера» — накопительная доля будет меняться медленно."
     echo -e "  Откатить: ${BOLD}sudo xm tune --off${NC}"
     echo ""
     ;;
