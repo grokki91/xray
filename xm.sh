@@ -5,7 +5,7 @@
 #
 #  Команды:
 #   Сервис:      start / stop / restart / status
-#   Конфиг:      edit / test / apply / set-sni
+#   Конфиг:      edit / test / apply / set-sni / set-port
 #   Бэкапы:      backup / restore / backups
 #   Клиенты:     clients / add-client / del-client / uri / qr
 #   TCP:         add-tcp
@@ -510,20 +510,29 @@ open(path, 'w').write(out)
 PY
 }
 
-# nginx резолвит апстрим fallback сам и МИМО системного резолвера: в конфиге
-# стоит resolver 1.1.1.1 8.8.8.8 valid=30s, то есть открытый UDP/53 раз в
-# полминуты — только чтобы отдать proxy_pass адрес домена-маски. Браузинг это
-# не раскрывает (домен-маска и так публичен), но это постоянный открытый
+# nginx резолвит апстрим fallback сам и МИМО системного резолвера: изначально
+# в конфиге стоит resolver 1.1.1.1 8.8.8.8 valid=30s, то есть открытый UDP/53
+# раз в полминуты — только чтобы отдать proxy_pass адрес домена-маски. Браузинг
+# это не раскрывает (домен-маска и так публичен), но это постоянный открытый
 # маячок, который противоречит остальному harden. Переводим на стаб: после
 # шага DoT он ходит по :853, а кэш становится общим с остальной машиной.
+#
+# valid=900s, а не 30s или 300s. Причина в цене промаха: этот резолвинг —
+# не фон, а часть тракта REALITY, потому что dest задан именем. Каждое
+# истечение кэша — окно, в котором неудачный запрос роняет fallback целиком
+# и сервер начинает рвать соединения (замерено: "could not be resolved
+# (110: Operation timed out)" в reality_fallback_error.log). Со строгим DoT
+# промах становится вероятнее: при недоступном :853 резолвед не имеет права
+# свалиться в открытый UDP и честно возвращает ошибку. Реже ходим — реже
+# попадаем в это окно; адреса CDN-домена меняются несопоставимо медленнее.
 # Возврат 0 — что-то изменили, 1 — менять было нечего.
 _ngx_resolver_local() {
   local f rc=1
   for f in /etc/nginx/stream-enabled/reality-fallback.conf /etc/nginx/reality-fallback.conf.tmpl; do
     [[ -f "$f" ]] || continue
     grep -qE '^[[:space:]]*resolver[[:space:]]' "$f" || continue
-    grep -qE '^[[:space:]]*resolver[[:space:]]+127\.0\.0\.53([[:space:]]|;)' "$f" && continue
-    sed -i -E 's|^([[:space:]]*)resolver[[:space:]]+[^;]*;|\1resolver 127.0.0.53 valid=300s ipv6=off;|' "$f" && rc=0
+    grep -qE '^[[:space:]]*resolver[[:space:]]+127\.0\.0\.53[[:space:]]+valid=900s' "$f" && continue
+    sed -i -E 's|^([[:space:]]*)resolver[[:space:]]+[^;]*;|\1resolver 127.0.0.53 valid=900s ipv6=off;|' "$f" && rc=0
   done
   return $rc
 }
@@ -1202,6 +1211,100 @@ set-sni)
     ;;
 
 # ─── Бэкапы ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# set-port — сменить порт inbound с проверкой занятости, UFW и откатом.
+#
+# ЗАЧЕМ ЭТО ВООБЩЕ НУЖНО: номер порта — признак, который DPI и сканер видят
+# ДО всякого анализа TLS. Сертификат крупного сайта, отданный на 8443 или
+# 8448, обесценивает всю маскировку REALITY: сайтов на таких портах не бывает,
+# а сами эти номера — первые в списке любого сканера прокси. 443 стоит того,
+# чтобы ради него разово перевыпустить клиентские URI.
+#
+# ВАЖНО ПРО «ПОРТ ЗАНЯТ»: занятость проверяется ТОЛЬКО по TCP. Порт — это пара
+# (протокол, номер), поэтому служба, слушающая UDP на том же номере, нам не
+# мешает и трогать её не нужно. Частый случай: на 443/udp живёт другой VPN,
+# а 443/tcp при этом полностью свободен.
+set-port)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm set-port <порт>${NC}"; exit 1; }
+    NEW_PORT="${2:-}"
+    PORT_IDX=0; PORT_LABEL="XHTTP"
+    [[ "${3:-}" == "--tcp" ]] && { PORT_IDX=1; PORT_LABEL="TCP/Vision"; }
+
+    if [[ -z "$NEW_PORT" ]]; then
+      echo -e "${BOLD}Использование:${NC} xm set-port <порт> [--tcp]"
+      echo    "  xm set-port 443          порт XHTTP inbound"
+      echo    "  xm set-port 8443 --tcp   порт TCP/Vision inbound"
+      echo ""
+      echo -e "${BOLD}Сейчас:${NC}"
+      jq -r '.inbounds[] | "  \(.streamSettings.network)\t порт \(.port)"' "$CONFIG" 2>/dev/null | sed 's/^/  /'
+      exit 0
+    fi
+    [[ "$NEW_PORT" =~ ^[0-9]+$ ]] && [[ "$NEW_PORT" -ge 1 && "$NEW_PORT" -le 65535 ]] \
+      || { fail "Порт должен быть числом 1-65535"; exit 1; }
+    [[ "$PORT_IDX" -eq 1 ]] && ! _has_tcp_inbound && { fail "TCP inbound отсутствует — нечего переносить"; exit 1; }
+
+    echo -e "\n${BOLD}${CYAN}[ Смена порта: $PORT_LABEL ]${NC}\n"
+    OLD_PORT=$(jq -r ".inbounds[$PORT_IDX].port" "$CONFIG")
+    [[ "$OLD_PORT" == "$NEW_PORT" ]] && { ok "Порт уже $NEW_PORT — ничего не меняю"; exit 0; }
+
+    # Второй inbound не должен оказаться на том же номере.
+    OTHER_PORT=$(jq -r "[.inbounds[].port] | del(.[$PORT_IDX]) | .[0] // empty" "$CONFIG")
+    [[ -n "$OTHER_PORT" && "$OTHER_PORT" == "$NEW_PORT" ]] \
+      && { fail "Порт $NEW_PORT занят другим inbound этого же Xray"; exit 1; }
+
+    # Занятость по TCP. Свой же xray на старом порту в расчёт не идёт.
+    # tail -n +2 вместо ss -H: флаг есть не во всех сборках iproute2, а
+    # заголовок один и тот же везде (так же сделано в diag-ports).
+    BUSY=$(ss -tlnp 2>/dev/null | tail -n +2 | awk -v p=":$NEW_PORT" '$4 ~ p"$" {print $NF}' | head -1)
+    if [[ -n "$BUSY" ]]; then
+      fail "TCP-порт $NEW_PORT уже слушает: $BUSY"
+      info "Порт — это пара (протокол, номер). Служба на UDP/$NEW_PORT помехой не является"
+      info "и в этой проверке не участвует — здесь занят именно TCP."
+      exit 1
+    fi
+    ok "TCP-порт $NEW_PORT свободен"
+    UDP_HINT=$(ss -ulnp 2>/dev/null | tail -n +2 | awk -v p=":$NEW_PORT" '$4 ~ p"$" {print $NF}' | head -1)
+    [[ -n "$UDP_HINT" ]] && info "На UDP/$NEW_PORT есть служба ($UDP_HINT) — она не мешает и не трогается"
+
+    PBAK=$(_backup_config before_setport); ok "Бэкап: $PBAK"
+
+    if ! jq ".inbounds[$PORT_IDX].port = ${NEW_PORT}" "$CONFIG" | _atomic_write_config; then
+      fail "Не удалось записать конфиг"; exit 1
+    fi
+    if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+      fail "Конфиг невалиден — откат"
+      cp "$PBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+    fi
+
+    # UFW открываем ДО рестарта: иначе между стартом и правилом есть окно,
+    # когда порт слушает, а файрвол его режет.
+    ufw allow "${NEW_PORT}/tcp" comment "Xray ${PORT_LABEL}" >/dev/null 2>&1 \
+      && ok "UFW: открыт ${NEW_PORT}/tcp" || warn "UFW не принял правило — проверь: sudo ufw status"
+
+    systemctl restart xray; sleep 2
+    if ss -tln 2>/dev/null | tail -n +2 | awk -v p=":$NEW_PORT" '$4 ~ p"$"' | grep -q .; then
+      ok "Xray слушает $NEW_PORT"
+    else
+      fail "Xray не поднялся на $NEW_PORT — откат"
+      cp "$PBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+      ufw delete allow "${NEW_PORT}/tcp" >/dev/null 2>&1 || true
+      systemctl restart xray
+      journalctl -u xray -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+      exit 1
+    fi
+
+    # Старое правило убираем только после успеха.
+    ufw delete allow "${OLD_PORT}/tcp" >/dev/null 2>&1 \
+      && ok "UFW: закрыт старый ${OLD_PORT}/tcp" || info "Старое правило ${OLD_PORT}/tcp не найдено"
+
+    sep
+    warn "URI клиентов содержат порт — старые перестали работать. Раздай новые:"
+    echo -e "  ${BOLD}sudo xm qr --all${NC}   или   ${BOLD}sudo xm uri --all${NC}"
+    echo ""
+    ok "Порт $PORT_LABEL: $OLD_PORT → $NEW_PORT"
+    echo -e "  Проверить: ${BOLD}sudo xm selftest${NC}, затем ${BOLD}sudo xm diag-dpi${NC} (тест B8)"
+    echo ""
+    ;;
 backup)
     echo -e "${GREEN}Бэкап: $(_backup_config)${NC}"
     ;;
@@ -2387,6 +2490,14 @@ dpi|diag-dpi)
       ok "Порт 443 — трафик неотличим от обычного HTTPS по одному только номеру"
     else
       dfail "Порт $PORT: сертификат $SNI на нестандартном порту. Настоящие сайты живут на 443, а $PORT — типичный порт прокси и первый кандидат при сканировании. Это отличие видно ДО любого анализа TLS."
+      P443=$(ss -tlnp 2>/dev/null | tail -n +2 | awk '$4 ~ /:443$/ {print $NF}' | head -1)
+      if [[ -z "$P443" ]]; then
+        info "TCP/443 при этом СВОБОДЕН — перенос: ${BOLD}sudo xm set-port 443${NC} (URI придётся перевыпустить)"
+        U443=$(ss -ulnp 2>/dev/null | tail -n +2 | awk '$4 ~ /:443$/ {print $NF}' | head -1)
+        [[ -n "$U443" ]] && info "На UDP/443 есть служба — она не конфликтует: порт это пара (протокол, номер)"
+      else
+        info "TCP/443 занят ($P443) — сначала освободи его, потом sudo xm set-port 443"
+      fi
     fi
 
 # ══ C. Параметры REALITY ═════════════════════════════════════════════════════
@@ -2618,11 +2729,38 @@ dpi|diag-dpi)
       dwarn "nginx resolver: $NGX_RSLV — открытый UDP/53 за адресом домена-маски мимо всех остальных настроек. Исправит: sudo xm harden"
     fi
 
-    # G2 — счётчики ядра: потери ДО того, как соединение доходит до Xray.
+    # G2 — почему рвался fallback. REALITY идёт к dest на каждое входящее
+    # соединение, поэтому каждая строка здесь — это чей-то неудавшийся коннект.
+    # Причины принципиально разные и лечатся по-разному, а в одной куче
+    # (4738 строк на живом сервере) они неразличимы.
+    EL="/var/log/nginx/reality_fallback_error.log"
+    if [[ -s "$EL" ]]; then
+      E_RESOLV=$(grep -c 'could not be resolved'    "$EL" 2>/dev/null) || true
+      E_RESET=$(grep -c  'reset by peer'            "$EL" 2>/dev/null) || true
+      E_TMOUT=$(grep -c  'upstream timed out'       "$EL" 2>/dev/null) || true
+      E_NOHOST=$(grep -c 'no host in upstream'      "$EL" 2>/dev/null) || true
+      echo ""
+      info "Отказы fallback (всего строк: $(wc -l < "$EL")):"
+      [[ "${E_RESOLV:-0}" -gt 0 ]] \
+        && dwarn "  ${E_RESOLV} × dest не резолвился — DNS-путь. Лечится: sudo xm harden + sudo xm tune (watchdog)" \
+        || ok "  0 × отказов резолвинга"
+      if [[ "${E_RESET:-0}" -gt 0 || "${E_TMOUT:-0}" -gt 0 ]]; then
+        dwarn "  $(( ${E_RESET:-0} + ${E_TMOUT:-0} )) × сам $SNI сбросил или не ответил — путь ОТ ЭТОГО VPS до домена-маски нестабилен."
+        echo -e "      ${CYAN}Это бьёт по приложениям, которые часто открывают новые соединения${NC}"
+        echo -e "      ${CYAN}(мессенджеры): часть коннектов не проходит, клиент показывает${NC}"
+        echo -e "      ${CYAN}«соединение» и переподключается. Подбор живого домена: sudo xm sni-scan${NC}"
+      else
+        ok "  0 × сбросов со стороны домена-маски"
+      fi
+      [[ "${E_NOHOST:-0}" -gt 0 ]] \
+        && info "  ${E_NOHOST} × пустой апстрим — следы старого режима strict (до mimic), не текущая проблема"
+    fi
+
+    # G3 — счётчики ядра: потери ДО того, как соединение доходит до Xray.
     echo ""
     _tune_counters
 
-    # G3 — watchdog и таймаут хендшейка.
+    # G4 — watchdog и таймаут хендшейка.
     echo ""
     systemctl is-active --quiet xray-watchdog.timer \
       && ok "watchdog активен — мёртвый резолвинг dest будет починен сам" \
@@ -3112,7 +3250,7 @@ RESOLVEDEOF
       elif ! _ngx_resolver_local; then
         ok "nginx-fallback: resolver уже локальный — не трогаю"
       elif nginx -t &>/dev/null && systemctl reload nginx; then
-        ok "nginx-fallback: resolver → 127.0.0.53 valid=300s, открытых запросов к 1.1.1.1/8.8.8.8 больше нет"
+        ok "nginx-fallback: resolver → 127.0.0.53 valid=900s, открытых запросов к 1.1.1.1/8.8.8.8 больше нет"
       else
         fail "nginx -t не прошёл после правки resolver — откат"
         _ngx_resolver_public; nginx -t &>/dev/null && systemctl reload nginx
@@ -3638,6 +3776,7 @@ neighbors)
     echo "  xm test              Проверить валидность"
     echo "  xm apply             Проверить + перезапустить"
     echo -e "  ${GREEN}xm set-sni <domain>${NC}  Сменить домен-маску во ВСЕХ местах (config+nginx) атомарно"
+    echo -e "  ${GREEN}xm set-port <порт> [--tcp]${NC}  Сменить порт inbound (проверка занятости + UFW + откат)"
     echo ""
     echo -e "${BOLD}Бэкапы:${NC}"
     echo "  xm backup / restore / backups"
