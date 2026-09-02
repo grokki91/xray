@@ -14,7 +14,7 @@
 #   Fail2ban:    ban-list / ban-ssh-stat / unban
 #   Логи:        log / log-live / log-clear
 #   Инфо:        info / paths / uuid / pubkey
-#   Анти-DPI:    harden [--check|--off] / pq status|on|off
+#   Анти-DPI:    harden [--check|--off|--nonip [drop|skip|off]] / pq status|on|off
 #   Фронт:       front [status|on|off|add <sni> <порт>|del <sni>]
 #   Стабильность: tune [--check|--off] / watchdog on|off|now|status
 #   Соседи:      neighbors — что ещё живёт на сервере и что трогает xm
@@ -120,6 +120,25 @@ _get_ssh_port() {
 
 _has_tcp_inbound() {
   [[ $(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0) -ge 2 ]]
+}
+
+# ─── UFW ─────────────────────────────────────────────────────────────────────
+#
+# ЗАЧЕМ ОТДЕЛЬНО: трафик на СОБСТВЕННЫЙ внешний адрес уходит через lo, а ufw
+# петлю пропускает целиком (`-i lo -j ACCEPT` в ufw-before-input). Значит все
+# зонды diag-dpi, запущенные с самого VPS, проходят мимо файрвола и показывают
+# зелень на порту, который снаружи закрыт наглухо. Правило приходится проверять
+# отдельной командой — сетевым тестом изнутри его не увидеть.
+_ufw_active()  { ufw status 2>/dev/null | grep -q "Status: active"; }
+_ufw_allowed() { ufw status 2>/dev/null | grep -qE "^${1}(/tcp)?[[:space:]]+ALLOW"; }
+
+# _ufw_open <порт> <комментарий>
+#   0 — открыли, 1 — уже было открыто, 2 — ufw не активен, 3 — ufw отказал
+_ufw_open() {
+  _ufw_active || return 2
+  _ufw_allowed "$1" && return 1
+  ufw allow "${1}/tcp" comment "$2" >/dev/null 2>&1 || return 3
+  return 0
 }
 
 # Список активных джейлов fail2ban. Раньше вызывалась в ban-list, но НЕ была
@@ -486,6 +505,55 @@ _harden_unpatch() {
   ' "$CONFIG"
 }
 
+# ─── nonIPQuery: режим для запросов не-A/AAAA ────────────────────────────────
+#
+# ЧТО ЭТО. Android с 11-й версии сам спрашивает HTTPS/SVCB (тип 65) перед
+# каждым соединением. При nonIPQuery=drop такой запрос отбрасывается МОЛЧА:
+# клиент не получает ни ответа, ни отказа и ждёт своего таймаута. На десктопе
+# это незаметно, на телефоне выглядит как «соединение — переподключение».
+#
+# ЗАЧЕМ ОТДЕЛЬНАЯ РУЧКА. Раньше единственным способом это проверить был
+# `xm harden --off`, который заодно сносит DoH, перехват :53, строгий DoT и
+# mimic-fallback. Проверять одну гипотезу ценой всех остальных защит нельзя:
+# на время теста сервер становится ровно тем, чем был до harden.
+#
+# ЦЕНА `skip`: запрос не-A/AAAA уходит на исходный адрес, то есть покидает VPS
+# открытым UDP. Утечка узкая (только тип 65 и подобные, не имена сайтов в A),
+# но это утечка — режим диагностический, не целевой.
+#
+# Набор допустимых значений между сборками Xray менялся, поэтому его не
+# угадываем, а проверяем на копии конфига через `xray -test` (_nonip_try).
+
+# Текущее значение; пусто = поле не задано (сборка его не приняла или --nonip off)
+_nonip_current() {
+  jq -r '[.outbounds[]? | select(.protocol=="dns") | .settings.nonIPQuery? // empty] | first // ""' \
+     "$CONFIG" 2>/dev/null
+}
+
+# _nonip_patch <значение|""> → конфиг с этим значением на stdout.
+# Пустое значение убирает поле целиком, вместе с осиротевшим settings:{}.
+_nonip_patch() {
+  jq --arg v "$1" '
+    .outbounds = [ .outbounds[]
+      | if .protocol == "dns"
+        then ( .settings = ((.settings // {}) | del(.nonIPQuery))
+             | (if $v == "" then . else .settings.nonIPQuery = $v end)
+             | (if (.settings | length) == 0 then del(.settings) else . end) )
+        else . end ]
+  ' "$CONFIG"
+}
+
+# Принимает ли ЭТА сборка Xray такое значение. Копия временная и 600 (mktemp),
+# но в ней лежит приватный ключ REALITY — поэтому удаляется сразу.
+_nonip_try() {
+  local tmp rc=1
+  tmp=$(mktemp /tmp/xm-nonip.XXXXXX.json) || return 1
+  if _nonip_patch "$1" > "$tmp" 2>/dev/null \
+     && xray -test -config "$tmp" 2>&1 | grep -q "Configuration OK"; then rc=0; fi
+  rm -f "$tmp"
+  return $rc
+}
+
 # Переключение поведения nginx-fallback на чужой SNI.
 # ВАЖНО: правим default ТОЛЬКО в map $reality_upstream. В файле есть второй
 # map ($log_probe) со своим default 1; — тронуть его значит сломать фильтр
@@ -562,6 +630,26 @@ _ngx_resolver_public() {
 #
 # Правим ТОЧЕЧНО, sed по конкретным директивам: файл мог быть отредактирован
 # руками, и перезапись целиком снесла бы чужие правки.
+
+# headers-more — единственный способ поменять заголовок Server: `server_tokens
+# off` убирает только версию, слово nginx остаётся. Без модуля :80 отвечает
+# «nginx» там, где домен-маска отвечает своим именем, и тест B7 остаётся
+# красным навсегда: предупреждением это не лечится. Пакет и так в списке
+# зависимостей setup.sh — на серверах, поставленных до его появления, его
+# просто нет. Поэтому harden не советует, а ставит.
+# Новый динамический модуль подхватывается только полным перезапуском nginx:
+# load_module по reload не применяется.
+_ngx_headers_more() {
+  grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null && return 2
+  command -v apt-get >/dev/null 2>&1 || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    -o Dpkg::Options::=--force-confold libnginx-mod-http-headers-more-filter >/dev/null 2>&1 || return 1
+  grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null || return 1
+  nginx -t &>/dev/null || return 1
+  systemctl restart nginx 2>/dev/null || return 1
+  return 0
+}
+
 _ngx_http80_fix() {
   local f="/etc/nginx/sites-available/fallback" sni srv cur_srv bak changed=1
   [[ -f "$f" ]] || { warn "$f не найден — :80 не трогаю"; return 1; }
@@ -851,6 +939,34 @@ _front_worker_conn() {
   sed -i -E 's|^([[:space:]]*)worker_connections[[:space:]]+[0-9]+;|\1worker_connections 4096;|' "$f"
 }
 
+# worker_connections без worker_rlimit_nofile — половина дела: соединение это
+# дескриптор, а больше, чем разрешил systemd (по умолчанию 1024 на процесс),
+# воркер открыть не может. nginx пишет об этом одну строку при старте
+# («worker_connections exceed open file resource limit») и дальше просто не
+# принимает лишние соединения — молча. А молча потерянное соединение на этом
+# сервере равно «принял TCP и закрыл», то есть подписи прокси.
+# Директива top-level, поэтому ставится рядом с worker_processes.
+# Возврат: 0 — поправили, 1 — не смогли, 2 — уже достаточно.
+_ngx_rlimit_nofile() {
+  local f=/etc/nginx/nginx.conf cur bak
+  [[ -f "$f" ]] || return 1
+  cur=$(grep -oE '^[[:space:]]*worker_rlimit_nofile[[:space:]]+[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+$')
+  [[ -n "$cur" && "$cur" -ge 16384 ]] && return 2
+
+  mkdir -p "$BACKUP_DIR"
+  bak="$BACKUP_DIR/nginx.conf_$(date +%Y%m%d_%H%M%S).bak"
+  cp "$f" "$bak"
+  if [[ -n "$cur" ]]; then
+    sed -i -E 's|^([[:space:]]*)worker_rlimit_nofile[[:space:]]+[0-9]+;|\1worker_rlimit_nofile 16384;|' "$f"
+  else
+    grep -qE '^[[:space:]]*worker_processes[[:space:]]' "$f" || { rm -f "$bak"; return 1; }
+    sed -i -E '0,/^[[:space:]]*worker_processes[[:space:]][^;]*;/s//&\nworker_rlimit_nofile 16384;/' "$f"
+  fi
+  # nginx.conf общий для всей машины: сломать его — уронить и соседей.
+  nginx -t &>/dev/null && { rm -f "$bak"; return 0; }
+  cp "$bak" "$f"; rm -f "$bak"; return 1
+}
+
 # ─── Стабильность: sysctl-профиль и watchdog ─────────────────────────────────
 #
 # ЗАЧЕМ ОТДЕЛЬНО ОТ harden: harden закрывает утечки, tune чинит обрывы.
@@ -983,34 +1099,14 @@ _tune_counters() {
   udperr=$(nstat -az UdpRcvbufErrors   2>/dev/null | awk 'NR==2{print $2}')
 
   local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-  if [[ -n "${retr:-}" && -n "${tx:-}" && "${tx:-0}" -gt 0 ]]; then
-    pct=$(awk -v r="$retr" -v t="$tx" 'BEGIN{printf "%.2f", r*100/t}')
-    if   awk -v p="$pct" 'BEGIN{exit !(p<1)}'; then ok   "Ретрансмиты: ${pct}% (${retr} из ${tx}) — норма"
-    elif awk -v p="$pct" 'BEGIN{exit !(p<3)}'; then warn "Ретрансмиты: ${pct}% — заметные потери на пути к клиентам"
-    elif [[ "$cc" == "bbr" ]]; then
-      # BBR уже стоит, а потери всё равно высокие — значит дело не в
-      # алгоритме. Обычно это либо реальные потери на последней миле у
-      # клиентов (мобильный интернет), либо PMTU blackhole: пакеты полного
-      # размера не проходят, ICMP Too Big режется, и ядро молча ретранслирует.
-      fail "Ретрансмиты: ${pct}% при уже включённом BBR — алгоритм ни при чём. Проверь MTU probing ниже и учти, что часть потерь может быть на стороне клиентских сетей"
-    else
-      fail "Ретрансмиты: ${pct}% при cc=${cc:-?} — на потерях CUBIC режет окно вдвое каждый раз. Включи BBR: ${BOLD}sudo xm tune${NC}"
-    fi
-  fi
-  [[ -n "${to:-}" ]] && info "TCP-таймауты: ${to}"
-  if [[ "${lo:-0}" -gt 0 || "${ld:-0}" -gt 0 ]]; then
-    warn "Очередь accept переполнялась: overflows=${lo:-0}, drops=${ld:-0} — это молча потерянные подключения"
-  else
-    ok "Очередь accept не переполнялась"
-  fi
-  [[ "${udperr:-0}" -gt 0 ]] && warn "UDP-датаграмм потеряно по буферу: ${udperr}" \
-                             || ok "UDP-буфер без потерь"
-  info "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null), qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
-  info "MTU probing: $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null) (нужен 1 — иначе мобильные клиенты виснут на PMTU blackhole)"
 
-  # Дельта с прошлого снимка. Всё, что выше, — с момента загрузки, и по этим
-  # числам нельзя сказать, идут ли потери прямо сейчас.
-  local s_t s_r s_x s_o s_l s_d s_u d_age d_tx d_retr d_lo d_ld d_pct
+  # ── Окно с прошлого замера считается ПЕРВЫМ, потому что вердикт даётся по
+  # нему. Накопительное с загрузки отвечает на вопрос «случалось ли это
+  # когда-нибудь», а не «происходит ли сейчас»: авария трёхдневной давности
+  # держит красный процент неделями, а свежая правка в нём не видна. Ровно на
+  # такой подаче прошлая сессия обвинила домен-маску по счётчику за шесть суток.
+  local s_t s_r s_x s_o s_l s_d s_u d_age=0 d_tx=0 d_retr=0 d_lo=0 d_ld=0
+  local w_ok=0 w_label=""
   if [[ -r "$COUNTERS_SNAP" ]] \
      && read -r s_t s_r s_x s_o s_l s_d s_u < "$COUNTERS_SNAP" \
      && [[ -n "${s_t:-}" ]]; then
@@ -1021,16 +1117,57 @@ _tune_counters() {
       info "Счётчики обнулились (перезагрузка) — точка отсчёта обновлена"
       _counters_snap_write
     elif [[ "$d_age" -ge 300 && "$d_tx" -gt 0 ]]; then
-      d_pct=$(awk -v r="$d_retr" -v t="$d_tx" 'BEGIN{printf "%.2f", r*100/t}')
-      info "За $(( d_age / 3600 )) ч $(( (d_age % 3600) / 60 )) мин с прошлого замера: ретрансмиты ${d_pct}%, accept-очередь ${d_lo}/${d_ld}"
-      info "  Вердикт смотри по этой строке, а не по накопительным выше"
+      w_ok=1; w_label="за $(( d_age / 3600 )) ч $(( (d_age % 3600) / 60 )) мин"
     else
-      info "Точка отсчёта свежая ($(( d_age / 60 )) мин) — дельта появится позже"
+      info "Точка отсчёта свежая ($(( d_age / 60 )) мин) — вердикт пока по накопительному"
     fi
   else
     _counters_snap_write
-    info "Точка отсчёта поставлена — следующий запуск покажет дельту"
+    info "Точка отсчёта поставлена — следующий запуск даст вердикт по окну"
   fi
+
+  local src cum_pct
+  if [[ -n "${retr:-}" && -n "${tx:-}" && "${tx:-0}" -gt 0 ]]; then
+    cum_pct=$(awk -v r="$retr" -v t="$tx" 'BEGIN{printf "%.2f", r*100/t}')
+  fi
+  if [[ "$w_ok" -eq 1 ]]; then
+    pct=$(awk -v r="$d_retr" -v t="$d_tx" 'BEGIN{printf "%.2f", r*100/t}'); src="$w_label"
+  else
+    pct="$cum_pct"; src="накопительно с загрузки"
+  fi
+
+  if [[ -n "${pct:-}" ]]; then
+    if   awk -v p="$pct" 'BEGIN{exit !(p<1)}'; then ok   "Ретрансмиты ${src}: ${pct}% — норма"
+    elif awk -v p="$pct" 'BEGIN{exit !(p<3)}'; then warn "Ретрансмиты ${src}: ${pct}% — заметные потери на пути к клиентам"
+    elif [[ "$cc" == "bbr" ]]; then
+      # BBR уже стоит, а потери всё равно высокие — значит дело не в
+      # алгоритме. Обычно это либо реальные потери на последней миле у
+      # клиентов (мобильный интернет), либо PMTU blackhole: пакеты полного
+      # размера не проходят, ICMP Too Big режется, и ядро молча ретранслирует.
+      fail "Ретрансмиты ${src}: ${pct}% при уже включённом BBR — алгоритм ни при чём. Проверь MTU probing ниже и учти, что часть потерь может быть на стороне клиентских сетей"
+    else
+      fail "Ретрансмиты ${src}: ${pct}% при cc=${cc:-?} — на потерях CUBIC режет окно вдвое каждый раз. Включи BBR: ${BOLD}sudo xm tune${NC}"
+    fi
+    [[ "$w_ok" -eq 1 && -n "${cum_pct:-}" ]] \
+      && info "  Накопительно с загрузки: ${cum_pct}% (${retr} из ${tx}) — история, не текущее состояние"
+  fi
+
+  [[ -n "${to:-}" ]] && info "TCP-таймауты накопительно: ${to}"
+
+  local q_lo q_ld
+  if [[ "$w_ok" -eq 1 ]]; then q_lo="$d_lo"; q_ld="$d_ld"; else q_lo="${lo:-0}"; q_ld="${ld:-0}"; fi
+  if [[ "$q_lo" -gt 0 || "$q_ld" -gt 0 ]]; then
+    warn "Очередь accept переполнялась ${src}: overflows=${q_lo}, drops=${q_ld} — это молча потерянные подключения"
+  else
+    ok "Очередь accept не переполнялась ${src}"
+  fi
+  [[ "$w_ok" -eq 1 && $(( ${lo:-0} + ${ld:-0} )) -gt $(( q_lo + q_ld )) ]] \
+    && info "  Накопительно с загрузки: overflows=${lo:-0}, drops=${ld:-0} — было до последней правки"
+
+  [[ "${udperr:-0}" -gt 0 ]] && warn "UDP-датаграмм потеряно по буферу (накопительно): ${udperr}" \
+                             || ok "UDP-буфер без потерь"
+  info "Congestion control: ${cc:-?}, qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  info "MTU probing: $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null) (нужен 1 — иначе мобильные клиенты виснут на PMTU blackhole)"
 }
 
 # ─── Watchdog ────────────────────────────────────────────────────────────────
@@ -2763,6 +2900,10 @@ dpi|diag-dpi)
       ok "Server совпадает с доменом-маской"
     else
       dwarn "Server отличается («${OUR_SRV:-нет}» вместо «${REAL_SRV}») — сканеру видно, что :80 обслуживает не тот сервер, чей сертификат отдаёт :$PORT"
+      # Причина почти всегда одна и та же, и без неё вердикт читается как
+      # «xm harden не сработал», хотя менять заголовок ему просто нечем.
+      grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null \
+        || info "      причина: модуль headers-more не установлен — ${BOLD}sudo xm harden${NC} поставит его и перезапустит nginx"
     fi
     if [[ "$OUR_LOC" =~ ^https://([0-9]{1,3}\.){3}[0-9]{1,3}/ ]]; then
       dfail "Redirect ведёт на голый IP ($OUR_LOC) — настоящий сайт редиректит на своё имя. Это прямая подпись «здесь нет вебсайта»."
@@ -2773,6 +2914,16 @@ dpi|diag-dpi)
     # B8 — НОМЕР ПОРТА. Никакая маскировка TLS не спасает, если сертификат
     # крупного сайта отдаётся на порту, на котором сайтов не бывает.
     echo -e "\n  ${BOLD}B8. Номер порта${NC}"
+    # Сначала — открыт ли порт снаружи ВООБЩЕ. Все зонды выше шли с самого VPS
+    # на его же внешний адрес, то есть через lo, а петлю ufw пропускает целиком.
+    # Поэтому закрытый в файрволе порт выглядит здесь безупречно зелёным, и
+    # только эта проверка отличает «сервер маскируется идеально» от «сервера
+    # снаружи нет вовсе».
+    if _ufw_active; then
+      _ufw_allowed "$PORT" \
+        && ok "UFW: публичный порт $PORT открыт" \
+        || dfail "UFW: порт $PORT НЕ открыт — снаружи не подключится никто, хотя зонды выше прошли: они идут через loopback, мимо файрвола. Открой: ${BOLD}sudo ufw allow ${PORT}/tcp${NC}"
+    fi
     if [[ "$PORT" == "443" ]]; then
       ok "Порт 443 — трафик неотличим от обычного HTTPS по одному только номеру"
       # Фронт увёл клиентов на 443, но пока старый порт открыт наружу, на нём
@@ -2791,6 +2942,21 @@ dpi|diag-dpi)
       else
         info "TCP/443 занят ($P443) — либо освободи и sudo xm set-port 443, либо"
         info "раздели его по SNI: sudo xm front add <SNI соседа> <его порт>, затем sudo xm front on"
+      fi
+    fi
+
+    # Второй inbound фронт обслуживать не может: маска у него та же, а по
+    # одному SNI два потока не развести. Значит он либо открыт наружу своим
+    # номером — и это ровно та аномалия, что описана выше, — либо закрыт, и
+    # тогда это канал только для loopback-диагностики. Второе безопаснее, но
+    # об этом надо сказать вслух: `xm qr --tcp` выдаёт рабочий на вид URI, а
+    # `xm selftest --tcp` ходит через loopback и закрытого файрвола не видит.
+    if _has_tcp_inbound && _ufw_active; then
+      TCP_P=$(jq -r '.inbounds[1].port' "$CONFIG" 2>/dev/null)
+      if _ufw_allowed "$TCP_P"; then
+        [[ "$TCP_P" != "443" ]] && dwarn "TCP/Vision inbound открыт наружу на $TCP_P — сертификат $SNI на нестандартном порту, та же аномалия. Держи порт закрытым, если канал не нужен клиентам: sudo ufw delete allow ${TCP_P}/tcp"
+      else
+        info "TCP/Vision inbound на $TCP_P закрыт в UFW — снаружи недоступен. Для B8 это правильно, но учти: URI из ${BOLD}xm qr --tcp${NC} у клиента не заработает, а ${BOLD}xm selftest --tcp${NC} этого не покажет (идёт через loopback)"
       fi
     fi
 
@@ -3374,7 +3540,7 @@ tune)
         && ok "policy.handshake: ${HS} с — хватает на медленный dest" \
         || warn "policy.handshake: ${HS} с — при тормозящем резолвинге dest хендшейк не успевает"
       sep
-      echo -e "${BOLD}Счётчики ядра (накопительные с загрузки)${NC}"
+      echo -e "${BOLD}Счётчики ядра — вердикт по окну с прошлого замера${NC}"
       _tune_counters
       sep; info "Режим --check: ничего не изменено. Применить: ${BOLD}sudo xm tune${NC}"
       exit 0
@@ -3537,9 +3703,25 @@ front)
           2) ok "nginx worker_connections уже достаточен" ;;
           *) warn "worker_connections в nginx.conf не найден — проверь events{} вручную" ;;
         esac
+        _ngx_rlimit_nofile; case $? in
+          0) ok "nginx worker_rlimit_nofile → 16384 (без него воркер упирается в 1024 дескриптора)" ;;
+          2) ok "nginx worker_rlimit_nofile уже достаточен" ;;
+          *) warn "worker_rlimit_nofile выставить не удалось — при потолке 1024 nginx молча не примет часть соединений" ;;
+        esac
 
         _front_apply || exit 1
         ok "Фронт поднят: $OUR_SNI и чужой SNI → 127.0.0.1:$OUR_PORT, соседи — по маршрутам"
+
+        # Установка открывала в ufw порт inbound, а фронт слушает публичный —
+        # это разные номера. Без правила сокет поднимется, `xm front status`
+        # покажет «порт держит nginx», и все зонды diag-dpi пройдут (они идут
+        # через loopback, мимо файрвола), а снаружи не подключится никто.
+        _ufw_open "$FPORT" "Xray front (SNI)"; case $? in
+          0) ok "UFW: открыт ${FPORT}/tcp — без этого правила фронт слушает, но снаружи закрыт" ;;
+          1) ok "UFW: ${FPORT}/tcp уже открыт" ;;
+          2) info "UFW не активен — правило не требуется" ;;
+          *) fail "UFW не принял правило для ${FPORT}/tcp — открой вручную: sudo ufw allow ${FPORT}/tcp" ;;
+        esac
         _front_fallback_limit 5000 \
           && ok "Лимит fallback снят с 200: за фронтом он общий на всех, а не по IP" \
           || info "Лимит fallback уже поднят"
@@ -3568,6 +3750,15 @@ front)
         nginx -t &>/dev/null && systemctl reload nginx
         info "Маршруты сохранены в $FRONT_STATE — вернуть всё: sudo xm front on"
         warn "Клиентам снова нужен URI с портом $OUR_PORT: sudo xm qr --all"
+        # `front on` подсказывал закрыть порт inbound снаружи. Если совет был
+        # выполнен, после снятия фронта клиентам некуда идти вообще.
+        _ufw_open "$OUR_PORT" "Xray XHTTP"; case $? in
+          0) ok "UFW: вернул ${OUR_PORT}/tcp — клиенты снова ходят на него напрямую" ;;
+          1) ok "UFW: ${OUR_PORT}/tcp уже открыт" ;;
+          3) fail "UFW не принял правило — открой вручную: sudo ufw allow ${OUR_PORT}/tcp" ;;
+        esac
+        _ufw_active && _ufw_allowed "$FPORT" \
+          && info "Правило ${FPORT}/tcp оставлено: за этот порт может вернуться соседняя служба. Убрать: sudo ufw delete allow ${FPORT}/tcp"
         while read -r rsni rup; do
           [[ -n "$rsni" ]] && warn "Служба $rsni осталась на 127.0.0.1:$rup — верни ей публичный порт сама"
         done < <(_front_routes)
@@ -3627,6 +3818,10 @@ front)
           sep
           info "TCP/Vision inbound на $TCPP мимо фронта: у него та же маска, что у XHTTP,"
           info "а по одному SNI два потока не развести. Это запасной канал для диагностики."
+          if _ufw_active && ! _ufw_allowed "$TCPP"; then
+            info "Порт $TCPP закрыт в UFW — снаружи канала нет. Для маскировки это"
+            info "правильно, но URI из xm qr --tcp у клиента не заработает."
+          fi
         fi
         sep
         RLIM=$(grep -oE 'limit_conn[[:space:]]+reality_conn[[:space:]]+[0-9]+' /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null | grep -oE '[0-9]+$')
@@ -3650,9 +3845,74 @@ harden)
                    || warn "nginx-fallback: strict (чужой SNI → молчаливый обрыв TCP — подпись прокси)"
     _resolved_dot_on && ok "Системный резолвер: строгий DoT" \
                      || warn "Системный резолвер: открытый UDP/53 (всё, что попадёт в стаб, видит хостер)"
+    # Только при живом перехвате :53: без dns-outbound это поле негде задавать,
+    # и строка про него сбивала бы с толку.
+    NONIP_CUR=""
+    if _dns_hijack_on; then
+      NONIP_CUR=$(_nonip_current)
+      case "${NONIP_CUR:-}" in
+        drop) ok "Запросы не-A/AAAA: drop — наружу не уходят. Ценой того, что Android не получает ответа на свои HTTPS/SVCB и ждёт таймаута" ;;
+        "")   info "Запросы не-A/AAAA: поле не задано — поведение по умолчанию этой сборки Xray" ;;
+        *)    warn "Запросы не-A/AAAA: ${NONIP_CUR} — не drop, часть запросов покидает VPS открытым UDP" ;;
+      esac
+    fi
 
     if [[ "$MODE" == "--check" ]]; then
       sep; info "Режим --check: ничего не изменено. Применить: ${BOLD}sudo xm harden${NC}"; exit 0
+    fi
+
+    # Точечная ручка вместо `--off`: поменять режим не-A/AAAA, не трогая DoH,
+    # перехват :53, DoT и mimic. Нужна, чтобы проверять гипотезу «мигает из-за
+    # HTTPS/SVCB» не ценой возврата всех утечек сразу.
+    if [[ "$MODE" == "--nonip" ]]; then
+      NONIP_NEW="${3:-}"
+      sep
+      echo -e "${BOLD}Режим запросов не-A/AAAA (HTTPS/SVCB, TXT)${NC}"
+      # Без dns-outbound поле негде задавать, а проба показала бы «принимается»
+      # для чего угодно: патч просто не нашёл бы, что патчить.
+      _dns_hijack_on || { fail "Перехвата :53 нет — сначала ${BOLD}sudo xm harden${NC}"; exit 1; }
+      if [[ -z "$NONIP_NEW" ]]; then
+        echo -e "  Сейчас: ${BOLD}${NONIP_CUR:-<не задано>}${NC}"
+        echo    "  Проверено на копии конфига этой сборкой Xray:"
+        for v in drop skip reject; do
+          _nonip_try "$v" && ok "  $v — принимается" || info "  $v — сборка отвергает"
+        done
+        echo ""
+        echo -e "  ${BOLD}sudo xm harden --nonip drop${NC}   отбрасывать (приватно; Android ждёт таймаута)"
+        echo -e "  ${BOLD}sudo xm harden --nonip skip${NC}   пропускать на исходный адрес — ${YELLOW}уходит открытым UDP${NC}"
+        echo -e "  ${BOLD}sudo xm harden --nonip off${NC}    убрать поле, оставить поведение сборки по умолчанию"
+        echo ""
+        info "Это диагностическая ручка. Остальные шаги harden (DoH, перехват :53, DoT, mimic) она не трогает"
+        warn "«Принимается» — про схему конфига, а не про поведение: Xray молча"
+        warn "игнорирует часть неизвестных значений. Что реально изменилось, видно"
+        warn "по симптому, а не по коду возврата."
+        exit 0
+      fi
+      [[ "$NONIP_NEW" == "off" ]] && NONIP_NEW=""
+      # Список значений не хардкодим: он менялся между сборками. Проверяет сам
+      # Xray на копии конфига — здесь только отсекаем заведомый мусор.
+      [[ -z "$NONIP_NEW" || "$NONIP_NEW" =~ ^[a-zA-Z]+$ ]] \
+        || { fail "Значение — одно слово латиницей, либо off"; exit 1; }
+      [[ "$NONIP_CUR" == "$NONIP_NEW" ]] && { ok "Уже ${NONIP_NEW:-<не задано>} — ничего не меняю"; exit 0; }
+
+      NBAK=$(_backup_config before_nonip); ok "Бэкап: $NBAK"
+      if ! _nonip_patch "$NONIP_NEW" | _atomic_write_config; then
+        fail "jq-патч не сработал — конфиг не тронут"; exit 1
+      fi
+      if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+        fail "Сборка Xray не приняла значение «${NONIP_NEW}» — откат"
+        cp "$NBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+      fi
+      systemctl restart xray; sleep 2
+      if ! systemctl is-active --quiet xray; then
+        fail "Xray не поднялся — откат"
+        cp "$NBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        systemctl restart xray; exit 1
+      fi
+      ok "nonIPQuery: ${NONIP_CUR:-<не задано>} → ${NONIP_NEW:-<не задано>}, Xray перезапущен"
+      [[ "$NONIP_NEW" == "skip" ]] && \
+        warn "skip — режим на время проверки: запросы не-A/AAAA теперь покидают VPS открытым UDP. Вернуть: sudo xm harden --nonip drop"
+      exit 0
     fi
 
     if [[ "$MODE" == "--off" ]]; then
@@ -3703,28 +3963,40 @@ harden)
     # и никакой dns-блок внутри Xray этого не отменяет.
     sep
     echo -e "${BOLD}Шаг 2: системный резолвер и его потребители${NC}"
+    # Четыре апстрима, а не два. Под строгим DoT недоступный :853 — это не
+    # деградация, а SERVFAIL: резолвед не имеет права уйти в открытый UDP и
+    # честно возвращает ошибку. Дальше nginx не находит апстрим fallback,
+    # REALITY некуда форвардить, и сервер начинает принимать TCP и рвать —
+    # то есть выдавать подпись прокси. Замерено: watchdog чинил мёртвый
+    # резолвинг dest несколько раз за трое суток. Три независимых провайдера
+    # вместо двух убирают ситуацию «один недоступен = резолвинга нет».
+    # FallbackDNS пустой — обязателен: с непустым resolved при недоступном
+    # :853 молча уходит в открытый UDP, та же утечка, но уже без признаков.
+    RESOLVED_WANT='[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net 8.8.8.8#dns.google
+FallbackDNS=
+DNSOverTLS=yes
+Domains=~.'
     if ! command -v resolvectl &>/dev/null; then
       warn "systemd-resolved не найден — шаг пропущен, системный резолвинг остаётся открытым"
-    elif _resolved_dot_on; then
-      ok "systemd-resolved уже DNSOverTLS=yes — не трогаю"
+    elif [[ -f "$RESOLVED_DROPIN" ]] && [[ "$(cat "$RESOLVED_DROPIN")" == "$RESOLVED_WANT" ]] && _resolved_dot_on; then
+      ok "systemd-resolved: наш drop-in актуален, DoT строгий — не трогаю"
+    elif [[ ! -f "$RESOLVED_DROPIN" ]] && _resolved_dot_on; then
+      # DoT настроен не нами — чужую конфигурацию не переписываем.
+      ok "systemd-resolved уже DNSOverTLS=yes и настроен не нами — не трогаю"
     else
+      # Сюда попадаем в двух случаях: DoT нет вовсе, либо наш drop-in устарел
+      # (раньше этот шаг не обновлялся никогда — условие было «DoT включён →
+      # не трогаю», и правка списка апстримов не доезжала до сервера).
       RBAK=""
       if [[ -f "$RESOLVED_DROPIN" ]]; then
         RBAK="${RESOLVED_DROPIN}.bak_$(date +%Y%m%d_%H%M%S)"; cp "$RESOLVED_DROPIN" "$RBAK"
       fi
       mkdir -p "$(dirname "$RESOLVED_DROPIN")"
-      # FallbackDNS пустой — обязателен. С непустым resolved при недоступном
-      # :853 молча уходит в открытый UDP: та же утечка, но уже без признаков.
-      cat > "$RESOLVED_DROPIN" <<'RESOLVEDEOF'
-[Resolve]
-DNS=1.1.1.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net
-FallbackDNS=
-DNSOverTLS=yes
-Domains=~.
-RESOLVEDEOF
+      printf '%s\n' "$RESOLVED_WANT" > "$RESOLVED_DROPIN"
       systemctl restart systemd-resolved 2>/dev/null; sleep 1
       if _resolved_dot_on && resolvectl query example.com &>/dev/null; then
-        ok "systemd-resolved: DNSOverTLS=yes, апстримы 1.1.1.1 и 9.9.9.9 по :853"
+        ok "systemd-resolved: DNSOverTLS=yes, четыре апстрима по :853 (Cloudflare ×2, Quad9, Google)"
       else
         fail "DoT не поднялся (хостер режет :853?) — откат этого шага"
         if [[ -n "$RBAK" ]]; then cp "$RBAK" "$RESOLVED_DROPIN"; else rm -f "$RESOLVED_DROPIN"; fi
@@ -3827,6 +4099,12 @@ RESOLVEDEOF
     # ── 6. :80 — заголовки и цель редиректа ─────────────────────────────────
     sep
     echo -e "${BOLD}Шаг 5: порт 80${NC}"
+    _ngx_headers_more; case $? in
+      0) ok "Модуль headers-more поставлен, nginx перезапущен — теперь Server можно замаскировать" ;;
+      2) : ;;
+      *) warn "headers-more поставить не удалось — Server на :80 останется «nginx» (тест B7)"
+         warn "Вручную: sudo apt install -y libnginx-mod-http-headers-more-filter && sudo systemctl restart nginx" ;;
+    esac
     _ngx_http80_fix; H80_RC=$?
     case "$H80_RC" in
       0) ok ":80 приведён к виду домена-маски: редирект на имя, Server как у сайта, лог выключен" ;;
@@ -3838,8 +4116,9 @@ RESOLVEDEOF
     echo -e "${GREEN}${BOLD}  Готово.${NC}"
     echo -e "  Проверить эффект: ${BOLD}sudo xm diag-dpi${NC}"
     echo -e "  Откатить всё:     ${BOLD}sudo xm harden --off${NC}"
-    echo -e "  ${YELLOW}Если какое-то приложение (мессенджер) начнёт капризничать с DNS —${NC}"
-    echo -e "  ${YELLOW}это nonIPQuery=drop. Откат: sudo xm harden --off${NC}"
+    echo -e "  ${YELLOW}Если приложение (мессенджер, Android) начнёт капризничать с DNS —${NC}"
+    echo -e "  ${YELLOW}проверь nonIPQuery точечно: ${BOLD}sudo xm harden --nonip${NC}${YELLOW}. Полный откат${NC}"
+    echo -e "  ${YELLOW}(--off) для этого не нужен: он заодно снимает DoH, DoT и mimic.${NC}"
     ;;
 
 pq)
@@ -4307,6 +4586,7 @@ neighbors)
     echo -e "${BOLD}${GREEN}Анти-DPI и анонимность:${NC}"
     echo -e "  ${GREEN}xm harden${NC}                        DoH на сервере + перехват :53 + mimic-fallback"
     echo    "  xm harden --check | --off        Показать состояние / откатить"
+    echo    "  xm harden --nonip [drop|skip|off]  Режим запросов не-A/AAAA, без отката остального"
     echo -e "  ${GREEN}xm pq status|on|off${NC}              ML-DSA-65: post-quantum подпись REALITY"
     echo ""
     echo -e "${BOLD}${GREEN}Стабильность:${NC}"

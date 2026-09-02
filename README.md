@@ -97,6 +97,8 @@ xm front [on|off|status]       # разделить публичный порт 
 xm front add <sni> <порт>      # маршрут соседа: его домен → его порт на 127.0.0.1
 xm front del <sni>             # убрать маршрут
 xm harden [--check|--off]      # DoH + перехват :53 + строгий DoT + mimic-fallback + маскировка :80
+xm harden --nonip [drop|skip|off]  # режим запросов не-A/AAAA (HTTPS/SVCB) отдельной ручкой,
+                               # не откатывая DoH, DoT и mimic вместе с ним
 xm tune   [--check|--off]      # сетевой стек + таймаут хендшейка + watchdog
 xm watchdog on|off|now|status  # присмотр за сквозным путём
 xm pq status|on|off            # ML-DSA-65: post-quantum подпись REALITY
