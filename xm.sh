@@ -630,6 +630,26 @@ _ngx_resolver_public() {
 #
 # Правим ТОЧЕЧНО, sed по конкретным директивам: файл мог быть отредактирован
 # руками, и перезапись целиком снесла бы чужие правки.
+
+# headers-more — единственный способ поменять заголовок Server: `server_tokens
+# off` убирает только версию, слово nginx остаётся. Без модуля :80 отвечает
+# «nginx» там, где домен-маска отвечает своим именем, и тест B7 остаётся
+# красным навсегда: предупреждением это не лечится. Пакет и так в списке
+# зависимостей setup.sh — на серверах, поставленных до его появления, его
+# просто нет. Поэтому harden не советует, а ставит.
+# Новый динамический модуль подхватывается только полным перезапуском nginx:
+# load_module по reload не применяется.
+_ngx_headers_more() {
+  grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null && return 2
+  command -v apt-get >/dev/null 2>&1 || return 1
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    -o Dpkg::Options::=--force-confold libnginx-mod-http-headers-more-filter >/dev/null 2>&1 || return 1
+  grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null || return 1
+  nginx -t &>/dev/null || return 1
+  systemctl restart nginx 2>/dev/null || return 1
+  return 0
+}
+
 _ngx_http80_fix() {
   local f="/etc/nginx/sites-available/fallback" sni srv cur_srv bak changed=1
   [[ -f "$f" ]] || { warn "$f не найден — :80 не трогаю"; return 1; }
@@ -1079,34 +1099,14 @@ _tune_counters() {
   udperr=$(nstat -az UdpRcvbufErrors   2>/dev/null | awk 'NR==2{print $2}')
 
   local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-  if [[ -n "${retr:-}" && -n "${tx:-}" && "${tx:-0}" -gt 0 ]]; then
-    pct=$(awk -v r="$retr" -v t="$tx" 'BEGIN{printf "%.2f", r*100/t}')
-    if   awk -v p="$pct" 'BEGIN{exit !(p<1)}'; then ok   "Ретрансмиты: ${pct}% (${retr} из ${tx}) — норма"
-    elif awk -v p="$pct" 'BEGIN{exit !(p<3)}'; then warn "Ретрансмиты: ${pct}% — заметные потери на пути к клиентам"
-    elif [[ "$cc" == "bbr" ]]; then
-      # BBR уже стоит, а потери всё равно высокие — значит дело не в
-      # алгоритме. Обычно это либо реальные потери на последней миле у
-      # клиентов (мобильный интернет), либо PMTU blackhole: пакеты полного
-      # размера не проходят, ICMP Too Big режется, и ядро молча ретранслирует.
-      fail "Ретрансмиты: ${pct}% при уже включённом BBR — алгоритм ни при чём. Проверь MTU probing ниже и учти, что часть потерь может быть на стороне клиентских сетей"
-    else
-      fail "Ретрансмиты: ${pct}% при cc=${cc:-?} — на потерях CUBIC режет окно вдвое каждый раз. Включи BBR: ${BOLD}sudo xm tune${NC}"
-    fi
-  fi
-  [[ -n "${to:-}" ]] && info "TCP-таймауты: ${to}"
-  if [[ "${lo:-0}" -gt 0 || "${ld:-0}" -gt 0 ]]; then
-    warn "Очередь accept переполнялась: overflows=${lo:-0}, drops=${ld:-0} — это молча потерянные подключения"
-  else
-    ok "Очередь accept не переполнялась"
-  fi
-  [[ "${udperr:-0}" -gt 0 ]] && warn "UDP-датаграмм потеряно по буферу: ${udperr}" \
-                             || ok "UDP-буфер без потерь"
-  info "Congestion control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null), qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
-  info "MTU probing: $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null) (нужен 1 — иначе мобильные клиенты виснут на PMTU blackhole)"
 
-  # Дельта с прошлого снимка. Всё, что выше, — с момента загрузки, и по этим
-  # числам нельзя сказать, идут ли потери прямо сейчас.
-  local s_t s_r s_x s_o s_l s_d s_u d_age d_tx d_retr d_lo d_ld d_pct
+  # ── Окно с прошлого замера считается ПЕРВЫМ, потому что вердикт даётся по
+  # нему. Накопительное с загрузки отвечает на вопрос «случалось ли это
+  # когда-нибудь», а не «происходит ли сейчас»: авария трёхдневной давности
+  # держит красный процент неделями, а свежая правка в нём не видна. Ровно на
+  # такой подаче прошлая сессия обвинила домен-маску по счётчику за шесть суток.
+  local s_t s_r s_x s_o s_l s_d s_u d_age=0 d_tx=0 d_retr=0 d_lo=0 d_ld=0
+  local w_ok=0 w_label=""
   if [[ -r "$COUNTERS_SNAP" ]] \
      && read -r s_t s_r s_x s_o s_l s_d s_u < "$COUNTERS_SNAP" \
      && [[ -n "${s_t:-}" ]]; then
@@ -1117,16 +1117,57 @@ _tune_counters() {
       info "Счётчики обнулились (перезагрузка) — точка отсчёта обновлена"
       _counters_snap_write
     elif [[ "$d_age" -ge 300 && "$d_tx" -gt 0 ]]; then
-      d_pct=$(awk -v r="$d_retr" -v t="$d_tx" 'BEGIN{printf "%.2f", r*100/t}')
-      info "За $(( d_age / 3600 )) ч $(( (d_age % 3600) / 60 )) мин с прошлого замера: ретрансмиты ${d_pct}%, accept-очередь ${d_lo}/${d_ld}"
-      info "  Вердикт смотри по этой строке, а не по накопительным выше"
+      w_ok=1; w_label="за $(( d_age / 3600 )) ч $(( (d_age % 3600) / 60 )) мин"
     else
-      info "Точка отсчёта свежая ($(( d_age / 60 )) мин) — дельта появится позже"
+      info "Точка отсчёта свежая ($(( d_age / 60 )) мин) — вердикт пока по накопительному"
     fi
   else
     _counters_snap_write
-    info "Точка отсчёта поставлена — следующий запуск покажет дельту"
+    info "Точка отсчёта поставлена — следующий запуск даст вердикт по окну"
   fi
+
+  local src cum_pct
+  if [[ -n "${retr:-}" && -n "${tx:-}" && "${tx:-0}" -gt 0 ]]; then
+    cum_pct=$(awk -v r="$retr" -v t="$tx" 'BEGIN{printf "%.2f", r*100/t}')
+  fi
+  if [[ "$w_ok" -eq 1 ]]; then
+    pct=$(awk -v r="$d_retr" -v t="$d_tx" 'BEGIN{printf "%.2f", r*100/t}'); src="$w_label"
+  else
+    pct="$cum_pct"; src="накопительно с загрузки"
+  fi
+
+  if [[ -n "${pct:-}" ]]; then
+    if   awk -v p="$pct" 'BEGIN{exit !(p<1)}'; then ok   "Ретрансмиты ${src}: ${pct}% — норма"
+    elif awk -v p="$pct" 'BEGIN{exit !(p<3)}'; then warn "Ретрансмиты ${src}: ${pct}% — заметные потери на пути к клиентам"
+    elif [[ "$cc" == "bbr" ]]; then
+      # BBR уже стоит, а потери всё равно высокие — значит дело не в
+      # алгоритме. Обычно это либо реальные потери на последней миле у
+      # клиентов (мобильный интернет), либо PMTU blackhole: пакеты полного
+      # размера не проходят, ICMP Too Big режется, и ядро молча ретранслирует.
+      fail "Ретрансмиты ${src}: ${pct}% при уже включённом BBR — алгоритм ни при чём. Проверь MTU probing ниже и учти, что часть потерь может быть на стороне клиентских сетей"
+    else
+      fail "Ретрансмиты ${src}: ${pct}% при cc=${cc:-?} — на потерях CUBIC режет окно вдвое каждый раз. Включи BBR: ${BOLD}sudo xm tune${NC}"
+    fi
+    [[ "$w_ok" -eq 1 && -n "${cum_pct:-}" ]] \
+      && info "  Накопительно с загрузки: ${cum_pct}% (${retr} из ${tx}) — история, не текущее состояние"
+  fi
+
+  [[ -n "${to:-}" ]] && info "TCP-таймауты накопительно: ${to}"
+
+  local q_lo q_ld
+  if [[ "$w_ok" -eq 1 ]]; then q_lo="$d_lo"; q_ld="$d_ld"; else q_lo="${lo:-0}"; q_ld="${ld:-0}"; fi
+  if [[ "$q_lo" -gt 0 || "$q_ld" -gt 0 ]]; then
+    warn "Очередь accept переполнялась ${src}: overflows=${q_lo}, drops=${q_ld} — это молча потерянные подключения"
+  else
+    ok "Очередь accept не переполнялась ${src}"
+  fi
+  [[ "$w_ok" -eq 1 && $(( ${lo:-0} + ${ld:-0} )) -gt $(( q_lo + q_ld )) ]] \
+    && info "  Накопительно с загрузки: overflows=${lo:-0}, drops=${ld:-0} — было до последней правки"
+
+  [[ "${udperr:-0}" -gt 0 ]] && warn "UDP-датаграмм потеряно по буферу (накопительно): ${udperr}" \
+                             || ok "UDP-буфер без потерь"
+  info "Congestion control: ${cc:-?}, qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+  info "MTU probing: $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null) (нужен 1 — иначе мобильные клиенты виснут на PMTU blackhole)"
 }
 
 # ─── Watchdog ────────────────────────────────────────────────────────────────
@@ -2859,6 +2900,10 @@ dpi|diag-dpi)
       ok "Server совпадает с доменом-маской"
     else
       dwarn "Server отличается («${OUR_SRV:-нет}» вместо «${REAL_SRV}») — сканеру видно, что :80 обслуживает не тот сервер, чей сертификат отдаёт :$PORT"
+      # Причина почти всегда одна и та же, и без неё вердикт читается как
+      # «xm harden не сработал», хотя менять заголовок ему просто нечем.
+      grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null \
+        || info "      причина: модуль headers-more не установлен — ${BOLD}sudo xm harden${NC} поставит его и перезапустит nginx"
     fi
     if [[ "$OUR_LOC" =~ ^https://([0-9]{1,3}\.){3}[0-9]{1,3}/ ]]; then
       dfail "Redirect ведёт на голый IP ($OUR_LOC) — настоящий сайт редиректит на своё имя. Это прямая подпись «здесь нет вебсайта»."
@@ -2897,6 +2942,21 @@ dpi|diag-dpi)
       else
         info "TCP/443 занят ($P443) — либо освободи и sudo xm set-port 443, либо"
         info "раздели его по SNI: sudo xm front add <SNI соседа> <его порт>, затем sudo xm front on"
+      fi
+    fi
+
+    # Второй inbound фронт обслуживать не может: маска у него та же, а по
+    # одному SNI два потока не развести. Значит он либо открыт наружу своим
+    # номером — и это ровно та аномалия, что описана выше, — либо закрыт, и
+    # тогда это канал только для loopback-диагностики. Второе безопаснее, но
+    # об этом надо сказать вслух: `xm qr --tcp` выдаёт рабочий на вид URI, а
+    # `xm selftest --tcp` ходит через loopback и закрытого файрвола не видит.
+    if _has_tcp_inbound && _ufw_active; then
+      TCP_P=$(jq -r '.inbounds[1].port' "$CONFIG" 2>/dev/null)
+      if _ufw_allowed "$TCP_P"; then
+        [[ "$TCP_P" != "443" ]] && dwarn "TCP/Vision inbound открыт наружу на $TCP_P — сертификат $SNI на нестандартном порту, та же аномалия. Держи порт закрытым, если канал не нужен клиентам: sudo ufw delete allow ${TCP_P}/tcp"
+      else
+        info "TCP/Vision inbound на $TCP_P закрыт в UFW — снаружи недоступен. Для B8 это правильно, но учти: URI из ${BOLD}xm qr --tcp${NC} у клиента не заработает, а ${BOLD}xm selftest --tcp${NC} этого не покажет (идёт через loopback)"
       fi
     fi
 
@@ -3480,7 +3540,7 @@ tune)
         && ok "policy.handshake: ${HS} с — хватает на медленный dest" \
         || warn "policy.handshake: ${HS} с — при тормозящем резолвинге dest хендшейк не успевает"
       sep
-      echo -e "${BOLD}Счётчики ядра (накопительные с загрузки)${NC}"
+      echo -e "${BOLD}Счётчики ядра — вердикт по окну с прошлого замера${NC}"
       _tune_counters
       sep; info "Режим --check: ничего не изменено. Применить: ${BOLD}sudo xm tune${NC}"
       exit 0
@@ -3758,6 +3818,10 @@ front)
           sep
           info "TCP/Vision inbound на $TCPP мимо фронта: у него та же маска, что у XHTTP,"
           info "а по одному SNI два потока не развести. Это запасной канал для диагностики."
+          if _ufw_active && ! _ufw_allowed "$TCPP"; then
+            info "Порт $TCPP закрыт в UFW — снаружи канала нет. Для маскировки это"
+            info "правильно, но URI из xm qr --tcp у клиента не заработает."
+          fi
         fi
         sep
         RLIM=$(grep -oE 'limit_conn[[:space:]]+reality_conn[[:space:]]+[0-9]+' /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null | grep -oE '[0-9]+$')
@@ -3899,28 +3963,40 @@ harden)
     # и никакой dns-блок внутри Xray этого не отменяет.
     sep
     echo -e "${BOLD}Шаг 2: системный резолвер и его потребители${NC}"
+    # Четыре апстрима, а не два. Под строгим DoT недоступный :853 — это не
+    # деградация, а SERVFAIL: резолвед не имеет права уйти в открытый UDP и
+    # честно возвращает ошибку. Дальше nginx не находит апстрим fallback,
+    # REALITY некуда форвардить, и сервер начинает принимать TCP и рвать —
+    # то есть выдавать подпись прокси. Замерено: watchdog чинил мёртвый
+    # резолвинг dest несколько раз за трое суток. Три независимых провайдера
+    # вместо двух убирают ситуацию «один недоступен = резолвинга нет».
+    # FallbackDNS пустой — обязателен: с непустым resolved при недоступном
+    # :853 молча уходит в открытый UDP, та же утечка, но уже без признаков.
+    RESOLVED_WANT='[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net 8.8.8.8#dns.google
+FallbackDNS=
+DNSOverTLS=yes
+Domains=~.'
     if ! command -v resolvectl &>/dev/null; then
       warn "systemd-resolved не найден — шаг пропущен, системный резолвинг остаётся открытым"
-    elif _resolved_dot_on; then
-      ok "systemd-resolved уже DNSOverTLS=yes — не трогаю"
+    elif [[ -f "$RESOLVED_DROPIN" ]] && [[ "$(cat "$RESOLVED_DROPIN")" == "$RESOLVED_WANT" ]] && _resolved_dot_on; then
+      ok "systemd-resolved: наш drop-in актуален, DoT строгий — не трогаю"
+    elif [[ ! -f "$RESOLVED_DROPIN" ]] && _resolved_dot_on; then
+      # DoT настроен не нами — чужую конфигурацию не переписываем.
+      ok "systemd-resolved уже DNSOverTLS=yes и настроен не нами — не трогаю"
     else
+      # Сюда попадаем в двух случаях: DoT нет вовсе, либо наш drop-in устарел
+      # (раньше этот шаг не обновлялся никогда — условие было «DoT включён →
+      # не трогаю», и правка списка апстримов не доезжала до сервера).
       RBAK=""
       if [[ -f "$RESOLVED_DROPIN" ]]; then
         RBAK="${RESOLVED_DROPIN}.bak_$(date +%Y%m%d_%H%M%S)"; cp "$RESOLVED_DROPIN" "$RBAK"
       fi
       mkdir -p "$(dirname "$RESOLVED_DROPIN")"
-      # FallbackDNS пустой — обязателен. С непустым resolved при недоступном
-      # :853 молча уходит в открытый UDP: та же утечка, но уже без признаков.
-      cat > "$RESOLVED_DROPIN" <<'RESOLVEDEOF'
-[Resolve]
-DNS=1.1.1.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net
-FallbackDNS=
-DNSOverTLS=yes
-Domains=~.
-RESOLVEDEOF
+      printf '%s\n' "$RESOLVED_WANT" > "$RESOLVED_DROPIN"
       systemctl restart systemd-resolved 2>/dev/null; sleep 1
       if _resolved_dot_on && resolvectl query example.com &>/dev/null; then
-        ok "systemd-resolved: DNSOverTLS=yes, апстримы 1.1.1.1 и 9.9.9.9 по :853"
+        ok "systemd-resolved: DNSOverTLS=yes, четыре апстрима по :853 (Cloudflare ×2, Quad9, Google)"
       else
         fail "DoT не поднялся (хостер режет :853?) — откат этого шага"
         if [[ -n "$RBAK" ]]; then cp "$RBAK" "$RESOLVED_DROPIN"; else rm -f "$RESOLVED_DROPIN"; fi
@@ -4023,6 +4099,12 @@ RESOLVEDEOF
     # ── 6. :80 — заголовки и цель редиректа ─────────────────────────────────
     sep
     echo -e "${BOLD}Шаг 5: порт 80${NC}"
+    _ngx_headers_more; case $? in
+      0) ok "Модуль headers-more поставлен, nginx перезапущен — теперь Server можно замаскировать" ;;
+      2) : ;;
+      *) warn "headers-more поставить не удалось — Server на :80 останется «nginx» (тест B7)"
+         warn "Вручную: sudo apt install -y libnginx-mod-http-headers-more-filter && sudo systemctl restart nginx" ;;
+    esac
     _ngx_http80_fix; H80_RC=$?
     case "$H80_RC" in
       0) ok ":80 приведён к виду домена-маски: редирект на имя, Server как у сайта, лог выключен" ;;
