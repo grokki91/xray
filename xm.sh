@@ -14,7 +14,7 @@
 #   Fail2ban:    ban-list / ban-ssh-stat / unban
 #   Логи:        log / log-live / log-clear
 #   Инфо:        info / paths / uuid / pubkey
-#   Анти-DPI:    harden [--check|--off|--nonip [drop|skip|off]] / pq status|on|off
+#   Анти-DPI:    harden [--check|--off|--dot|--nonip [drop|skip|off]] / pq status|on|off
 #   Фронт:       front [status|on|off|add <sni> <порт>|del <sni>]
 #   Стабильность: tune [--check|--off] / watchdog on|off|now|status
 #   Соседи:      neighbors — что ещё живёт на сервере и что трогает xm
@@ -205,6 +205,20 @@ DOH_LIST='["https+local://1.1.1.1/dns-query","https+local://9.9.9.9/dns-query","
 DOH_IPS=(1.1.1.1 9.9.9.9 8.8.8.8)
 RESOLVED_DROPIN=/etc/systemd/resolved.conf.d/xm-dot.conf
 
+# Четыре апстрима, а не два, и три независимых провайдера. Под СТРОГИМ DoT
+# недоступный :853 — это не деградация, а отказ: резолвед обязан вернуть
+# ошибку вместо открытого UDP. Дальше nginx не находит апстрим fallback,
+# REALITY некуда форвардить, и сервер принимает TCP и рвёт, то есть выдаёт
+# подпись прокси. Замерено: watchdog чинил мёртвый резолвинг dest несколько
+# раз за трое суток. Резервирование здесь — часть маскировки, а не удобство.
+# FallbackDNS пустой обязателен: с непустым резолвед при недоступном :853
+# молча уходит в открытый UDP — та же утечка, но уже без признаков.
+RESOLVED_DOT_CONF='[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net 8.8.8.8#dns.google
+FallbackDNS=
+DNSOverTLS=yes
+Domains=~.'
+
 _has_ipv6() { ip -6 route get 2001:4860:4860::8888 &>/dev/null; }
 
 # DoH прописан в конфиге?
@@ -227,6 +241,31 @@ _dns_hijack_on() {
 _resolved_dot_on() {
   resolvectl status 2>/dev/null \
     | grep -qiE '^[[:space:]]*DNSOverTLS setting:[[:space:]]*yes[[:space:]]*$'
+}
+
+# Эффективный список апстримов резолвера: main-конфиг плюс ВСЕ drop-in в
+# порядке применения, последнее присваивание побеждает. Нужен именно он:
+# «DNSOverTLS=yes» одинаково выглядит и с одним апстримом, и с четырьмя, а под
+# строгим DoT это разница между «провайдер лёг — стало медленно» и «провайдер
+# лёг — резолвинга нет вообще».
+_resolved_dns_line() {
+  systemd-analyze cat-config systemd/resolved.conf 2>/dev/null \
+    | grep -E '^[[:space:]]*DNS=' | tail -1 | sed 's/^[[:space:]]*DNS=[[:space:]]*//'
+}
+
+# Записать наш профиль DoT, перезапустить резолвед, проверить и откатиться
+# самому, если DoT не поднялся (хостер режет :853).
+_resolved_write_dot() {
+  local bak=""
+  [[ -f "$RESOLVED_DROPIN" ]] && {
+    bak="${RESOLVED_DROPIN}.bak_$(date +%Y%m%d_%H%M%S)"; cp "$RESOLVED_DROPIN" "$bak"; }
+  mkdir -p "$(dirname "$RESOLVED_DROPIN")"
+  printf '%s\n' "$RESOLVED_DOT_CONF" > "$RESOLVED_DROPIN"
+  systemctl restart systemd-resolved 2>/dev/null; sleep 1
+  _resolved_dot_on && resolvectl query example.com &>/dev/null && return 0
+  if [[ -n "$bak" ]]; then cp "$bak" "$RESOLVED_DROPIN"; else rm -f "$RESOLVED_DROPIN"; fi
+  systemctl restart systemd-resolved 2>/dev/null
+  return 1
 }
 
 # Классификация DNS-дампа по АДРЕСУ ИСТОЧНИКА пакета. Источник — единственное,
@@ -3843,8 +3882,16 @@ harden)
     _dns_hijack_on && ok "Перехват :53 из тоннеля: включён" || warn "Перехват :53: ВЫКЛЮЧЕН (plain-DNS клиента уходит с VPS как есть)"
     _ngx_mimic_on  && ok "nginx-fallback: mimic (чужой SNI → ответ настоящего сайта)" \
                    || warn "nginx-fallback: strict (чужой SNI → молчаливый обрыв TCP — подпись прокси)"
-    _resolved_dot_on && ok "Системный резолвер: строгий DoT" \
-                     || warn "Системный резолвер: открытый UDP/53 (всё, что попадёт в стаб, видит хостер)"
+    if _resolved_dot_on; then
+      # Одного «DNSOverTLS=yes» мало: под строгим DoT число апстримов и есть
+      # разница между «один провайдер лёг» и «резолвинга нет вообще».
+      RDNS_S=$(_resolved_dns_line); RN_S=$(printf '%s' "$RDNS_S" | wc -w)
+      [[ "${RN_S:-0}" -ge 3 ]] \
+        && ok "Системный резолвер: строгий DoT, апстримов ${RN_S}" \
+        || warn "Системный резолвер: строгий DoT, но апстримов ${RN_S:-0} — при недоступности одного резолвинг отказывает целиком, а это мёртвый dest. Профиль на четыре: ${BOLD}sudo xm harden --dot${NC}"
+    else
+      warn "Системный резолвер: открытый UDP/53 (всё, что попадёт в стаб, видит хостер)"
+    fi
     # Только при живом перехвате :53: без dns-outbound это поле негде задавать,
     # и строка про него сбивала бы с толку.
     NONIP_CUR=""
@@ -3859,6 +3906,31 @@ harden)
 
     if [[ "$MODE" == "--check" ]]; then
       sep; info "Режим --check: ничего не изменено. Применить: ${BOLD}sudo xm harden${NC}"; exit 0
+    fi
+
+    # Наш профиль DoT поверх уже настроенного резолвера. Отдельной командой,
+    # потому что шаг 2 в harden чужую конфигурацию намеренно не переписывает:
+    # решение «заменить то, что настроил владелец» принимает владелец.
+    if [[ "$MODE" == "--dot" ]]; then
+      sep
+      echo -e "${BOLD}Профиль DoT для системного резолвера${NC}"
+      command -v resolvectl &>/dev/null || { fail "systemd-resolved не найден — применять некуда"; exit 1; }
+      info "Было: $(_resolved_dns_line)"
+      if ! _resolved_write_dot; then
+        fail "DoT с нашими апстримами не поднялся — откат, прежняя конфигурация на месте"
+        warn "Проверь вручную: sudo resolvectl query example.com, затем sudo resolvectl status"
+        exit 1
+      fi
+      ok "Применено: четыре апстрима по :853 (Cloudflare ×2, Quad9, Google), FallbackDNS пуст"
+      DOT_NEW=$(_resolved_dns_line)
+      info "Стало: $DOT_NEW"
+      # Drop-in'ы применяются в лексическом порядке имён, последнее присваивание
+      # побеждает. Если у владельца есть файл, сортирующийся после нашего, наш
+      # DNS= будет перекрыт — и это надо увидеть, а не считать, что применилось.
+      [[ "$DOT_NEW" == "$(printf '%s' "$RESOLVED_DOT_CONF" | sed -n 's/^DNS=//p')" ]] \
+        || warn "Эффективный список отличается от нашего — значит есть drop-in, который сортируется после ${RESOLVED_DROPIN##*/} и перекрывает DNS=. Смотри: sudo systemd-analyze cat-config systemd/resolved.conf"
+      info "Файл: $RESOLVED_DROPIN — убирается вместе с sudo xm harden --off"
+      exit 0
     fi
 
     # Точечная ручка вместо `--off`: поменять режим не-A/AAAA, не трогая DoH,
@@ -3963,46 +4035,29 @@ harden)
     # и никакой dns-блок внутри Xray этого не отменяет.
     sep
     echo -e "${BOLD}Шаг 2: системный резолвер и его потребители${NC}"
-    # Четыре апстрима, а не два. Под строгим DoT недоступный :853 — это не
-    # деградация, а SERVFAIL: резолвед не имеет права уйти в открытый UDP и
-    # честно возвращает ошибку. Дальше nginx не находит апстрим fallback,
-    # REALITY некуда форвардить, и сервер начинает принимать TCP и рвать —
-    # то есть выдавать подпись прокси. Замерено: watchdog чинил мёртвый
-    # резолвинг dest несколько раз за трое суток. Три независимых провайдера
-    # вместо двух убирают ситуацию «один недоступен = резолвинга нет».
-    # FallbackDNS пустой — обязателен: с непустым resolved при недоступном
-    # :853 молча уходит в открытый UDP, та же утечка, но уже без признаков.
-    RESOLVED_WANT='[Resolve]
-DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 9.9.9.9#dns.quad9.net 8.8.8.8#dns.google
-FallbackDNS=
-DNSOverTLS=yes
-Domains=~.'
     if ! command -v resolvectl &>/dev/null; then
       warn "systemd-resolved не найден — шаг пропущен, системный резолвинг остаётся открытым"
-    elif [[ -f "$RESOLVED_DROPIN" ]] && [[ "$(cat "$RESOLVED_DROPIN")" == "$RESOLVED_WANT" ]] && _resolved_dot_on; then
-      ok "systemd-resolved: наш drop-in актуален, DoT строгий — не трогаю"
+    elif [[ -f "$RESOLVED_DROPIN" ]] && [[ "$(cat "$RESOLVED_DROPIN")" == "$RESOLVED_DOT_CONF" ]] && _resolved_dot_on; then
+      ok "systemd-resolved: наш профиль DoT актуален — не трогаю"
     elif [[ ! -f "$RESOLVED_DROPIN" ]] && _resolved_dot_on; then
-      # DoT настроен не нами — чужую конфигурацию не переписываем.
-      ok "systemd-resolved уже DNSOverTLS=yes и настроен не нами — не трогаю"
+      # DoT настроен не нами. Переписывать чужое молча нельзя, но и ставить
+      # зелёную галочку на конфигурации, в которую не заглянули, тоже: под
+      # строгим DoT число апстримов и есть разница между «один провайдер лёг»
+      # и «резолвинга нет», а второе на этом сервере равно демаскировке.
+      RDNS=$(_resolved_dns_line); RN=$(printf '%s' "$RDNS" | wc -w)
+      ok "systemd-resolved: строгий DoT, настроен не нами — свой профиль не навязываю"
+      info "Апстримы сейчас (${RN:-0}): ${RDNS:-не заданы явно, берутся с линка}"
+      if [[ "${RN:-0}" -lt 3 ]]; then
+        warn "Апстримов меньше трёх. Недоступность одного провайдера по :853 — это не"
+        warn "замедление, а отказ резолвинга: dest перестаёт резолвиться, fallback теряет"
+        warn "апстрим, и сервер начинает принимать TCP и рвать — подпись прокси."
+        warn "Наш профиль (четыре апстрима, три провайдера): ${BOLD}sudo xm harden --dot${NC}"
+      fi
+    elif _resolved_write_dot; then
+      ok "systemd-resolved: DNSOverTLS=yes, четыре апстрима по :853 (Cloudflare ×2, Quad9, Google)"
     else
-      # Сюда попадаем в двух случаях: DoT нет вовсе, либо наш drop-in устарел
-      # (раньше этот шаг не обновлялся никогда — условие было «DoT включён →
-      # не трогаю», и правка списка апстримов не доезжала до сервера).
-      RBAK=""
-      if [[ -f "$RESOLVED_DROPIN" ]]; then
-        RBAK="${RESOLVED_DROPIN}.bak_$(date +%Y%m%d_%H%M%S)"; cp "$RESOLVED_DROPIN" "$RBAK"
-      fi
-      mkdir -p "$(dirname "$RESOLVED_DROPIN")"
-      printf '%s\n' "$RESOLVED_WANT" > "$RESOLVED_DROPIN"
-      systemctl restart systemd-resolved 2>/dev/null; sleep 1
-      if _resolved_dot_on && resolvectl query example.com &>/dev/null; then
-        ok "systemd-resolved: DNSOverTLS=yes, четыре апстрима по :853 (Cloudflare ×2, Quad9, Google)"
-      else
-        fail "DoT не поднялся (хостер режет :853?) — откат этого шага"
-        if [[ -n "$RBAK" ]]; then cp "$RBAK" "$RESOLVED_DROPIN"; else rm -f "$RESOLVED_DROPIN"; fi
-        systemctl restart systemd-resolved 2>/dev/null
-        warn "Системный резолвинг остаётся открытым; остальные шаги harden продолжаю"
-      fi
+      fail "DoT не поднялся (хостер режет :853?) — шаг откачен"
+      warn "Системный резолвинг остаётся открытым; остальные шаги harden продолжаю"
     fi
 
     # Правим resolver в nginx только когда стабу есть чем ответить: иначе
@@ -4586,6 +4641,7 @@ neighbors)
     echo -e "${BOLD}${GREEN}Анти-DPI и анонимность:${NC}"
     echo -e "  ${GREEN}xm harden${NC}                        DoH на сервере + перехват :53 + mimic-fallback"
     echo    "  xm harden --check | --off        Показать состояние / откатить"
+    echo    "  xm harden --dot                  Наш профиль DoT (4 апстрима) поверх настроенного резолвера"
     echo    "  xm harden --nonip [drop|skip|off]  Режим запросов не-A/AAAA, без отката остального"
     echo -e "  ${GREEN}xm pq status|on|off${NC}              ML-DSA-65: post-quantum подпись REALITY"
     echo ""
