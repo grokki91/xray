@@ -253,6 +253,24 @@ _resolved_dns_line() {
     | grep -E '^[[:space:]]*DNS=' | tail -1 | sed 's/^[[:space:]]*DNS=[[:space:]]*//'
 }
 
+# Файл, который фактически задаёт DNS= — последний по порядку применения.
+# Нужен, чтобы `--dot` правил существующий, а не заводил ВТОРОЙ drop-in,
+# конкурирующий за одну и ту же настройку: побеждает лексикографически
+# последний, и два источника правды здесь — отложенный сюрприз. Глоб в shell
+# раскрывается в том же порядке, в каком файлы читает systemd.
+_resolved_dns_file() {
+  local f last=""
+  for f in /etc/systemd/resolved.conf /etc/systemd/resolved.conf.d/*.conf; do
+    [[ -f "$f" ]] || continue
+    grep -qE '^[[:space:]]*DNS=[^[:space:]]' "$f" && last="$f"
+  done
+  [[ -n "$last" ]] || return 1
+  echo "$last"
+}
+
+# Наш список апстримов одной строкой — для сравнения и для точечной правки.
+_resolved_dot_dns() { printf '%s' "$RESOLVED_DOT_CONF" | sed -n 's/^DNS=//p'; }
+
 # Записать наш профиль DoT, перезапустить резолвед, проверить и откатиться
 # самому, если DoT не поднялся (хостер режет :853).
 _resolved_write_dot() {
@@ -3916,20 +3934,39 @@ harden)
       echo -e "${BOLD}Профиль DoT для системного резолвера${NC}"
       command -v resolvectl &>/dev/null || { fail "systemd-resolved не найден — применять некуда"; exit 1; }
       info "Было: $(_resolved_dns_line)"
-      if ! _resolved_write_dot; then
+      DOT_F=$(_resolved_dns_file) || DOT_F=""
+      if [[ -n "$DOT_F" && "$DOT_F" != "$RESOLVED_DROPIN" ]]; then
+        # DNS= уже задан чужим файлом. Свой рядом класть нельзя: два drop-in
+        # спорят за одну настройку, и кто победит — вопрос имени файла.
+        # Правим ровно одну строку в существующем, остальное не трогаем.
+        info "DNS= задаёт $DOT_F — правлю в нём одну строку, второй drop-in не завожу"
+        DOT_BAK="${DOT_F}.bak_$(date +%Y%m%d_%H%M%S)"
+        cp "$DOT_F" "$DOT_BAK"
+        sed -i -E "s|^([[:space:]]*)DNS=.*|\\1DNS=$(_resolved_dot_dns)|" "$DOT_F"
+        systemctl restart systemd-resolved 2>/dev/null; sleep 1
+        if ! { _resolved_dot_on && resolvectl query example.com &>/dev/null; }; then
+          fail "Резолвинг с новыми апстримами не поднялся — откат"
+          cp "$DOT_BAK" "$DOT_F"; systemctl restart systemd-resolved 2>/dev/null
+          warn "Прежняя конфигурация на месте. Бэкап: $DOT_BAK"
+          exit 1
+        fi
+        ok "Апстримы в $DOT_F заменены на четыре (Cloudflare ×2, Quad9, Google)"
+        info "Бэкап: $DOT_BAK — это НЕ наш файл, ${BOLD}xm harden --off${NC} его не тронет"
+      elif _resolved_write_dot; then
+        ok "Применено: четыре апстрима по :853 (Cloudflare ×2, Quad9, Google), FallbackDNS пуст"
+        info "Файл: $RESOLVED_DROPIN — убирается вместе с sudo xm harden --off"
+      else
         fail "DoT с нашими апстримами не поднялся — откат, прежняя конфигурация на месте"
         warn "Проверь вручную: sudo resolvectl query example.com, затем sudo resolvectl status"
         exit 1
       fi
-      ok "Применено: четыре апстрима по :853 (Cloudflare ×2, Quad9, Google), FallbackDNS пуст"
       DOT_NEW=$(_resolved_dns_line)
       info "Стало: $DOT_NEW"
-      # Drop-in'ы применяются в лексическом порядке имён, последнее присваивание
-      # побеждает. Если у владельца есть файл, сортирующийся после нашего, наш
-      # DNS= будет перекрыт — и это надо увидеть, а не считать, что применилось.
-      [[ "$DOT_NEW" == "$(printf '%s' "$RESOLVED_DOT_CONF" | sed -n 's/^DNS=//p')" ]] \
-        || warn "Эффективный список отличается от нашего — значит есть drop-in, который сортируется после ${RESOLVED_DROPIN##*/} и перекрывает DNS=. Смотри: sudo systemd-analyze cat-config systemd/resolved.conf"
-      info "Файл: $RESOLVED_DROPIN — убирается вместе с sudo xm harden --off"
+      # Файлы применяются в лексическом порядке имён, последнее присваивание
+      # побеждает. Если правка перекрыта файлом с именем позже — это надо
+      # увидеть, а не считать, что применилось.
+      [[ "$DOT_NEW" == "$(_resolved_dot_dns)" ]] \
+        || warn "Эффективный список отличается от заданного — значит DNS= перекрывает файл с именем, сортирующимся позже. Смотри: sudo systemd-analyze cat-config systemd/resolved.conf"
       exit 0
     fi
 
