@@ -11,6 +11,7 @@
 |---|---|
 | **Xray-core** | Прокси-сервер: VLESS + REALITY + XHTTP (плюс опциональный второй inbound XTLS-Vision/TCP) |
 | **Nginx** | REALITY-fallback: `stream` + `ssl_preread` на `127.0.0.1:10443` прозрачно проксирует TLS-хендшейк на настоящий сайт-маску |
+| **Фронт по SNI** | Тот же `ssl_preread`, но на публичном порту: 443 делится с соседней службой, каждая узнаётся по своему домену |
 | **DoH / DoT** | Xray резолвит домены через DoH и перехватывает `:53` из тоннеля; системный резолвер переведён на строгий DoT |
 | **sysctl-профиль** | BBR + fq, буферы под реальный RTT, очередь accept, MTU probing |
 | **watchdog** | systemd-таймер раз в 2 мин: резолвится ли `dest`, живы ли fallback и Xray |
@@ -85,7 +86,16 @@ xm backup | restore | backups
 ```
 
 **Анти-DPI и стабильность**
+
+`front` нужен, когда 443 занят другой службой навсегда: `ssl_preread` читает SNI
+из ClientHello и разводит потоки по локальным портам, так что оба канала живут
+на 443 и клиентам соседа ничего перевыпускать не надо. Наши URI после включения
+раздать заново — в них зашит порт (`xm qr --all`).
+
 ```bash
+xm front [on|off|status]       # разделить публичный порт по SNI с соседней службой
+xm front add <sni> <порт>      # маршрут соседа: его домен → его порт на 127.0.0.1
+xm front del <sni>             # убрать маршрут
 xm harden [--check|--off]      # DoH + перехват :53 + строгий DoT + mimic-fallback + маскировка :80
 xm tune   [--check|--off]      # сетевой стек + таймаут хендшейка + watchdog
 xm watchdog on|off|now|status  # присмотр за сквозным путём
@@ -149,6 +159,9 @@ URI и QR-коды умирают) и переписывает `nginx.conf`, `si
 `stream-enabled/`, `ufw`, `fail2ban`. Если на машине живёт что-то ещё —
 проверь `sudo xm neighbors` заранее. Скрипт потребует подтверждение словом.
 
+Конфиг фронта лежит в `stream-enabled/` и вычищается вместе с остальным;
+маршруты в `front.conf` переустановку переживают — вернуть всё: `sudo xm front on`.
+
 Чтобы обновиться — `sudo xm self-update`.
 
 ---
@@ -158,6 +171,7 @@ URI и QR-коды умирают) и переписывает `nginx.conf`, `si
 ```
 /usr/local/etc/xray/config.json        — конфиг Xray (chmod 640, приватный ключ)
 /usr/local/etc/xray/client-info.txt    — данные клиентов (chmod 600)
+/usr/local/etc/xray/front.conf         — маршруты фронта по SNI (chmod 600)
 /usr/local/etc/xray/backups/           — автобэкапы
 /var/log/xray/error.log                — лог Xray
 /usr/local/bin/xm                      — менеджер

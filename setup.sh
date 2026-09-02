@@ -440,6 +440,11 @@ if [[ -f "$XRAY_CONFIG" ]] && [[ "${1:-}" == "--reinstall" ]]; then
   echo    "    · sites-enabled/default     — удаляется"
   echo    "    · sites-available/fallback  — перезаписывается, listen 80 default_server"
   echo    "    · /etc/nginx/stream-enabled/*  — вычищается ЦЕЛИКОМ"
+  if [[ -f /usr/local/etc/xray/front.conf ]]; then
+    echo  "      ↳ включая front.conf: публичный порт перестанет отвечать,"
+    echo  "        и соседняя служба за фронтом станет недоступна снаружи."
+    echo  "        Маршруты уцелеют, вернуть после установки: sudo xm front on"
+  fi
   echo    "    · ufw                       — включается, открываются только наши порты"
   echo    "    · fail2ban, unattended-upgrades — конфиги перезаписываются"
   echo ""
@@ -1127,6 +1132,14 @@ nginx -t || error "nginx -t не прошёл — см. /etc/nginx/stream-enable
 systemctl enable nginx
 systemctl restart nginx
 success "Nginx REALITY fallback настроен (stream/ssl_preread, dest=127.0.0.1:10443)"
+
+# Состояние фронта переустановку переживает (лежит вне /etc/nginx), сам конфиг
+# nginx — нет. Не поднимаем его автоматически: порт inbound только что выбран
+# заново, а соседняя служба могла за это время переехать.
+if [[ -f /usr/local/etc/xray/front.conf ]]; then
+  warn "Найдены маршруты фронта по SNI, но конфиг nginx вычищен переустановкой."
+  warn "Проверить и вернуть: sudo xm front status, затем sudo xm front on"
+fi
 
 # =============================================================================
 # 10. FAIL2BAN

@@ -15,6 +15,7 @@
 #   Логи:        log / log-live / log-clear
 #   Инфо:        info / paths / uuid / pubkey
 #   Анти-DPI:    harden [--check|--off] / pq status|on|off
+#   Фронт:       front [status|on|off|add <sni> <порт>|del <sni>]
 #   Стабильность: tune [--check|--off] / watchdog on|off|now|status
 #   Соседи:      neighbors — что ещё живёт на сервере и что трогает xm
 #   Диагностика: diag / diag-dpi [--quick] / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
@@ -649,6 +650,207 @@ _ngx_fallback_mode() {
   return 0
 }
 
+# ─── Фронт: демультиплексор по SNI на публичном порту ────────────────────────
+#
+# ЗАЧЕМ: номер порта виден сканеру ДО всякого анализа TLS, и сертификат
+# крупного сайта на нестандартном порту обесценивает всю маскировку REALITY
+# (diag-dpi, тест B8). 443 при этом может держать только один сокет. Фронт —
+# тот же приём, что уже работает в reality-fallback.conf: ssl_preread читает
+# SNI из ClientHello, НЕ терминируя TLS, и разводит поток по локальным службам.
+# Соседняя служба на том же 443 (свой VPN, сайт) продолжает работать, её
+# клиентам ничего перевыпускать не нужно — они по-прежнему стучатся в 443.
+#
+# ПОЧЕМУ ОТДЕЛЬНЫМ ФАЙЛОМ, А НЕ ПРАВКОЙ reality-fallback.conf: все пишущие
+# пути xm адресуют fallback поимённо, так что harden/set-sni/set-port фронт
+# не трогают. setup.sh --reinstall чистит stream-enabled/ целиком — поэтому
+# источник правды не в /etc/nginx, а в FRONT_STATE, и восстановление после
+# переустановки стоит одной команды: sudo xm front on.
+FRONT_STATE="/usr/local/etc/xray/front.conf"
+FRONT_NGX="/etc/nginx/stream-enabled/front.conf"
+FRONT_LOG="/var/log/nginx/front.log"
+
+# Фронт включён = конфиг лежит там, откуда nginx его читает.
+_front_enabled() { [[ -f "$FRONT_NGX" ]]; }
+
+_front_port() {
+  local p=""
+  [[ -f "$FRONT_STATE" ]] && p=$(awk -F= '$1=="PORT"{print $2; exit}' "$FRONT_STATE")
+  [[ "$p" =~ ^[0-9]+$ ]] && echo "$p" || echo 443
+}
+
+# Маршруты соседей: строки "ROUTE <sni> <порт>" → "<sni> <порт>".
+_front_routes() {
+  [[ -f "$FRONT_STATE" ]] || return 0
+  awk '$1=="ROUTE" && NF==3 {print $2, $3}' "$FRONT_STATE"
+}
+
+# Публичный порт нашего XHTTP inbound: за фронтом клиент идёт на 443, а сам
+# Xray продолжает слушать свой локальный порт. Отсюда берут порт и URI, и B8 —
+# иначе клиентам уедет адрес мимо фронта, и вся затея обнуляется.
+_front_public_port() {
+  if _front_enabled; then _front_port
+  else jq -r '.inbounds[0].port' "$CONFIG" 2>/dev/null; fi
+}
+
+_front_state_init() {
+  [[ -f "$FRONT_STATE" ]] && return 0
+  cat > "$FRONT_STATE" <<'FSEOF'
+# Состояние SNI-фронта. Читается `xm front on` при каждой генерации конфига
+# nginx и переживает setup.sh --reinstall — в этом весь смысл файла.
+# Маршрут нашего собственного inbound здесь НЕ хранится: он выводится из
+# config.json, поэтому set-sni и set-port доезжают до фронта сами.
+#   PORT=<публичный порт>
+#   ROUTE <sni соседа> <локальный порт соседа>
+PORT=443
+FSEOF
+  chmod 600 "$FRONT_STATE"
+}
+
+# Апстрим всегда 127.0.0.1: фронт разводит СВОИ службы, а не проксирует наружу.
+# Литеральный адрес заодно избавляет nginx от resolver в этом server{} —
+# открытых DNS-запросов фронт не делает.
+_front_set_route() {
+  local sni="$1" port="$2"
+  _front_state_init
+  sed -i "/^ROUTE ${sni//./\\.} /d" "$FRONT_STATE"
+  echo "ROUTE $sni $port" >> "$FRONT_STATE"
+}
+
+_front_del_route() {
+  [[ -f "$FRONT_STATE" ]] || return 1
+  grep -q "^ROUTE ${1//./\\.} " "$FRONT_STATE" || return 1
+  sed -i "/^ROUTE ${1//./\\.} /d" "$FRONT_STATE"
+}
+
+# Генерация конфига nginx из FRONT_STATE + config.json. Пишет во временный
+# файл: класть незаконченный конфиг прямо в stream-enabled/ нельзя — nginx
+# подхватит его по маске при любой посторонней перезагрузке.
+_front_generate() {
+  local out="$1" port ours oport sni up
+  port=$(_front_port)
+  ours=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
+  oport=$(jq -r '.inbounds[0].port' "$CONFIG")
+  [[ "$ours" =~ ^[a-zA-Z0-9._-]+$ ]] || return 1
+  [[ "$oport" =~ ^[0-9]+$ ]] || return 1
+
+  {
+    cat <<'HEADEOF'
+# Сгенерировано `xm front on` — правки руками теряются при следующей генерации.
+# Маршруты: /usr/local/etc/xray/front.conf (xm front add / xm front del).
+#
+# ssl_preread читает SNI из ClientHello и разводит поток, не терминируя TLS:
+# ни ключей, ни сертификатов здесь нет, содержимое соединения фронту недоступно.
+HEADEOF
+    echo "map \$ssl_preread_server_name \$front_upstream {"
+    # default уходит нам: чужой и пустой SNI должен и дальше получать ответ
+    # настоящего сайта через наш REALITY-fallback (mimic), а не обрыв.
+    printf '    %-40s %s;\n' "default" "127.0.0.1:$oport"
+    printf '    %-40s %s;\n' "$ours" "127.0.0.1:$oport"
+    while read -r sni up; do
+      [[ -n "$sni" ]] && printf '    %-40s %s;\n' "$sni" "127.0.0.1:$up"
+    done < <(_front_routes)
+    echo "}"
+    echo ""
+    cat <<'MAPEOF'
+# На диск пишем только то, что не попало ни в один маршрут — то есть сканы.
+# Через фронт идёт ВЕСЬ боевой трафик: без этого фильтра в access_log легли бы
+# адреса всех клиентов (ровно то, от чего уходили в reality-fallback.conf).
+MAPEOF
+    echo "map \$ssl_preread_server_name \$front_probe {"
+    printf '    %-40s %s;\n' "default" "1"
+    printf '    %-40s %s;\n' "$ours" "0"
+    while read -r sni up; do
+      [[ -n "$sni" ]] && printf '    %-40s %s;\n' "$sni" "0"
+    done < <(_front_routes)
+    echo "}"
+    echo ""
+    cat <<'TAILEOF'
+# $remote_addr здесь — настоящий адрес клиента: фронт стоит первым, PROXY
+# protocol ниоткуда не приходит и ngx_stream_realip не нужен. Это же и
+# восстанавливает лимит по IP, который за фронтом теряет смысл в fallback:
+# туда все соединения приходят от нашего же Xray, то есть с 127.0.0.1.
+limit_conn_zone $remote_addr zone=front_conn:10m;
+
+log_format front '$remote_addr [$time_local] SNI="$ssl_preread_server_name" '
+                 'up=$front_upstream status=$status sent=$bytes_sent';
+
+server {
+TAILEOF
+    echo "    listen 0.0.0.0:${port};"
+    echo "    listen [::]:${port};"
+    cat <<'SRVEOF'
+
+    ssl_preread on;
+    limit_conn front_conn 200;
+
+    proxy_pass $front_upstream;
+    proxy_connect_timeout 5s;
+
+    access_log /var/log/nginx/front.log front if=$front_probe;
+    error_log  /var/log/nginx/front_error.log error;
+}
+SRVEOF
+  } > "$out"
+}
+
+# Сборка фронта: генерация → проверка → перезагрузка → откат при любой осечке.
+_front_apply() {
+  local tmp bak
+  tmp=$(mktemp /etc/nginx/front.XXXXXX.tmp)
+  if ! _front_generate "$tmp"; then
+    rm -f "$tmp"; fail "Не собрать конфиг: в config.json нет SNI или порта inbound"; return 1
+  fi
+  bak=""
+  [[ -f "$FRONT_NGX" ]] && { bak="$BACKUP_DIR/front_$(date +%Y%m%d_%H%M%S).conf.bak"; cp "$FRONT_NGX" "$bak"; }
+  mv "$tmp" "$FRONT_NGX"; chmod 644 "$FRONT_NGX"
+  if ! nginx -t 2>/dev/null; then
+    # Стек без IPv6 отвергает listen [::] — второй заход без него, прежде
+    # чем считать конфиг сломанным.
+    sed -i "/listen \[::\]:/d" "$FRONT_NGX"
+    if nginx -t 2>/dev/null; then
+      info "IPv6-сокет не принят стеком — фронт слушает только IPv4"
+    else
+      fail "nginx -t не прошёл — откат"
+      nginx -t 2>&1 | sed 's/^/    /'
+      if [[ -n "$bak" ]]; then cp "$bak" "$FRONT_NGX"; else rm -f "$FRONT_NGX"; fi
+      nginx -t &>/dev/null && systemctl reload nginx
+      return 1
+    fi
+  fi
+  if ! systemctl reload nginx; then
+    fail "nginx reload не удался — откат"
+    if [[ -n "$bak" ]]; then cp "$bak" "$FRONT_NGX"; else rm -f "$FRONT_NGX"; fi
+    systemctl reload nginx; return 1
+  fi
+  return 0
+}
+
+# Лимит в fallback за фронтом теряет смысл и становится опасен: ключ
+# $proxy_protocol_addr приходит от нашего же Xray, то есть у всех клиентов
+# один и тот же 127.0.0.1 — общий счётчик на всех. Упёрлись в потолок →
+# fallback отказывает → REALITY некуда форвардить → «принял TCP и закрыл»,
+# то есть ровно та подпись прокси, ради ухода от которой сделан mimic.
+# Ограничение по реальному IP берёт на себя фронт (limit_conn front_conn).
+_front_fallback_limit() {
+  local want="$1" f="/etc/nginx/stream-enabled/reality-fallback.conf" cur
+  [[ -f "$f" ]] || return 1
+  cur=$(grep -oE '^[[:space:]]*limit_conn[[:space:]]+reality_conn[[:space:]]+[0-9]+' "$f" | grep -oE '[0-9]+$')
+  [[ -z "$cur" || "$cur" == "$want" ]] && return 1
+  sed -i -E "s|^([[:space:]]*)limit_conn[[:space:]]+reality_conn[[:space:]]+[0-9]+;|\1limit_conn reality_conn ${want};|" "$f"
+}
+
+# Каждое фронтовое соединение стоит nginx двух дескрипторов, и ещё два уходят
+# на дозвон REALITY до fallback — вчетверо больше, чем до фронта. Дефолтные
+# 768 упираются в потолок молча, а молча потерянные соединения на этом сервере
+# и есть демаскировка.
+_front_worker_conn() {
+  local f=/etc/nginx/nginx.conf cur
+  cur=$(grep -oE '^[[:space:]]*worker_connections[[:space:]]+[0-9]+' "$f" 2>/dev/null | grep -oE '[0-9]+$')
+  [[ -z "$cur" ]] && return 1
+  [[ "$cur" -ge 4096 ]] && return 2
+  sed -i -E 's|^([[:space:]]*)worker_connections[[:space:]]+[0-9]+;|\1worker_connections 4096;|' "$f"
+}
+
 # ─── Стабильность: sysctl-профиль и watchdog ─────────────────────────────────
 #
 # ЗАЧЕМ ОТДЕЛЬНО ОТ harden: harden закрывает утечки, tune чинит обрывы.
@@ -865,7 +1067,19 @@ _wd_check() {
     rc=1
   fi
 
-  # 3. Слушает ли сам Xray свой порт. Restart=on-failure не ловит случай,
+  # 3. Слушает ли фронт свой публичный порт. Он первый в тракте: сокета нет —
+  # снаружи не отвечает ни один канал, при живых Xray и fallback.
+  if _front_enabled; then
+    local fport
+    fport=$(_front_port)
+    if ! ss -tln 2>/dev/null | tail -n +2 | awk -v p=":$fport" '$4 ~ p"$"' | grep -q .; then
+      echo "watchdog: фронт :${fport} не слушает — перезапускаю nginx"
+      nginx -t >/dev/null 2>&1 && systemctl restart nginx 2>/dev/null || true
+      rc=1
+    fi
+  fi
+
+  # 4. Слушает ли сам Xray свой порт. Restart=on-failure не ловит случай,
   # когда процесс жив, но порт потерян.
   local xport
   xport=$(jq -r '.inbounds[0].port' "$CONFIG" 2>/dev/null)
@@ -932,7 +1146,10 @@ _make_uri_xhttp() {
   local uuid="$1" comment="$2"
   local sni port sid path_val mode pubkey fp server_ip encoded_path
   sni=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host // .inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
-  port=$(jq -r '.inbounds[0].port' "$CONFIG")
+  # За фронтом Xray слушает свой локальный порт, а клиент идёт на публичный.
+  # URI с локальным портом увёл бы клиента мимо фронта — и на нестандартный
+  # порт, ради ухода с которого фронт и поднимался.
+  port=$(_front_public_port)
   sid=$(jq -r '.inbounds[0].streamSettings.realitySettings.shortIds[0]' "$CONFIG")
   path_val=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
   mode=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
@@ -1221,6 +1438,13 @@ set-sni)
       # Без этого шага после смены домена порт 80 продолжал бы называть старый
       # сайт, а :443 отдавать сертификат нового: рассинхрон, который сканеру
       # виден одним запросом и который мы же ловим в diag-dpi (тест B7).
+      # Маска — ключ map и на фронте: без пересборки наш SNI уедет в default.
+      # Канал не умрёт (default ведёт к нам же), но зонды перестанут отличаться
+      # от клиентов, и в access_log фронта начнут падать их адреса.
+      if _front_enabled; then
+        _front_apply && ok "Фронт пересобран под $NEW_SNI" \
+                     || warn "Фронт пересобрать не удалось — sudo xm front on"
+      fi
       case "$(_ngx_http80_fix; echo $?)" in
         0) ok ":80 обновлён под $NEW_SNI (редирект + Server)" ;;
         2) ok ":80 уже соответствует $NEW_SNI" ;;
@@ -1353,6 +1577,11 @@ set-port)
     echo -e "  ${BOLD}sudo xm qr --all${NC}   или   ${BOLD}sudo xm uri --all${NC}"
     echo ""
     ok "Порт $PORT_LABEL: $OLD_PORT → $NEW_PORT"
+    # Апстрим фронта задан номером порта: без пересборки он указывает в пустоту.
+    if [[ "$PORT_IDX" -eq 0 ]] && _front_enabled; then
+      _front_apply && ok "Фронт пересобран под новый порт" \
+                   || warn "Фронт пересобрать не удалось — sudo xm front on"
+    fi
     echo -e "  Проверить: ${BOLD}sudo xm selftest${NC}, затем ${BOLD}sudo xm diag-dpi${NC} (тест B8)"
     echo ""
     ;;
@@ -1974,12 +2203,14 @@ autoupd)
 
 # ─── Nginx ───────────────────────────────────────────────────────────────────
 nginx-status)  systemctl status nginx --no-pager ;;
-nginx-log)     tail -30 /var/log/nginx/reality_fallback.log 2>/dev/null || echo "Лог пуст" ;;
+nginx-log)     tail -30 "$(_front_enabled && echo "$FRONT_LOG" || echo /var/log/nginx/reality_fallback.log)" 2>/dev/null || echo "Лог пуст" ;;
 nginx-reload)  nginx -t && systemctl reload nginx && echo -e "${GREEN}Nginx перезагружен${NC}" ;;
 nginx-probes)
     echo -e "${BOLD}Активные зонды (соединения с чужим/пустым SNI):${NC}"
     echo -e "${CYAN}(легитимные клиенты сюда НЕ попадают — у них правильный SNI)${NC}"
-    awk '{print $1}' /var/log/nginx/reality_fallback.log 2>/dev/null \
+    # За фронтом адрес сканера виден только в его логе: в fallback все
+    # соединения приходят от нашего же Xray, то есть с 127.0.0.1.
+    awk '{print $1}' "$(_front_enabled && echo "$FRONT_LOG" || echo /var/log/nginx/reality_fallback.log)" 2>/dev/null \
       | sort | uniq -c | sort -rn | head -20 || echo "Лог недоступен"
     ;;
 
@@ -2380,10 +2611,15 @@ dpi|diag-dpi)
     dfail() { fail "$*"; DPI_CRIT=$((DPI_CRIT + 1)); }
     dwarn() { warn "$*"; DPI_WARN=$((DPI_WARN + 1)); }
 
-    PORT=$(jq -r '.inbounds[0].port' "$CONFIG")
+    # Целимся в ПУБЛИЧНЫЙ порт: за фронтом Xray слушает loopback, и зонд на
+    # его локальный порт померил бы не то, что видит сканер снаружи.
+    LPORT=$(jq -r '.inbounds[0].port' "$CONFIG")
+    PORT=$(_front_public_port)
     SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
     SERVER_IP=$(_get_server_ip)
     info "Цель: ${SERVER_IP}:${PORT} | домен-маска: ${SNI}"
+    _front_enabled && [[ "$PORT" != "$LPORT" ]] \
+      && info "Фронт по SNI: :${PORT} → 127.0.0.1:${LPORT} — зонды идут публичным путём"
     $QUICK && info "--quick: живые тесты через тоннель пропускаются"
 
 # ══ A. Согласованность источников SNI ════════════════════════════════════════
@@ -2539,6 +2775,12 @@ dpi|diag-dpi)
     echo -e "\n  ${BOLD}B8. Номер порта${NC}"
     if [[ "$PORT" == "443" ]]; then
       ok "Порт 443 — трафик неотличим от обычного HTTPS по одному только номеру"
+      # Фронт увёл клиентов на 443, но пока старый порт открыт наружу, на нём
+      # по-прежнему отдаётся сертификат маски — аномалия никуда не делась.
+      if _front_enabled && [[ "$PORT" != "$LPORT" ]] \
+         && ufw status 2>/dev/null | grep -qE "^${LPORT}(/tcp)?[[:space:]]+ALLOW"; then
+        dwarn "Локальный порт $LPORT всё ещё открыт наружу в UFW — сертификат $SNI виден и на нём. Закрой, когда клиенты перейдут на 443: sudo ufw delete allow ${LPORT}/tcp"
+      fi
     else
       dfail "Порт $PORT: сертификат $SNI на нестандартном порту. Настоящие сайты живут на 443, а $PORT — типичный порт прокси и первый кандидат при сканировании. Это отличие видно ДО любого анализа TLS."
       P443=$(ss -tlnp 2>/dev/null | tail -n +2 | awk '$4 ~ /:443$/ {print $NF}' | head -1)
@@ -2547,7 +2789,8 @@ dpi|diag-dpi)
         U443=$(ss -ulnp 2>/dev/null | tail -n +2 | awk '$4 ~ /:443$/ {print $NF}' | head -1)
         [[ -n "$U443" ]] && info "На UDP/443 есть служба — она не конфликтует: порт это пара (протокол, номер)"
       else
-        info "TCP/443 занят ($P443) — сначала освободи его, потом sudo xm set-port 443"
+        info "TCP/443 занят ($P443) — либо освободи и sudo xm set-port 443, либо"
+        info "раздели его по SNI: sudo xm front add <SNI соседа> <его порт>, затем sudo xm front on"
       fi
     fi
 
@@ -3227,6 +3470,173 @@ watchdog)
     esac
     ;;
 
+# ─────────────────────────────────────────────────────────────────────────────
+# front — вывести inbound на публичный порт, разделив его по SNI с соседом.
+#
+# Когда 443 занят другой службой навсегда, а нестандартный порт — единственное
+# «критично» в diag-dpi (B8), выбор не между «переехать» и «остаться», а между
+# «остаться» и «поделить». Делит ssl_preread: SNI виден в ClientHello открытым
+# текстом, до всякого расшифрования, и этого достаточно, чтобы развести потоки.
+front)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm front${NC}"; exit 1; }
+    FSUB="${2:-status}"
+    FPORT=$(_front_port)
+    OUR_SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
+    OUR_PORT=$(jq -r '.inbounds[0].port' "$CONFIG")
+
+    case "$FSUB" in
+      on)
+        echo -e "\n${BOLD}${CYAN}[ Фронт на порту $FPORT ]${NC}\n"
+        _front_state_init
+
+        # 1. Модуль. Без ssl_preread разделить поток нечем — как и fallback.
+        if ! nginx -V 2>&1 | grep -q -- "--with-stream_ssl_preread_module" \
+           && ! grep -rqs "ssl_preread" /usr/lib/nginx/modules/; then
+          fail "nginx собран без ssl_preread — фронт невозможен"
+          info "Проверь: sudo grep -rl ssl_preread /usr/lib/nginx/modules/"
+          exit 1
+        fi
+
+        # 2. stream-контекст. После setup.sh он есть; после чужой правки
+        #    nginx.conf мог исчезнуть — возвращаем идемпотентно.
+        if ! grep -q "stream-enabled/\*.conf" /etc/nginx/nginx.conf; then
+          printf '\nstream {\n    include /etc/nginx/stream-enabled/*.conf;\n}\n' >> /etc/nginx/nginx.conf
+          ok "В nginx.conf возвращён stream-контекст"
+        fi
+
+        # 3. Коллизия масок. Один и тот же SNI у нас и у соседа развести
+        #    нечем: nginx видит одну строку в ClientHello и обязан выбрать
+        #    одну ветку map — то есть один из двух каналов умрёт молча.
+        while read -r rsni rup; do
+          [[ "$rsni" == "$OUR_SNI" ]] && {
+            fail "Маска соседа совпадает с нашей ($OUR_SNI) — по SNI их не различить"
+            info "Смени одну из двух: sudo xm sni-scan, затем sudo xm set-sni <домен>"
+            exit 1; }
+        done < <(_front_routes)
+
+        # 4. Порт. Занят кем-то, кроме nginx → фронт не поднимется.
+        FBUSY=$(ss -tlnp 2>/dev/null | tail -n +2 | awk -v p=":$FPORT" '$4 ~ p"$" {print $NF}' | head -1)
+        if [[ -n "$FBUSY" && "$FBUSY" != *nginx* ]]; then
+          fail "TCP-порт $FPORT занят: $FBUSY"
+          info "Освободи его: служба должна переехать на 127.0.0.1:<порт> и попасть"
+          info "в маршруты фронта (sudo xm front add <её SNI> <её новый порт>),"
+          info "иначе её клиенты потеряют сервер."
+          exit 1
+        fi
+
+        # 5. Апстримы соседей. Не поднялись — не отказ: маршрут может быть
+        #    заведён заранее, до переезда службы.
+        while read -r rsni rup; do
+          ss -tln 2>/dev/null | tail -n +2 | awk -v p=":$rup" '$4 ~ p"$"' | grep -q . \
+            && ok "Маршрут $rsni → 127.0.0.1:$rup (слушает)" \
+            || warn "Маршрут $rsni → 127.0.0.1:$rup — на порту никто не слушает"
+        done < <(_front_routes)
+
+        case "$(_front_worker_conn; echo $?)" in
+          0) ok "nginx worker_connections → 4096 (фронт удваивает расход на соединение)" ;;
+          2) ok "nginx worker_connections уже достаточен" ;;
+          *) warn "worker_connections в nginx.conf не найден — проверь events{} вручную" ;;
+        esac
+
+        _front_apply || exit 1
+        ok "Фронт поднят: $OUR_SNI и чужой SNI → 127.0.0.1:$OUR_PORT, соседи — по маршрутам"
+        _front_fallback_limit 5000 \
+          && ok "Лимит fallback снят с 200: за фронтом он общий на всех, а не по IP" \
+          || info "Лимит fallback уже поднят"
+        nginx -t &>/dev/null && systemctl reload nginx
+
+        sep
+        warn "URI клиентов содержат порт — старые ведут мимо фронта, на $OUR_PORT."
+        echo -e "  Раздай новые:   ${BOLD}sudo xm qr --all${NC}"
+        echo -e "  Убедись:        ${BOLD}sudo xm selftest${NC} и ${BOLD}sudo xm diag-dpi${NC} (тест B8)"
+        echo -e "  И только потом: ${BOLD}sudo ufw delete allow ${OUR_PORT}/tcp${NC}"
+        echo -e "                  ${CYAN}— пока порт открыт наружу, сертификат маски${NC}"
+        echo -e "                  ${CYAN}  на нём виден сканеру, и B8 остаётся красным${NC}"
+        echo ""
+        ;;
+
+      off)
+        echo -e "\n${BOLD}${CYAN}[ Выключение фронта ]${NC}\n"
+        _front_enabled || { info "Фронт и так выключен"; exit 0; }
+        rm -f "$FRONT_NGX"
+        if nginx -t 2>/dev/null && systemctl reload nginx; then
+          ok "Фронт снят, порт $FPORT свободен"
+        else
+          fail "nginx -t не прошёл после снятия — разбирайся: sudo nginx -t"; exit 1
+        fi
+        _front_fallback_limit 200 && ok "Лимит fallback вернулся к 200 по IP" || true
+        nginx -t &>/dev/null && systemctl reload nginx
+        info "Маршруты сохранены в $FRONT_STATE — вернуть всё: sudo xm front on"
+        warn "Клиентам снова нужен URI с портом $OUR_PORT: sudo xm qr --all"
+        while read -r rsni rup; do
+          [[ -n "$rsni" ]] && warn "Служба $rsni осталась на 127.0.0.1:$rup — верни ей публичный порт сама"
+        done < <(_front_routes)
+        echo ""
+        ;;
+
+      add)
+        ASNI="${3:-}"; APORT="${4:-}"
+        [[ -z "$ASNI" || -z "$APORT" ]] && { echo -e "${BOLD}Использование:${NC} xm front add <sni> <локальный порт>"; exit 1; }
+        [[ "$ASNI" =~ ^[a-zA-Z0-9._-]+$ ]] || { fail "Недопустимые символы в SNI"; exit 1; }
+        [[ "$APORT" =~ ^[0-9]+$ ]] && [[ "$APORT" -ge 1 && "$APORT" -le 65535 ]] || { fail "Порт должен быть числом 1-65535"; exit 1; }
+        [[ "$ASNI" == "$OUR_SNI" ]] && { fail "Это наша собственная маска — она уже ведёт на 127.0.0.1:$OUR_PORT"; exit 1; }
+        _front_set_route "$ASNI" "$APORT"
+        ok "Маршрут записан: $ASNI → 127.0.0.1:$APORT"
+        if _front_enabled; then _front_apply && ok "Фронт пересобран"; else info "Фронт выключен — применится при: sudo xm front on"; fi
+        ;;
+
+      del)
+        DSNI="${3:-}"
+        [[ -z "$DSNI" ]] && { echo -e "${BOLD}Использование:${NC} xm front del <sni>"; exit 1; }
+        _front_del_route "$DSNI" || { fail "Маршрута $DSNI нет"; exit 1; }
+        ok "Маршрут $DSNI удалён"
+        if _front_enabled; then _front_apply && ok "Фронт пересобран"; else info "Фронт выключен"; fi
+        ;;
+
+      *)
+        echo -e "\n${BOLD}${CYAN}[ Фронт по SNI ]${NC}\n"
+        if _front_enabled; then
+          ok "Включён, порт $FPORT"
+        else
+          info "Выключен. Включить: sudo xm front on"
+          [[ -f "$FRONT_STATE" ]] && info "Сохранённые маршруты есть — вернутся при включении"
+        fi
+        FHOLD=$(ss -tlnp 2>/dev/null | tail -n +2 | awk -v p=":$FPORT" '$4 ~ p"$" {print $NF}' | head -1)
+        if [[ -z "$FHOLD" ]]; then
+          _front_enabled && fail "На $FPORT никто не слушает — фронт не поднялся, проверь: sudo nginx -t"
+        elif [[ "$FHOLD" == *nginx* ]]; then
+          ok "Порт $FPORT держит nginx"
+        else
+          _front_enabled \
+            && fail "Порт $FPORT перехвачен: $FHOLD — наш конфиг есть, а сокета нет" \
+            || info "Порт $FPORT держит: $FHOLD"
+        fi
+        sep
+        echo -e "${BOLD}Маршруты${NC}"
+        printf "  %-34s %-18s %s\n" "SNI" "куда" "апстрим"
+        printf "  %-34s %-18s %s\n" "$OUR_SNI" "127.0.0.1:$OUR_PORT" "наш XHTTP inbound"
+        printf "  %-34s %-18s %s\n" "(чужой и пустой)" "127.0.0.1:$OUR_PORT" "mimic через наш fallback"
+        while read -r rsni rup; do
+          [[ -z "$rsni" ]] && continue
+          ss -tln 2>/dev/null | tail -n +2 | awk -v p=":$rup" '$4 ~ p"$"' | grep -q . \
+            && printf "  %-34s %-18s %s\n" "$rsni" "127.0.0.1:$rup" "слушает" \
+            || printf "  %-34s %-18s %s\n" "$rsni" "127.0.0.1:$rup" "НЕ СЛУШАЕТ"
+        done < <(_front_routes)
+        if _has_tcp_inbound; then
+          TCPP=$(jq -r '.inbounds[1].port' "$CONFIG")
+          sep
+          info "TCP/Vision inbound на $TCPP мимо фронта: у него та же маска, что у XHTTP,"
+          info "а по одному SNI два потока не развести. Это запасной канал для диагностики."
+        fi
+        sep
+        RLIM=$(grep -oE 'limit_conn[[:space:]]+reality_conn[[:space:]]+[0-9]+' /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null | grep -oE '[0-9]+$')
+        [[ -n "$RLIM" ]] && info "Лимит fallback: $RLIM $(_front_enabled && echo '(общий: за фронтом ключ у всех 127.0.0.1)' || echo '(по IP клиента)')"
+        [[ -f "$FRONT_LOG" ]] && info "Зонды на фронте: $(wc -l < "$FRONT_LOG") записей — sudo xm nginx-probes"
+        echo ""
+        ;;
+    esac
+    ;;
+
 harden)
     [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm harden${NC}"; exit 1; }
     MODE="${2:-apply}"
@@ -3769,9 +4179,11 @@ neighbors)
       shopt -s nullglob
       for f in /etc/nginx/stream-enabled/*; do
         n=$(basename "$f")
-        [[ "$n" == "reality-fallback.conf" ]] \
-          && info "$n — наш (ssl_preread → $(_get_nginx_sni))" \
-          || warn "$n — ЧУЖОЙ в нашем каталоге. Проверь, что он не слушает 127.0.0.1:10443"
+        case "$n" in
+          reality-fallback.conf) info "$n — наш (ssl_preread → $(_get_nginx_sni))" ;;
+          front.conf)            info "$n — наш (фронт по SNI на :$(_front_port))" ;;
+          *) warn "$n — ЧУЖОЙ в нашем каталоге. Проверь, что он не слушает 127.0.0.1:10443" ;;
+        esac
       done
       shopt -u nullglob
     else
@@ -3783,6 +4195,8 @@ neighbors)
     XP=$(jq -r '.inbounds[0].port' "$CONFIG" 2>/dev/null || echo "")
     XP2=$(jq -r '.inbounds[1].port // ""' "$CONFIG" 2>/dev/null || echo "")
     SSHP=$(_get_ssh_port)
+    FRP=""; FRUP=""
+    _front_enabled && { FRP=$(_front_port); FRUP=$(_front_routes | awk '{print $2}'); }
     echo    "  порт     процесс        чей"
     ss -tlnp 2>/dev/null | tail -n +2 | awk '
       { a=$4; sub(/.*:/, "", a); p="?";
@@ -3791,8 +4205,11 @@ neighbors)
       case "$port" in
         "$XP"|"$XP2") who="наш (xray)" ;;
         80|10443)     who="наш (nginx)" ;;
+        "$FRP")       who="наш (nginx: фронт по SNI)" ;;
         "$SSHP")      who="системный (ssh)" ;;
-        *)            who="ЧУЖОЙ — не наш, xm его не трогает" ;;
+        *) if [[ -n "$FRUP" ]] && grep -qx "$port" <<< "$FRUP"; then
+             who="сосед за фронтом — переехал на loopback, xm его не трогает"
+           else who="ЧУЖОЙ — не наш, xm его не трогает"; fi ;;
       esac
       printf "  %-8s %-14s %s\n" "$port" "$proc" "$who"
     done
@@ -3811,7 +4228,7 @@ neighbors)
       case "$n" in
         # xray@.service — шаблонный юнит официального установщика Xray,
         # ставится вместе с xray.service и тоже наш.
-        xray.service|xray@*.service|xray-sni-watch.service) info "$n — наш" ;;
+        xray.service|xray@*.service|xray-sni-watch.service|xray-watchdog.service) info "$n — наш" ;;
         *) warn "$n — ЧУЖОЙ ($(systemctl is-active "$n" 2>/dev/null))" ;;
       esac
       FOUND_UNIT=1
@@ -3831,6 +4248,8 @@ neighbors)
     sep
     echo -e "${BOLD}Что трогает каждая команда${NC}"
     echo -e "  ${GREEN}xm self-update${NC}   только /usr/local/bin/xm — больше ничего"
+    echo -e "  ${GREEN}xm front${NC}         только stream-enabled/front.conf + worker_connections;"
+    echo    "                   апстримы соседей — из /usr/local/etc/xray/front.conf"
     echo -e "  ${GREEN}xm harden${NC}        config.json + stream-enabled/reality-fallback.conf,"
     echo    "                   затем nginx reload — и только если nginx -t прошёл"
     echo -e "  ${GREEN}xm set-sni${NC}       то же самое плюс перезапуск xray"
@@ -3858,6 +4277,8 @@ neighbors)
     echo "  xm apply             Проверить + перезапустить"
     echo -e "  ${GREEN}xm set-sni <domain>${NC}  Сменить домен-маску во ВСЕХ местах (config+nginx) атомарно"
     echo -e "  ${GREEN}xm set-port <порт> [--tcp]${NC}  Сменить порт inbound (проверка занятости + UFW + откат)"
+    echo -e "  ${GREEN}xm front${NC}             Разделить публичный порт по SNI с соседней службой"
+    echo    "                       front on | off | add <sni> <порт> | del <sni> | status"
     echo ""
     echo -e "${BOLD}Бэкапы:${NC}"
     echo "  xm backup / restore / backups"
