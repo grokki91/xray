@@ -930,8 +930,8 @@ log_format front '$remote_addr [$time_local] SNI="$ssl_preread_server_name" '
 
 server {
 TAILEOF
-    echo "    listen 0.0.0.0:${port};"
-    echo "    listen [::]:${port};"
+    echo "    listen 0.0.0.0:${port} backlog=${NGX_BACKLOG};"
+    echo "    listen [::]:${port} backlog=${NGX_BACKLOG};"
     cat <<'SRVEOF'
 
     ssl_preread on;
@@ -1050,6 +1050,11 @@ _ngx_rlimit_nofile() {
 #     это стабильная подпись, по которой сервер узнаётся между сессиями.
 # Устойчивость к DPI дороже пары процентов скорости.
 SYSCTL_FILE="/etc/sysctl.d/99-xray-tune.conf"
+# nginx НЕ наследует net.core.somaxconn: backlog он задаёт сам в listen(),
+# по умолчанию 511. Поэтому sysctl-профиль применяется, а очередь accept
+# продолжает переполняться — замерено 375 overflows за сутки уже ПОСЛЕ tune,
+# при somaxconn=8192 и Xray (Go, somaxconn наследует) на 8192.
+NGX_BACKLOG=8192
 WATCHDOG_SVC="/etc/systemd/system/xray-watchdog.service"
 WATCHDOG_TIMER="/etc/systemd/system/xray-watchdog.timer"
 
@@ -1152,6 +1157,67 @@ _counters_snap_write() {
   ( umask 077; printf '%s\n' "$snap" > "$COUNTERS_SNAP" ) 2>/dev/null
 }
 
+# Фактический backlog слушающих сокетов nginx и Xray. Для LISTEN-сокета
+# Send-Q в ss — это и есть backlog. Счётчик overflows видит последствие,
+# но не называет причину; здесь она видна прямо.
+_backlog_report() {
+  local smc out
+  smc=$(sysctl -n net.core.somaxconn 2>/dev/null)
+  [[ -z "$smc" ]] && return 0
+  out=$(ss -tlnpH 2>/dev/null | awk -v m="$smc" '
+    /"nginx"|"xray"/ && $3+0 < m {
+      printf "      %-24s backlog=%-6s %s\n", $4, $3, ($0 ~ /"nginx"/ ? "nginx" : "xray") }')
+  if [[ -z "$out" ]]; then
+    ok "backlog слушающих сокетов не ниже somaxconn (${smc})"; return 0
+  fi
+  dwarn "backlog ниже somaxconn (${smc}) — на эти сокеты sysctl-профиль не подействовал:"
+  printf '%s\n' "$out"
+  echo -e "      ${CYAN}nginx задаёт backlog сам (по умолчанию 511) и somaxconn не наследует.${NC}"
+  echo -e "      ${CYAN}Чинит: ${BOLD}sudo xm tune${NC}"
+}
+
+# Проставить backlog в listen-директивах nginx. Идемпотентно: строки, где
+# backlog уже есть, не трогаются. Шаблон правится тоже — иначе xm set-sni
+# перегенерирует fallback из него и вернёт 511.
+_ngx_backlog_fix() {
+  local f bak changed=0 rc=0
+  local files=("$FRONT_NGX"
+               /etc/nginx/stream-enabled/reality-fallback.conf
+               /etc/nginx/reality-fallback.conf.tmpl
+               /etc/nginx/sites-available/fallback)
+  mkdir -p "$BACKUP_DIR" 2>/dev/null; chmod 700 "$BACKUP_DIR" 2>/dev/null
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || continue
+    grep -E '^[[:space:]]*listen[[:space:]]' "$f" | grep -qv 'backlog=' || continue
+    bak="$BACKUP_DIR/$(basename "$f")_$(date +%Y%m%d_%H%M%S).bak"; cp "$f" "$bak"
+    sed -i -E "/^[[:space:]]*listen[[:space:]]/{ /backlog=/! s/[[:space:]]*;[[:space:]]*\$/ backlog=${NGX_BACKLOG};/ }" "$f"
+    # Шаблон в конфиг nginx не подключён, проверять его через nginx -t нечем.
+    if [[ "$f" == *.tmpl ]]; then changed=1; continue; fi
+    if nginx -t &>/dev/null; then
+      changed=1
+    else
+      cp "$bak" "$f"
+      warn "backlog в $(basename "$f") nginx не принял — файл возвращён из $bak"
+      nginx -t 2>&1 | tail -3 | sed 's/^/      /'
+      rc=1
+    fi
+  done
+  if [[ "$changed" -eq 0 ]]; then
+    [[ "$rc" -eq 0 ]] && ok "backlog в конфигах nginx уже проставлен"
+    return $rc
+  fi
+  systemctl reload nginx || { fail "nginx reload не удался"; return 1; }
+  # Reload переоткрывает сокет не всегда, а backlog живёт на самом сокете.
+  # Поэтому проверяем по факту, а не по успеху reload.
+  sleep 1
+  if ss -tlnpH 2>/dev/null | awk '/"nginx"/{print $3}' | grep -qv "^${NGX_BACKLOG}$"; then
+    info "reload не переставил backlog на живых сокетах — перезапускаю nginx"
+    systemctl restart nginx; sleep 1
+  fi
+  ok "backlog в listen nginx → ${NGX_BACKLOG}"
+  return $rc
+}
+
 # Счётчики, по которым видно потери ДО Xray. Все накопительные с загрузки,
 # поэтому смысл имеет доля, а не абсолют: 1.9 млн ретрансмитов сами по себе
 # ничего не значат, 7.7% от отправленного — значат много.
@@ -1244,6 +1310,7 @@ _tune_counters() {
   fi
   [[ "$w_ok" -eq 1 && $(( ${lo:-0} + ${ld:-0} )) -gt $(( q_lo + q_ld )) ]] \
     && info "  Накопительно с загрузки: overflows=${lo:-0}, drops=${ld:-0} — было до последней правки"
+  _backlog_report
 
   # UDP-буфер — тоже по окну: снапшот хранит это поле с самого начала, но
   # вердикт давался по счётчику с загрузки, то есть предупреждение висело за
@@ -3642,6 +3709,9 @@ tune)
     sep; echo -e "${BOLD}Шаг 1: сетевой стек${NC}"
     _tune_write && ok "Профиль записан: $SYSCTL_FILE"
     _tune_apply || warn "Часть параметров ядро не приняло (см. выше) — остальные применены"
+    # somaxconn сам по себе на nginx не действует — правим его listen отдельно,
+    # иначе очередь accept продолжит переполняться при применённом профиле.
+    _ngx_backlog_fix || true
 
     # ── 2. policy.handshake ─────────────────────────────────────────────────
     # 4 секунды — дефолт Xray, и он рассчитан на dest в той же сети. У нас
