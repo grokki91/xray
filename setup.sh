@@ -988,8 +988,8 @@ fi
 
 cat > /etc/nginx/sites-available/fallback <<'NGINXEOF'
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen 80 default_server backlog=8192;
+    listen [::]:80 default_server backlog=8192;
     server_name _;
     server_tokens off;
     __NGX_SRV_LINE__
@@ -1100,7 +1100,9 @@ resolver_timeout 5s;
 server {
     # xver=2 в REALITY → сюда приходит PROXY protocol v2. Без proxy_protocol
     # nginx не распарсит заголовок и порвёт хендшейк.
-    listen 127.0.0.1:10443 proxy_protocol;
+    # backlog=8192 под net.core.somaxconn из xm tune: nginx системный
+    # потолок не наследует и без этого молча остаётся на 511.
+    listen 127.0.0.1:10443 proxy_protocol backlog=8192;
 
     # Читаем SNI из ClientHello БЕЗ терминации TLS.
     ssl_preread on;
