@@ -17,6 +17,7 @@
 | **watchdog** | systemd-таймер раз в 2 мин: резолвится ли `dest`, живы ли fallback и Xray |
 | **fail2ban** | Джейл `sshd`. Джейла по трафику REALITY намеренно нет — бан демаскирует |
 | **chrony** | Синхронизация времени (нужна для `maxTimeDiff` REALITY) |
+| **unattended-upgrades** | Автообновления пакетов ОС: ветки `-security` и `-updates`, без автоперезагрузки |
 | **UFW** | Файрвол |
 | **xm** | Менеджер в `/usr/local/bin/xm` |
 
@@ -123,6 +124,7 @@ xm log | log-live | log-clear
 xm ban-list | unban <ip>
 xm nginx-status | nginx-log | nginx-reload | nginx-probes
 xm info | paths | uuid | pubkey
+xm autoupd [on|off|now|log]        # автообновления; без аргумента — статус
 ```
 
 ---
@@ -138,6 +140,7 @@ sudo xm update          # Xray-core
 sudo xm update-geo      # geoip.dat / geosite.dat
 sudo xm harden          # применить свежие анти-DPI настройки
 sudo xm tune            # сетевой стек и watchdog
+sudo xm autoupd apply   # политика автообновлений пакетов ОС
 sudo xm diag-dpi        # проверить, что получилось
 ```
 

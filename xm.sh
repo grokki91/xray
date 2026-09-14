@@ -1411,6 +1411,118 @@ WDTIMEREOF
   systemctl enable --now xray-watchdog.timer >/dev/null 2>&1
 }
 
+# ─── Автообновления пакетов ──────────────────────────────────────────────────
+#
+# ПОЧЕМУ НЕ ТОЛЬКО -security. Ветка security чинит дыры, но не обновляет
+# пакеты: nginx, curl, jq, openssl остаются на версии дня установки, пока
+# конкретно в них не найдут CVE. Ветка -updates доносит обычные обновления в
+# пределах релиза — это патч-версии, ABI и формат конфигов они не меняют.
+#
+# ЧЕГО ЗДЕСЬ НЕТ и не будет: -backports и -proposed. Оттуда приезжают версии,
+# которых нет у большинства машин этого релиза. Нам нужно обратное — быть как
+# все, в том числе по набору версий служб, которые видны снаружи баннером.
+#
+# XRAY ПОД ЭТО НЕ ПОПАДАЕТ. Он не apt-пакет, а бинарник в /usr/local/bin от
+# официального установщика XTLS. Обновляется только руками через xm update —
+# apt его не видит, и никакой Package-Blacklist для этого не нужен.
+#
+# ПЕРЕЗАГРУЗКА НЕ АВТОМАТИЧЕСКАЯ. Ядро и libc ставятся, но момент перезапуска
+# выбирает владелец: авторебут посреди дня рвёт все сессии разом. Напоминание
+# уже есть в xm diag — он читает /var/run/reboot-required.
+UU_POLICY="/etc/apt/apt.conf.d/50unattended-upgrades"
+UU_PERIODIC="/etc/apt/apt.conf.d/20auto-upgrades"
+UU_TIMER_DIR="/etc/systemd/system/apt-daily-upgrade.timer.d"
+UU_LIST_DIR="/etc/systemd/system/apt-daily.timer.d"
+
+# Политика пишется целиком и идемпотентно — как sysctl-профиль в _tune_write.
+# Расписание живёт здесь же, а не в setup.sh: два владельца одного набора
+# файлов расходятся ровно до первой правки, которая попала только в один из них.
+_autoupd_write() {
+  cat > "$UU_POLICY" <<'UUEOF'
+// Политика автообновлений. Создана xm autoupd apply.
+// Правки руками переживут только до следующего запуска — меняй xm.sh.
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}:${distro_codename}-updates";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Package-Blacklist {
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::SyslogEnable "true";
+UUEOF
+  chmod 644 "$UU_POLICY"
+
+  cat > "$UU_PERIODIC" <<'UUEOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+UUEOF
+  chmod 644 "$UU_PERIODIC"
+
+  # Таймзона задаётся в самом таймере — системное время VPS не трогаем.
+  mkdir -p "$UU_TIMER_DIR" "$UU_LIST_DIR"
+  cat > "$UU_TIMER_DIR/override.conf" <<'UUEOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 20:30:00 Europe/Moscow
+RandomizedDelaySec=20m
+Persistent=true
+UUEOF
+  cat > "$UU_LIST_DIR/override.conf" <<'UUEOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 20:00:00 Europe/Moscow
+RandomizedDelaySec=10m
+Persistent=true
+UUEOF
+  chmod 644 "$UU_TIMER_DIR/override.conf" "$UU_LIST_DIR/override.conf"
+}
+
+# Синтаксическая ошибка в любом файле /etc/apt/apt.conf.d ломает НЕ только
+# автообновления, а каждую команду apt на машине — включая ту, которой пришлось
+# бы это чинить. Поэтому бэкап → apt-config dump (он разбирает весь каталог
+# целиком) → откат при отказе. Проверено: на битом файле dump выходит с кодом
+# 100 и печатает «Syntax error <файл>:<строка>».
+_autoupd_apply() {
+  local stamp bak_policy bak_periodic
+  stamp=$(date +%Y%m%d_%H%M%S)
+  mkdir -p "$BACKUP_DIR"
+  bak_policy="$BACKUP_DIR/50unattended-upgrades_$stamp.bak"
+  bak_periodic="$BACKUP_DIR/20auto-upgrades_$stamp.bak"
+  [[ -f "$UU_POLICY"   ]] && cp "$UU_POLICY"   "$bak_policy"
+  [[ -f "$UU_PERIODIC" ]] && cp "$UU_PERIODIC" "$bak_periodic"
+
+  _autoupd_write
+
+  if apt-config dump >/dev/null 2>&1; then
+    rm -f "$bak_policy" "$bak_periodic"
+    systemctl daemon-reload
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+    return 0
+  fi
+
+  # Откат безусловный: неработающий apt дороже автообновлений.
+  if [[ -f "$bak_policy" ]]; then cp "$bak_policy" "$UU_POLICY"; else rm -f "$UU_POLICY"; fi
+  if [[ -f "$bak_periodic" ]]; then cp "$bak_periodic" "$UU_PERIODIC"; else rm -f "$UU_PERIODIC"; fi
+  rm -f "$bak_policy" "$bak_periodic"
+  return 1
+}
+
+# Какие ветки реально приняты apt'ом сейчас — не то, что записано в наш файл,
+# а итог разбора всего каталога: соседний файл с той же директивой мог её
+# переопределить, и тогда -updates в нашем файле ни на что не влияет.
+_autoupd_origins() {
+  apt-config dump 2>/dev/null \
+    | sed -n 's/^Unattended-Upgrade::Allowed-Origins:: "\(.*\)";$/\1/p'
+}
+
 # ─── ML-DSA-65: post-quantum подпись REALITY ─────────────────────────────────
 #
 # ЧТО ДАЁТ: сервер подписывает «подпись сертификата + сырые ClientHello и
@@ -2480,11 +2592,39 @@ update-geo)
 
 autoupd)
     case "${2:-status}" in
+    apply)
+      [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm autoupd apply${NC}"; exit 1; }
+      command -v unattended-upgrade >/dev/null 2>&1 \
+        || warn "Пакет unattended-upgrades не установлен — политику запишу, но применять её некому: sudo apt install -y unattended-upgrades"
+      if _autoupd_apply; then
+        ok "Политика записана, таймеры включены"
+        echo -e "\n${BOLD}Ветки, принятые apt:${NC}"
+        _autoupd_origins | sed 's/^/  /'
+        info "Что реально поставится сегодня: sudo xm autoupd now"
+      else
+        fail "apt отверг записанную политику — файлы возвращены как были"
+        apt-config dump 2>&1 >/dev/null | head -3 | sed 's/^/    /'
+        exit 1
+      fi
+      ;;
     on)   systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; ok "Включено" ;;
     off)  systemctl disable --now apt-daily-upgrade.timer; ok "Выключено" ;;
     now)  unattended-upgrade --dry-run -v 2>&1 | tail -20 ;;
     log)  tail -40 /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null || echo "Лог пуст" ;;
     *)    systemctl list-timers apt-daily-upgrade.timer --no-pager | sed 's/^/  /'
+      # Ветки важнее расписания: таймер может исправно ходить каждый вечер и
+      # ставить при этом одни security-патчи. Ровно так это и выглядело до
+      # того, как в политику добавили -updates.
+      echo -e "\n${BOLD}Ветки, из которых ставятся обновления:${NC}"
+      UUO=$(_autoupd_origins)
+      if [[ -z "$UUO" ]]; then
+        warn "ни одной — автообновления не поставят ничего. Применить: sudo xm autoupd apply"
+      else
+        sed 's/^/  /' <<< "$UUO"
+        grep -q -- '-updates' <<< "$UUO" \
+          || warn "только security: обычные обновления не приезжают. Применить: sudo xm autoupd apply"
+      fi
+      [[ -f /var/run/reboot-required ]] && warn "Требуется перезагрузка (обновлено ядро/libc) — перезагрузи в удобное время"
       echo -e "\n${BOLD}Последние применённые:${NC}"
       UUL=$(grep -a "Packages that will be upgraded" /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -5)
       [[ -n "$UUL" ]] && sed 's/^/  /' <<< "$UUL" || echo "  нет данных"
