@@ -38,6 +38,21 @@ XM_SRC_FILE="/usr/local/etc/xray/xm-source"
 REALITY_CERT_WARN=7000
 REALITY_CERT_LIMIT=8192
 
+# Окно, в котором домен-маска годится ещё и под ML-DSA-65.
+# Нижняя граница — тот же порог, что в diag-dpi (блок C): при более мелком
+# сертификате +3.3 КБ подписи становятся заметной долей ответа, и мы меняем
+# одну зацепку для DPI на другую.
+# Верхняя — та же арифметика, что в xm pq: EST + 3400 должно остаться ниже
+# лимита REALITY, иначе хендшейк порвётся. Считается от лимита, чтобы две
+# константы не разъехались при правке одной.
+REALITY_CERT_PQ_MIN=3500
+REALITY_CERT_PQ_MAX=$((REALITY_CERT_LIMIT - 3400))
+
+# Сколько хендшейков на домен делает sni-scan. Три — компромисс: ловит домен,
+# который рвёт соединения постоянно, и укладывается в интерактивное время.
+# Редкие отказы (единицы в сутки) так не ловятся — для них блок G diag-dpi.
+SNI_PROBES=3
+
 ok()   { echo -e "  ${GREEN}[✓]${NC} $*"; }
 fail() { echo -e "  ${RED}[✗]${NC} $*"; }
 warn() { echo -e "  ${YELLOW}[!]${NC} $*"; }
@@ -3777,41 +3792,96 @@ selftest)
 
 # ─── Подбор домена-маски ─────────────────────────────────────────────────────
 sni-scan)
-    POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net www.apple.com)
+    # Пул массовых CDN-имён: домен-маска должна быть тем, обращение к чему с
+    # этого адреса никого не удивит. Узкий пул = узкий выбор — на четырёх
+    # именах в окно ML-DSA могло не попасть ни одно, и менять было бы не на что.
+    POOL=(www.apple.com swcdn.apple.com dl.google.com www.microsoft.com
+          cdn.jsdelivr.net www.cloudflare.com)
     CUR=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
     if [[ -n "$CUR" ]] && ! printf '%s\n' "${POOL[@]}" | grep -qx "$CUR"; then
       POOL=("$CUR" "${POOL[@]}")
     fi
-    echo -e "${BOLD}${CYAN}[ Подбор домена-маски ]${NC}"; sep
-    printf "  %-22s %9s %6s %8s  %s\n" "домен" "cert,б" "h2" "RTT,мс" "вердикт"
-    BEST=""; BEST_SZ=999999
+    echo -e "${BOLD}${CYAN}[ Подбор домена-маски ]${NC}"
+    info "$SNI_PROBES хендшейка на домен, ${#POOL[@]} доменов — около минуты"
+    sep
+    printf "  %-24s %8s %4s %7s %6s  %s\n" "домен" "cert,б" "h2" "RTT,мс" "проб" "вердикт"
+    BEST=""; BEST_RTT=999999; BEST_EST=0
+    BEST_PQ=""; BEST_PQ_RTT=999999; BEST_PQ_EST=0
     for h in "${POOL[@]}"; do
       EST=$(_check_cert_size "$h")
       if [[ "$EST" == "-1" ]]; then
-        printf "  %-22s %9s %6s %8s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "НЕДОСТУПЕН"; continue
+        printf "  %-24s %8s %4s %7s %6s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "-" "НЕДОСТУПЕН"; continue
       fi
-      T0=$(date +%s%N)
-      HS=$(echo | timeout 8 openssl s_client -connect "$h:443" -servername "$h" \
-           -tls1_3 -alpn h2 2>/dev/null)
-      T1=$(date +%s%N); RTT=$(( (T1-T0)/1000000 ))
-      H2=нет;  printf '%s' "$HS" | grep -qi "ALPN protocol: h2" && H2=да
-      T13=нет; printf '%s' "$HS" | grep -q  "TLSv1.3"           && T13=да
-      V="ГОДИТСЯ"; C="$GREEN"
-      [[ "$EST" -ge "$REALITY_CERT_WARN"  ]] && { V="РИСК";       C="$YELLOW"; }
-      [[ "$EST" -ge "$REALITY_CERT_LIMIT" ]] && { V="НЕ ГОДИТСЯ"; C="$RED"; }
-      [[ "$H2" != "да" || "$T13" != "да"  ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; }
-      GOOD="$V"
-      [[ "$h" == "$CUR" ]] && V="$V ← текущий"
-      printf "  %-22s %9s %6s %8s  ${C}%s${NC}\n" "$h" "$EST" "$H2" "$RTT" "$V"
-      if [[ "$GOOD" == "ГОДИТСЯ" && "$EST" -lt "$BEST_SZ" ]]; then BEST="$h"; BEST_SZ="$EST"; fi
+
+      # Несколько хендшейков вместо одного. Домен, который рвёт каждое второе
+      # соединение, на единственной удачной попытке выглядел безупречно —
+      # ровно та картина, из-за которой нестабильный dest и уезжал в конфиг.
+      OK_N=0; RTT_SUM=0; H2=нет; T13=нет
+      for _ in $(seq 1 "$SNI_PROBES"); do
+        T0=$(date +%s%N)
+        HS=$(echo | timeout 8 openssl s_client -connect "$h:443" -servername "$h" \
+             -tls1_3 -alpn h2 2>/dev/null)
+        T1=$(date +%s%N)
+        [[ -z "$HS" ]] && continue
+        OK_N=$((OK_N + 1)); RTT_SUM=$(( RTT_SUM + (T1 - T0) / 1000000 ))
+        printf '%s' "$HS" | grep -qi "ALPN protocol: h2" && H2=да
+        printf '%s' "$HS" | grep -q  "TLSv1.3"           && T13=да
+      done
+      if [[ "$OK_N" -eq 0 ]]; then
+        printf "  %-24s %8s %4s %7s %6s  ${RED}%s${NC}\n" \
+               "$h" "$EST" "-" "-" "0/$SNI_PROBES" "НЕ ОТВЕЧАЕТ"; continue
+      fi
+      RTT=$(( RTT_SUM / OK_N ))
+
+      # ELIG=1 — кандидата можно выбрать. РИСК и потери проб оставляют домен
+      # в таблице, но из выбора убирают: это данные для глаз, не рекомендация.
+      V="ГОДИТСЯ"; C="$GREEN"; PQ=0; ELIG=1
+      if   [[ "$EST" -ge "$REALITY_CERT_LIMIT" ]]; then V="НЕ ГОДИТСЯ"; C="$RED";    ELIG=0
+      elif [[ "$EST" -ge "$REALITY_CERT_WARN"  ]]; then V="РИСК";       C="$YELLOW"; ELIG=0
+      elif [[ "$EST" -ge "$REALITY_CERT_PQ_MIN" && "$EST" -le "$REALITY_CERT_PQ_MAX" ]]; then
+        V="ГОДИТСЯ +PQ"; PQ=1
+      fi
+      [[ "$H2" != "да" || "$T13" != "да" ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; ELIG=0; PQ=0; }
+      [[ "$OK_N" -lt "$SNI_PROBES" ]] && { V="$V, РВЁТ"; C="$YELLOW"; ELIG=0; }
+
+      VP="$V"; [[ "$h" == "$CUR" ]] && VP="$V ← текущий"
+      printf "  %-24s %8s %4s %7s %6s  ${C}%s${NC}\n" \
+             "$h" "$EST" "$H2" "$RTT" "$OK_N/$SNI_PROBES" "$VP"
+
+      # Выбираем по RTT, а не по минимальному сертификату. RTT до dest лежит на
+      # критическом пути КАЖДОГО хендшейка: REALITY на каждое входящее
+      # соединение сам дозванивается до dest (см. policy.handshake). Размер же
+      # важен только порогами — внутри окна разница в сотню байт ничего не даёт.
+      if [[ "$ELIG" -eq 1 ]]; then
+        if [[ "$PQ" -eq 1 && "$RTT" -lt "$BEST_PQ_RTT" ]]; then
+          BEST_PQ="$h"; BEST_PQ_RTT="$RTT"; BEST_PQ_EST="$EST"
+        fi
+        if [[ "$RTT" -lt "$BEST_RTT" ]]; then
+          BEST="$h"; BEST_RTT="$RTT"; BEST_EST="$EST"
+        fi
+      fi
     done
     sep
-    if [[ -n "$BEST" ]]; then
-      ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_SZ} б)"
+    # Два кандидата, а не один, когда они расходятся: выбор между «RTT до dest
+    # ниже» и «доступен ML-DSA» — это размен, а не вычисление. Прежняя версия
+    # такой размен делала молча (брала минимальный сертификат) и тем закрывала
+    # ML-DSA навсегда; повторять это, поменяв только критерий, нет смысла.
+    if [[ -n "$BEST_PQ" && -n "$BEST" && "$BEST_PQ" != "$BEST" ]]; then
+      ok "Быстрее всех: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс) — ML-DSA недоступен"
+      ok "С окном ML-DSA: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс) — дороже на $((BEST_PQ_RTT - BEST_RTT)) мс в каждом хендшейке"
+      echo -e "  Применить: ${BOLD}sudo xm set-sni <домен>${NC}; после второго — ещё ${BOLD}sudo xm pq on${NC}"
+    elif [[ -n "$BEST_PQ" ]]; then
+      ok "Лучший кандидат: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс) — попадает в окно ML-DSA"
+      [[ "$BEST_PQ" != "$CUR" ]] \
+        && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST_PQ${NC}, затем ${BOLD}sudo xm pq on${NC}"
+    elif [[ -n "$BEST" ]]; then
+      ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс)"
+      info "В окно ML-DSA (${REALITY_CERT_PQ_MIN}–${REALITY_CERT_PQ_MAX} б) не попал никто — xm pq останется недоступен"
       [[ "$BEST" != "$CUR" ]] && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST${NC}"
     else
       fail "Ни один кандидат не прошёл — расширь POOL в xm.sh"
     fi
+    info "Редкие отказы — единицы в сутки — тремя пробами не ловятся. Их считает xm diag-dpi, блок G: «отказы fallback за 24 ч»"
     ;;
 
 tune)

@@ -112,7 +112,7 @@ xm pq status|on|off            # ML-DSA-65: post-quantum подпись REALITY
 xm selftest [--tcp|--all]   # живой хендшейк через loopback — начинай с неё
 xm diag                     # полная диагностика — первым при проблемах
 xm diag-dpi [--quick]       # устойчивость к DPI: зонды, DNS-утечки, профиль трафика
-xm sni-scan                 # замер доменов-масок (cert / h2 / RTT)
+xm sni-scan                 # замер доменов-масок (cert / h2 / RTT / потери проб)
 xm neighbors                # кто ещё живёт на сервере и что трогает xm
 xm reality-debug on|off     # почему REALITY отказывает (авто-off через 15 мин)
 xm diag-ntp | diag-ports | diag-tls | diag-fw | diag-log
