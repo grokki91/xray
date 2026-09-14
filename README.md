@@ -17,6 +17,7 @@
 | **watchdog** | systemd-таймер раз в 2 мин: резолвится ли `dest`, живы ли fallback и Xray |
 | **fail2ban** | Джейл `sshd`. Джейла по трафику REALITY намеренно нет — бан демаскирует |
 | **chrony** | Синхронизация времени (нужна для `maxTimeDiff` REALITY) |
+| **unattended-upgrades** | Автообновления пакетов ОС: ветки `-security` и `-updates`, без автоперезагрузки |
 | **UFW** | Файрвол |
 | **xm** | Менеджер в `/usr/local/bin/xm` |
 
@@ -111,7 +112,7 @@ xm pq status|on|off            # ML-DSA-65: post-quantum подпись REALITY
 xm selftest [--tcp|--all]   # живой хендшейк через loopback — начинай с неё
 xm diag                     # полная диагностика — первым при проблемах
 xm diag-dpi [--quick]       # устойчивость к DPI: зонды, DNS-утечки, профиль трафика
-xm sni-scan                 # замер доменов-масок (cert / h2 / RTT)
+xm sni-scan                 # замер доменов-масок (cert / h2 / RTT / потери проб)
 xm neighbors                # кто ещё живёт на сервере и что трогает xm
 xm reality-debug on|off     # почему REALITY отказывает (авто-off через 15 мин)
 xm diag-ntp | diag-ports | diag-tls | diag-fw | diag-log
@@ -123,6 +124,7 @@ xm log | log-live | log-clear
 xm ban-list | unban <ip>
 xm nginx-status | nginx-log | nginx-reload | nginx-probes
 xm info | paths | uuid | pubkey
+xm autoupd [on|off|now|log]        # автообновления; без аргумента — статус
 ```
 
 ---
@@ -138,6 +140,7 @@ sudo xm update          # Xray-core
 sudo xm update-geo      # geoip.dat / geosite.dat
 sudo xm harden          # применить свежие анти-DPI настройки
 sudo xm tune            # сетевой стек и watchdog
+sudo xm autoupd apply   # политика автообновлений пакетов ОС
 sudo xm diag-dpi        # проверить, что получилось
 ```
 

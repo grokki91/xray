@@ -645,7 +645,7 @@ header "Установка зависимостей"
 
 # DEBIAN_FRONTEND + force-confold: unattended-upgrades спрашивает про уже
 # изменённый 20auto-upgrades и вешает установку на интерактивном диалоге.
-# Оставляем локальную версию — секция 10b всё равно перезапишет её своей.
+# Оставляем локальную версию — секция 14d всё равно перезапишет её своей.
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
@@ -1174,57 +1174,6 @@ systemctl restart fail2ban
 success "fail2ban настроен (SSH на порту $SSH_PORT)"
 
 # =============================================================================
-# 10b. АВТОМАТИЧЕСКИЕ SECURITY-ПАТЧИ ОС
-# =============================================================================
-header "Настройка автоматических security-обновлений"
-
-cat > /etc/apt/apt.conf.d/50unattended-upgrades <<'UUEOF'
-Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}-security";
-    "${distro_id}ESMApps:${distro_codename}-apps-security";
-    "${distro_id}ESM:${distro_codename}-infra-security";
-};
-Unattended-Upgrade::Package-Blacklist {
-};
-Unattended-Upgrade::AutoFixInterruptedDpkg "true";
-Unattended-Upgrade::MinimalSteps "true";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "false";
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::SyslogEnable "true";
-UUEOF
-
-cat > /etc/apt/apt.conf.d/20auto-upgrades <<'UUEOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::Download-Upgradeable-Packages "1";
-APT::Periodic::AutocleanInterval "7";
-UUEOF
-
-# Таймзона задаётся в самом таймере — системное время VPS не меняем
-mkdir -p /etc/systemd/system/apt-daily-upgrade.timer.d
-cat > /etc/systemd/system/apt-daily-upgrade.timer.d/override.conf <<'UUEOF'
-[Timer]
-OnCalendar=
-OnCalendar=*-*-* 20:30:00 Europe/Moscow
-RandomizedDelaySec=20m
-Persistent=true
-UUEOF
-
-mkdir -p /etc/systemd/system/apt-daily.timer.d
-cat > /etc/systemd/system/apt-daily.timer.d/override.conf <<'UUEOF'
-[Timer]
-OnCalendar=
-OnCalendar=*-*-* 20:00:00 Europe/Moscow
-RandomizedDelaySec=10m
-Persistent=true
-UUEOF
-
-systemctl daemon-reload
-systemctl enable --now apt-daily.timer apt-daily-upgrade.timer
-success "Security-патчи: ежедневно 20:30 МСК (без автоперезагрузки)"
-
-# =============================================================================
 # 10c. ЕЖЕНЕДЕЛЬНАЯ РЕВАЛИДАЦИЯ ДОМЕНА-МАСКИ
 # Сертификаты сайтов ротируются. Если у текущего dest вырастет цепочка или
 # появится OCSP staple — REALITY начнёт рвать хендшейки МОЛЧА, и следующая
@@ -1695,6 +1644,22 @@ if command -v xm &>/dev/null; then
   xm tune || warn "xm tune отработал с замечаниями — проверь: sudo xm tune --check"
 else
   warn "xm недоступен — сетевой профиль не применён. Позже: sudo xm tune"
+fi
+
+# =============================================================================
+# 14d. АВТООБНОВЛЕНИЯ ПАКЕТОВ ОС
+#
+# Реализация живёт в xm.sh (_autoupd_write / _autoupd_apply), здесь только
+# вызов — по образцу 14c. Иначе политика оказывается в двух файлах сразу, и
+# правка, дошедшая только до setup.sh, не приезжает ни на одну уже поднятую
+# машину: setup.sh второй раз не запускают.
+# =============================================================================
+header "Автообновления пакетов ОС"
+
+if command -v xm &>/dev/null; then
+  xm autoupd apply || warn "xm autoupd apply не отработал — проверь: sudo xm autoupd"
+else
+  warn "xm недоступен — автообновления не настроены. Позже: sudo xm autoupd apply"
 fi
 
 # =============================================================================

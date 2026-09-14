@@ -38,6 +38,27 @@ XM_SRC_FILE="/usr/local/etc/xray/xm-source"
 REALITY_CERT_WARN=7000
 REALITY_CERT_LIMIT=8192
 
+# Окно, в котором домен-маска годится ещё и под ML-DSA-65.
+# Нижняя граница — тот же порог, что в diag-dpi (блок C): при более мелком
+# сертификате +3.3 КБ подписи становятся заметной долей ответа, и мы меняем
+# одну зацепку для DPI на другую.
+# Верхняя — та же арифметика, что в xm pq: EST + 3400 должно остаться ниже
+# лимита REALITY, иначе хендшейк порвётся. Считается от лимита, чтобы две
+# константы не разъехались при правке одной.
+REALITY_CERT_PQ_MIN=3500
+REALITY_CERT_PQ_MAX=$((REALITY_CERT_LIMIT - 3400))
+
+# Сколько хендшейков на домен делает sni-scan и с каким таймаутом.
+# Десять, а не три: замер на живом сервере дал кандидатов с долей отказов
+# 13% и 27%, и три пробы пропустили обоих — вероятность трёх удач подряд при
+# 13% отказов равна 0.66, то есть команда уверенно рекомендовала худший домен.
+# На десяти пробах те же кандидаты показывают потерю с вероятностью 0.75 и
+# 0.96. Единицы процентов так по-прежнему не ловятся — для них блок G diag-dpi.
+# Таймаут проб короче, чем у _check_cert_size: измеренные RTT здесь 28-56 мс,
+# пять секунд — полсотни запасов, а на мёртвом домене экономят минуты.
+SNI_PROBES=10
+SNI_PROBE_TIMEOUT=5
+
 ok()   { echo -e "  ${GREEN}[✓]${NC} $*"; }
 fail() { echo -e "  ${RED}[✗]${NC} $*"; }
 warn() { echo -e "  ${YELLOW}[!]${NC} $*"; }
@@ -1263,7 +1284,7 @@ _tune_counters() {
     info "Точка отсчёта поставлена — следующий запуск даст вердикт по окну"
   fi
 
-  local src cum_pct
+  local src cum_pct tx_rate=-1
   if [[ -n "${retr:-}" && -n "${tx:-}" && "${tx:-0}" -gt 0 ]]; then
     cum_pct=$(awk -v r="$retr" -v t="$tx" 'BEGIN{printf "%.2f", r*100/t}')
   fi
@@ -1273,7 +1294,21 @@ _tune_counters() {
     pct="$cum_pct"; src="накопительно с загрузки"
   fi
 
-  if [[ -n "${pct:-}" ]]; then
+  # Доля ретрансмитов — отношение, и на малом знаменателе оно перестаёт быть
+  # вердиктом. Замерено на живом сервере: почти простаивающая машина под
+  # постоянным сканированием даёт 12 исходящих сегментов в секунду и РОВНЫЙ фон
+  # ретрансмитов, от трафика не зависящий, — за 85 минут трафик по пятиминуткам
+  # менялся в 11 раз, ретрансмиты в 1.3 (σ 6% от среднего). Процент при этом
+  # читается как катастрофа, хотя в абсолюте это 2.3 ретрансмита в секунду и к
+  # путям до клиентов отношения не имеет: ровный фон при скачущем трафике — это
+  # ответы сканерам, а не потери последней мили. Порог 50 сегм/с взят как низ
+  # правдоподобного: один клиент, качающий видео, даёт на порядок больше.
+  [[ "$w_ok" -eq 1 && "$d_age" -gt 0 ]] && tx_rate=$(( d_tx / d_age ))
+  if [[ "$tx_rate" -ge 0 && "$tx_rate" -lt 50 ]]; then
+    dwarn "Ретрансмиты ${src}: ${pct}% при исходящем потоке ${tx_rate} сегм/с — знаменатель почти пуст, это не вердикт о потерях до клиентов"
+    info "  В абсолюте: $(( d_retr * 3600 / d_age )) ретрансмитов в час. Ровный фон при скачущем трафике = ответы сканерам, а не последняя миля"
+    info "  Разделить одно от другого: ${BOLD}nstat -az TcpExtTCPSynRetrans TcpExtTCPFastRetrans TcpRetransSegs${NC} дважды с интервалом 5 мин"
+  elif [[ -n "${pct:-}" ]]; then
     if   awk -v p="$pct" 'BEGIN{exit !(p<1)}'; then ok    "Ретрансмиты ${src}: ${pct}% — норма"
     elif awk -v p="$pct" 'BEGIN{exit !(p<3)}'; then dwarn "Ретрансмиты ${src}: ${pct}% — заметные потери на пути к клиентам"
     elif [[ "$cc" == "bbr" ]]; then
@@ -1409,6 +1444,118 @@ WantedBy=timers.target
 WDTIMEREOF
   systemctl daemon-reload
   systemctl enable --now xray-watchdog.timer >/dev/null 2>&1
+}
+
+# ─── Автообновления пакетов ──────────────────────────────────────────────────
+#
+# ПОЧЕМУ НЕ ТОЛЬКО -security. Ветка security чинит дыры, но не обновляет
+# пакеты: nginx, curl, jq, openssl остаются на версии дня установки, пока
+# конкретно в них не найдут CVE. Ветка -updates доносит обычные обновления в
+# пределах релиза — это патч-версии, ABI и формат конфигов они не меняют.
+#
+# ЧЕГО ЗДЕСЬ НЕТ и не будет: -backports и -proposed. Оттуда приезжают версии,
+# которых нет у большинства машин этого релиза. Нам нужно обратное — быть как
+# все, в том числе по набору версий служб, которые видны снаружи баннером.
+#
+# XRAY ПОД ЭТО НЕ ПОПАДАЕТ. Он не apt-пакет, а бинарник в /usr/local/bin от
+# официального установщика XTLS. Обновляется только руками через xm update —
+# apt его не видит, и никакой Package-Blacklist для этого не нужен.
+#
+# ПЕРЕЗАГРУЗКА НЕ АВТОМАТИЧЕСКАЯ. Ядро и libc ставятся, но момент перезапуска
+# выбирает владелец: авторебут посреди дня рвёт все сессии разом. Напоминание
+# уже есть в xm diag — он читает /var/run/reboot-required.
+UU_POLICY="/etc/apt/apt.conf.d/50unattended-upgrades"
+UU_PERIODIC="/etc/apt/apt.conf.d/20auto-upgrades"
+UU_TIMER_DIR="/etc/systemd/system/apt-daily-upgrade.timer.d"
+UU_LIST_DIR="/etc/systemd/system/apt-daily.timer.d"
+
+# Политика пишется целиком и идемпотентно — как sysctl-профиль в _tune_write.
+# Расписание живёт здесь же, а не в setup.sh: два владельца одного набора
+# файлов расходятся ровно до первой правки, которая попала только в один из них.
+_autoupd_write() {
+  cat > "$UU_POLICY" <<'UUEOF'
+// Политика автообновлений. Создана xm autoupd apply.
+// Правки руками переживут только до следующего запуска — меняй xm.sh.
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}:${distro_codename}-updates";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Package-Blacklist {
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::SyslogEnable "true";
+UUEOF
+  chmod 644 "$UU_POLICY"
+
+  cat > "$UU_PERIODIC" <<'UUEOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::Download-Upgradeable-Packages "1";
+APT::Periodic::AutocleanInterval "7";
+UUEOF
+  chmod 644 "$UU_PERIODIC"
+
+  # Таймзона задаётся в самом таймере — системное время VPS не трогаем.
+  mkdir -p "$UU_TIMER_DIR" "$UU_LIST_DIR"
+  cat > "$UU_TIMER_DIR/override.conf" <<'UUEOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 20:30:00 Europe/Moscow
+RandomizedDelaySec=20m
+Persistent=true
+UUEOF
+  cat > "$UU_LIST_DIR/override.conf" <<'UUEOF'
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 20:00:00 Europe/Moscow
+RandomizedDelaySec=10m
+Persistent=true
+UUEOF
+  chmod 644 "$UU_TIMER_DIR/override.conf" "$UU_LIST_DIR/override.conf"
+}
+
+# Синтаксическая ошибка в любом файле /etc/apt/apt.conf.d ломает НЕ только
+# автообновления, а каждую команду apt на машине — включая ту, которой пришлось
+# бы это чинить. Поэтому бэкап → apt-config dump (он разбирает весь каталог
+# целиком) → откат при отказе. Проверено: на битом файле dump выходит с кодом
+# 100 и печатает «Syntax error <файл>:<строка>».
+_autoupd_apply() {
+  local stamp bak_policy bak_periodic
+  stamp=$(date +%Y%m%d_%H%M%S)
+  mkdir -p "$BACKUP_DIR"
+  bak_policy="$BACKUP_DIR/50unattended-upgrades_$stamp.bak"
+  bak_periodic="$BACKUP_DIR/20auto-upgrades_$stamp.bak"
+  [[ -f "$UU_POLICY"   ]] && cp "$UU_POLICY"   "$bak_policy"
+  [[ -f "$UU_PERIODIC" ]] && cp "$UU_PERIODIC" "$bak_periodic"
+
+  _autoupd_write
+
+  if apt-config dump >/dev/null 2>&1; then
+    rm -f "$bak_policy" "$bak_periodic"
+    systemctl daemon-reload
+    systemctl enable --now apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1
+    return 0
+  fi
+
+  # Откат безусловный: неработающий apt дороже автообновлений.
+  if [[ -f "$bak_policy" ]]; then cp "$bak_policy" "$UU_POLICY"; else rm -f "$UU_POLICY"; fi
+  if [[ -f "$bak_periodic" ]]; then cp "$bak_periodic" "$UU_PERIODIC"; else rm -f "$UU_PERIODIC"; fi
+  rm -f "$bak_policy" "$bak_periodic"
+  return 1
+}
+
+# Какие ветки реально приняты apt'ом сейчас — не то, что записано в наш файл,
+# а итог разбора всего каталога: соседний файл с той же директивой мог её
+# переопределить, и тогда -updates в нашем файле ни на что не влияет.
+_autoupd_origins() {
+  apt-config dump 2>/dev/null \
+    | sed -n 's/^Unattended-Upgrade::Allowed-Origins:: "\(.*\)";$/\1/p'
 }
 
 # ─── ML-DSA-65: post-quantum подпись REALITY ─────────────────────────────────
@@ -2480,11 +2627,39 @@ update-geo)
 
 autoupd)
     case "${2:-status}" in
+    apply)
+      [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm autoupd apply${NC}"; exit 1; }
+      command -v unattended-upgrade >/dev/null 2>&1 \
+        || warn "Пакет unattended-upgrades не установлен — политику запишу, но применять её некому: sudo apt install -y unattended-upgrades"
+      if _autoupd_apply; then
+        ok "Политика записана, таймеры включены"
+        echo -e "\n${BOLD}Ветки, принятые apt:${NC}"
+        _autoupd_origins | sed 's/^/  /'
+        info "Что реально поставится сегодня: sudo xm autoupd now"
+      else
+        fail "apt отверг записанную политику — файлы возвращены как были"
+        apt-config dump 2>&1 >/dev/null | head -3 | sed 's/^/    /'
+        exit 1
+      fi
+      ;;
     on)   systemctl enable --now apt-daily.timer apt-daily-upgrade.timer; ok "Включено" ;;
     off)  systemctl disable --now apt-daily-upgrade.timer; ok "Выключено" ;;
     now)  unattended-upgrade --dry-run -v 2>&1 | tail -20 ;;
     log)  tail -40 /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null || echo "Лог пуст" ;;
     *)    systemctl list-timers apt-daily-upgrade.timer --no-pager | sed 's/^/  /'
+      # Ветки важнее расписания: таймер может исправно ходить каждый вечер и
+      # ставить при этом одни security-патчи. Ровно так это и выглядело до
+      # того, как в политику добавили -updates.
+      echo -e "\n${BOLD}Ветки, из которых ставятся обновления:${NC}"
+      UUO=$(_autoupd_origins)
+      if [[ -z "$UUO" ]]; then
+        warn "ни одной — автообновления не поставят ничего. Применить: sudo xm autoupd apply"
+      else
+        sed 's/^/  /' <<< "$UUO"
+        grep -q -- '-updates' <<< "$UUO" \
+          || warn "только security: обычные обновления не приезжают. Применить: sudo xm autoupd apply"
+      fi
+      [[ -f /var/run/reboot-required ]] && warn "Требуется перезагрузка (обновлено ядро/libc) — перезагрузи в удобное время"
       echo -e "\n${BOLD}Последние применённые:${NC}"
       UUL=$(grep -a "Packages that will be upgraded" /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -5)
       [[ -n "$UUL" ]] && sed 's/^/  /' <<< "$UUL" || echo "  нет данных"
@@ -3637,41 +3812,105 @@ selftest)
 
 # ─── Подбор домена-маски ─────────────────────────────────────────────────────
 sni-scan)
-    POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net www.apple.com)
+    # Пул массовых CDN-имён: домен-маска должна быть тем, обращение к чему с
+    # этого адреса никого не удивит. Узкий пул = узкий выбор — на четырёх
+    # именах в окно ML-DSA могло не попасть ни одно, и менять было бы не на что.
+    POOL=(www.apple.com swcdn.apple.com dl.google.com www.microsoft.com
+          cdn.jsdelivr.net www.cloudflare.com)
     CUR=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
     if [[ -n "$CUR" ]] && ! printf '%s\n' "${POOL[@]}" | grep -qx "$CUR"; then
       POOL=("$CUR" "${POOL[@]}")
     fi
-    echo -e "${BOLD}${CYAN}[ Подбор домена-маски ]${NC}"; sep
-    printf "  %-22s %9s %6s %8s  %s\n" "домен" "cert,б" "h2" "RTT,мс" "вердикт"
-    BEST=""; BEST_SZ=999999
+    echo -e "${BOLD}${CYAN}[ Подбор домена-маски ]${NC}"
+    info "$SNI_PROBES хендшейков на домен, ${#POOL[@]} доменов — одна-три минуты"
+    sep
+    printf "  %-24s %8s %4s %7s %6s  %s\n" "домен" "cert,б" "h2" "RTT,мс" "проб" "вердикт"
+    BEST=""; BEST_RTT=999999; BEST_EST=0; BEST_FAIL=999
+    BEST_PQ=""; BEST_PQ_RTT=999999; BEST_PQ_EST=0; BEST_PQ_FAIL=999
     for h in "${POOL[@]}"; do
       EST=$(_check_cert_size "$h")
       if [[ "$EST" == "-1" ]]; then
-        printf "  %-22s %9s %6s %8s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "НЕДОСТУПЕН"; continue
+        printf "  %-24s %8s %4s %7s %6s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "-" "НЕДОСТУПЕН"; continue
       fi
-      T0=$(date +%s%N)
-      HS=$(echo | timeout 8 openssl s_client -connect "$h:443" -servername "$h" \
-           -tls1_3 -alpn h2 2>/dev/null)
-      T1=$(date +%s%N); RTT=$(( (T1-T0)/1000000 ))
-      H2=нет;  printf '%s' "$HS" | grep -qi "ALPN protocol: h2" && H2=да
-      T13=нет; printf '%s' "$HS" | grep -q  "TLSv1.3"           && T13=да
-      V="ГОДИТСЯ"; C="$GREEN"
-      [[ "$EST" -ge "$REALITY_CERT_WARN"  ]] && { V="РИСК";       C="$YELLOW"; }
-      [[ "$EST" -ge "$REALITY_CERT_LIMIT" ]] && { V="НЕ ГОДИТСЯ"; C="$RED"; }
-      [[ "$H2" != "да" || "$T13" != "да"  ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; }
-      GOOD="$V"
-      [[ "$h" == "$CUR" ]] && V="$V ← текущий"
-      printf "  %-22s %9s %6s %8s  ${C}%s${NC}\n" "$h" "$EST" "$H2" "$RTT" "$V"
-      if [[ "$GOOD" == "ГОДИТСЯ" && "$EST" -lt "$BEST_SZ" ]]; then BEST="$h"; BEST_SZ="$EST"; fi
+
+      # Несколько хендшейков вместо одного. Домен, который рвёт каждое второе
+      # соединение, на единственной удачной попытке выглядел безупречно —
+      # ровно та картина, из-за которой нестабильный dest и уезжал в конфиг.
+      OK_N=0; RTT_SUM=0; H2=нет; T13=нет
+      for _ in $(seq 1 "$SNI_PROBES"); do
+        T0=$(date +%s%N)
+        HS=$(echo | timeout "$SNI_PROBE_TIMEOUT" openssl s_client -connect "$h:443" -servername "$h" \
+             -tls1_3 -alpn h2 2>/dev/null)
+        T1=$(date +%s%N)
+        [[ -z "$HS" ]] && continue
+        OK_N=$((OK_N + 1)); RTT_SUM=$(( RTT_SUM + (T1 - T0) / 1000000 ))
+        printf '%s' "$HS" | grep -qi "ALPN protocol: h2" && H2=да
+        printf '%s' "$HS" | grep -q  "TLSv1.3"           && T13=да
+      done
+      if [[ "$OK_N" -eq 0 ]]; then
+        printf "  %-24s %8s %4s %7s %6s  ${RED}%s${NC}\n" \
+               "$h" "$EST" "-" "-" "0/$SNI_PROBES" "НЕ ОТВЕЧАЕТ"; continue
+      fi
+      RTT=$(( RTT_SUM / OK_N ))
+
+      # ELIG=1 — кандидата можно выбрать. РИСК и потери проб оставляют домен
+      # в таблице, но из выбора убирают: это данные для глаз, не рекомендация.
+      V="ГОДИТСЯ"; C="$GREEN"; PQ=0; ELIG=1
+      if   [[ "$EST" -ge "$REALITY_CERT_LIMIT" ]]; then V="НЕ ГОДИТСЯ"; C="$RED";    ELIG=0
+      elif [[ "$EST" -ge "$REALITY_CERT_WARN"  ]]; then V="РИСК";       C="$YELLOW"; ELIG=0
+      elif [[ "$EST" -ge "$REALITY_CERT_PQ_MIN" && "$EST" -le "$REALITY_CERT_PQ_MAX" ]]; then
+        V="ГОДИТСЯ +PQ"; PQ=1
+      fi
+      [[ "$H2" != "да" || "$T13" != "да" ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; ELIG=0; PQ=0; }
+      FAIL_N=$(( SNI_PROBES - OK_N ))
+      [[ "$FAIL_N" -gt 0 ]] && { V="$V, РВЁТ"; C="$YELLOW"; }
+
+      VP="$V"; [[ "$h" == "$CUR" ]] && VP="$V ← текущий"
+      printf "  %-24s %8s %4s %7s %6s  ${C}%s${NC}\n" \
+             "$h" "$EST" "$H2" "$RTT" "$OK_N/$SNI_PROBES" "$VP"
+
+      # Ранжируем сперва по потерям, и только при равенстве — по RTT. Порядок
+      # именно такой: домен, который рвёт соединения, дороже любых сэкономленных
+      # миллисекунд, потому что каждый обрыв — это непрошедший коннект клиента.
+      # Размер сертификата в ранжировании не участвует вовсе: он важен только
+      # порогами, внутри допустимого диапазона сотня байт не даёт ничего.
+      # Домен с потерями не выбрасываем, а ставим ниже: если потери есть у всех,
+      # выбирать всё равно придётся, и «ни один не прошёл» — не ответ.
+      if [[ "$ELIG" -eq 1 ]]; then
+        if [[ "$FAIL_N" -lt "$BEST_FAIL" \
+           || ( "$FAIL_N" -eq "$BEST_FAIL" && "$RTT" -lt "$BEST_RTT" ) ]]; then
+          BEST="$h"; BEST_RTT="$RTT"; BEST_EST="$EST"; BEST_FAIL="$FAIL_N"
+        fi
+        if [[ "$PQ" -eq 1 ]] \
+           && [[ "$FAIL_N" -lt "$BEST_PQ_FAIL" \
+              || ( "$FAIL_N" -eq "$BEST_PQ_FAIL" && "$RTT" -lt "$BEST_PQ_RTT" ) ]]; then
+          BEST_PQ="$h"; BEST_PQ_RTT="$RTT"; BEST_PQ_EST="$EST"; BEST_PQ_FAIL="$FAIL_N"
+        fi
+      fi
     done
     sep
-    if [[ -n "$BEST" ]]; then
-      ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_SZ} б)"
+    # Два кандидата, а не один, когда они расходятся: выбор между «RTT до dest
+    # ниже» и «доступен ML-DSA» — это размен, а не вычисление. Прежняя версия
+    # такой размен делала молча (брала минимальный сертификат) и тем закрывала
+    # ML-DSA навсегда; повторять это, поменяв только критерий, нет смысла.
+    if [[ -n "$BEST_PQ" && -n "$BEST" && "$BEST_PQ" != "$BEST" ]]; then
+      ok "Стабильнее всех: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES}) — ML-DSA недоступен"
+      ok "С окном ML-DSA: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES})"
+      echo -e "  Применить: ${BOLD}sudo xm set-sni <домен>${NC}; после второго — ещё ${BOLD}sudo xm pq on${NC}"
+    elif [[ -n "$BEST_PQ" ]]; then
+      ok "Лучший кандидат: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES}) — попадает в окно ML-DSA"
+      [[ "$BEST_PQ" != "$CUR" ]] \
+        && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST_PQ${NC}, затем ${BOLD}sudo xm pq on${NC}"
+    elif [[ -n "$BEST" ]]; then
+      ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES})"
+      info "В окно ML-DSA (${REALITY_CERT_PQ_MIN}–${REALITY_CERT_PQ_MAX} б) не попал никто — xm pq останется недоступен"
       [[ "$BEST" != "$CUR" ]] && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST${NC}"
     else
       fail "Ни один кандидат не прошёл — расширь POOL в xm.sh"
     fi
+    [[ -n "$BEST" && "$BEST_FAIL" -gt 0 ]] \
+      && warn "Даже лучший кандидат потерял ${BEST_FAIL} из ${SNI_PROBES} проб — путь ОТ ЭТОГО VPS до масок нестабилен, дело может быть не в домене"
+    info "Доля отказов в единицы процентов ${SNI_PROBES} пробами не ловится. Её считает xm diag-dpi, блок G: «отказы fallback за 24 ч»"
     ;;
 
 tune)
