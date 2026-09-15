@@ -446,6 +446,10 @@ if [[ -f "$XRAY_CONFIG" ]] && [[ "${1:-}" == "--reinstall" ]]; then
     echo  "        Маршруты уцелеют, вернуть после установки: sudo xm front on"
   fi
   echo    "    · ufw                       — включается, открываются только наши порты"
+  if [[ -f /usr/local/etc/xray/access.conf ]]; then
+    echo  "      ↳ объявленные локальные правила доступа НЕ теряются: их список"
+    echo  "        лежит вне /etc и применяется заново (sudo xm access status)"
+  fi
   echo    "    · fail2ban, unattended-upgrades — конфиги перезаписываются"
   echo ""
   if command -v xm &>/dev/null; then
@@ -631,6 +635,52 @@ if [[ "$DUAL_CHOICE" =~ ^[Yy]$ ]]; then
     break
   done
   info "Второй inbound: порт ${BOLD}$XRAY_PORT2${NC}"
+fi
+
+# Порт своей службы рядом с VPN. Спрашиваем здесь, но по умолчанию НЕ делаем
+# ничего: пустой ответ — ни одного лишнего правила, и тому, кто ставит проект
+# с нуля, эта механика не достаётся вообще. Уже объявленные правила лежат вне
+# /etc, переустановку переживают и вопросом не трогаются — их вернёт секция 13.
+ACCESS_PENDING=()
+echo ""
+if [[ -f /usr/local/etc/xray/access.conf ]]; then
+  info "Найдены объявленные локальные правила доступа — секция UFW вернёт их на место."
+else
+  echo -e "${BOLD}Держать открытым порт для своей службы на этом сервере?${NC}"
+  echo -e "${YELLOW}Речь не о VPN, а о чём-то своём рядом: панель, API, внутренний${NC}"
+  echo -e "${YELLOW}сервис. Правило описывается как «порт + откуда» — интерфейс${NC}"
+  echo -e "${YELLOW}(туннель, локальный бридж) или один адрес — и сохраняется, чтобы${NC}"
+  echo -e "${YELLOW}переустановка его не съела. Нечего добавлять — просто Enter,${NC}"
+  echo -e "${YELLOW}ни один лишний порт не откроется.${NC}"
+  read -rp "Добавить правила? [y/N]: " ACCESS_CHOICE
+  if [[ "${ACCESS_CHOICE:-n}" =~ ^[Yy]$ ]]; then
+    while true; do
+      read -rp "Порт/протокол (например 8080/tcp), Enter — закончить: " A_SPEC
+      [[ -z "$A_SPEC" ]] && break
+      [[ "$A_SPEC" =~ ^[0-9]+/(tcp|udp)$ ]] || { warn "Формат: <порт>/tcp или <порт>/udp"; continue; }
+      A_PORT="${A_SPEC%%/*}"
+      [[ "$A_PORT" -ge 1 && "$A_PORT" -le 65535 ]] || { warn "Порт: число 1-65535"; continue; }
+      read -rp "  С какого интерфейса? [Enter — не ограничивать]: " A_IF
+      A_IF=${A_IF:--}
+      [[ "$A_IF" == "-" || "$A_IF" =~ ^[a-zA-Z0-9._-]{1,15}$ ]] \
+        || { warn "Некорректное имя интерфейса"; continue; }
+      read -rp "  С какого адреса или CIDR? [Enter — не ограничивать]: " A_SRC
+      A_SRC=${A_SRC:--}
+      [[ "$A_SRC" == "-" || "$A_SRC" =~ ^[0-9a-fA-F.:]+(/[0-9]{1,3})?$ ]] \
+        || { warn "Некорректный адрес"; continue; }
+      # Оба ограничения пустые — это «открыть всему интернету». Служба за таким
+      # портом отвечает своим баннером или сертификатом, и сканер находит её
+      # первым же проходом — вся маскировка REALITY рядом обесценивается.
+      if [[ "$A_IF" == "-" && "$A_SRC" == "-" ]]; then
+        warn "Без интерфейса и без адреса порт открывается всему интернету."
+        warn "Укажи хотя бы одно из двух. Если правило нужно именно такое —"
+        warn "добавь его после установки: sudo xm access add $A_SPEC - - --force"
+        continue
+      fi
+      ACCESS_PENDING+=("$A_SPEC $A_IF $A_SRC")
+      info "Запомнил: ${BOLD}$A_SPEC${NC} (интерфейс: $A_IF, источник: $A_SRC)"
+    done
+  fi
 fi
 
 echo ""
@@ -1533,6 +1583,29 @@ if ! ufw status | grep -q "Status: active"; then
 else
   ufw reload && success "UFW перезагружен"
 fi
+# Локальные правила доступа. Наши порты открыты выше заново, а эти объявлены
+# пользователем и должны уцелеть после переустановки. Применяет их сам xm
+# (установлен в секции 12) — валидация и формат файла живут в одном месте, а
+# не дублируются здесь.
+if [[ -x "$XM_TARGET" ]]; then
+  for A_RULE in ${ACCESS_PENDING[@]+"${ACCESS_PENDING[@]}"}; do
+    read -r A_SPEC A_IF A_SRC <<<"$A_RULE"
+    "$XM_TARGET" access add "$A_SPEC" "$A_IF" "$A_SRC" >/dev/null 2>&1 \
+      && success "Правило доступа: $A_SPEC (интерфейс: $A_IF, источник: $A_SRC)" \
+      || warn "Правило $A_SPEC не принято — добавь вручную: sudo xm access add $A_SPEC $A_IF $A_SRC"
+  done
+  if [[ -f /usr/local/etc/xray/access.conf ]]; then
+    "$XM_TARGET" access apply >/dev/null 2>&1 \
+      && success "Локальные правила доступа применены — проверить: sudo xm access status" \
+      || warn "Часть локальных правил не применилась — проверь: sudo xm access status"
+  fi
+elif [[ ${#ACCESS_PENDING[@]} -gt 0 ]]; then
+  warn "xm не установлен — правила доступа не применены. После установки xm:"
+  for A_RULE in "${ACCESS_PENDING[@]}"; do
+    warn "  sudo xm access add $A_RULE"
+  done
+fi
+
 ufw status numbered
 
 # =============================================================================

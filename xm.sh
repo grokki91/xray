@@ -16,6 +16,7 @@
 #   Инфо:        info / paths / uuid / pubkey
 #   Анти-DPI:    harden [--check|--off|--dot|--nonip [drop|skip|off]] / pq status|on|off
 #   Фронт:       front [status|on|off|add <sni> <порт>|del <sni>]
+#   Доступ:      access [status|add <порт>/<proto> [iface|-] [src|-]|del|apply|clear]
 #   Стабильность: tune [--check|--off] / watchdog on|off|now|status
 #   Соседи:      neighbors — что ещё живёт на сервере и что трогает xm
 #   Диагностика: diag / diag-dpi [--quick] / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
@@ -823,6 +824,134 @@ _ngx_fallback_mode() {
   fi
   systemctl reload nginx || { fail "nginx reload не удался — откат"; cp "$bak" "$conf"; systemctl reload nginx; return 1; }
   return 0
+}
+
+# ─── Локальные правила доступа ───────────────────────────────────────────────
+#
+# ЗАЧЕМ: рядом с VPN на сервере живут свои службы, и некоторым нужен открытый
+# порт — но не наружу, а с одного интерфейса (туннель, локальный бридж) или с
+# одного адреса. Само правило ufw пишется одной строкой; вся сложность в том,
+# чтобы оно не пропало. setup.sh --reinstall заново включает ufw и открывает
+# СВОИ порты, а `ufw reset` руками сносит вообще всё — и молча, так что
+# обнаруживается это уже по неработающей службе. Объявленные здесь правила
+# переживают и переустановку, и сброс: источник правды лежит в
+# /usr/local/etc/xray, как у фронта, а секция UFW в setup.sh прогоняет их
+# заново после своих.
+#
+# ЧТО ЗДЕСЬ НЕ ХРАНИТСЯ: правило — это тройка (интерфейс, источник, порт) и
+# ничего больше. Ни имени службы, ни назначения: состояние читают и печатают
+# diag и neighbors, и лишняя строка про соседа в выводе диагностики никому не
+# нужна. Кому нужно помнить — пишет себе комментарий в файле.
+#
+# ДЕФОЛТ — ПУСТО. У чистой установки файла нет, вопрос при установке
+# отвечается Enter'ом в «нет», и ни один лишний порт не открывается: ставящему
+# проект с нуля эта механика не достаётся вообще.
+ACCESS_STATE="/usr/local/etc/xray/access.conf"
+
+_access_state_init() {
+  [[ -f "$ACCESS_STATE" ]] && return 0
+  mkdir -p "$(dirname "$ACCESS_STATE")"
+  cat > "$ACCESS_STATE" <<'AEOF'
+# Локальные правила доступа. Читает `xm access apply` и секция UFW в setup.sh —
+# в этом весь смысл файла: он переживает переустановку и сброс ufw.
+#
+# Формат строки:
+#   RULE <интерфейс|-> <источник CIDR|-> <порт> <tcp|udp>
+# «-» значит «любой». Правки руками допустимы, но лучше `xm access add` —
+# там валидация, а сюда значения уходят в командную строку ufw.
+AEOF
+  chmod 600 "$ACCESS_STATE"
+}
+
+# Объявленные правила: строки "RULE <iface> <src> <порт> <proto>" → 4 поля.
+_access_rules() {
+  [[ -f "$ACCESS_STATE" ]] || return 0
+  awk '$1=="RULE" && NF==5 {print $2, $3, $4, $5}' "$ACCESS_STATE"
+}
+
+# Валидация обязательна и строгая: значения идут аргументами в ufw, и всё, что
+# не прошло проверку, до него не доезжает. Проверяет и `add`, и `apply` —
+# второй потому, что файл разрешено править руками.
+_access_valid() {
+  local iface="$1" src="$2" port="$3" proto="$4"
+  [[ "$iface" == "-" || "$iface" =~ ^[a-zA-Z0-9._-]{1,15}$ ]] \
+    || { fail "Интерфейс: буквы, цифры, . _ - (до 15 знаков) или «-»"; return 1; }
+  [[ "$src" == "-" \
+     || "$src" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$ \
+     || "$src" =~ ^[0-9a-fA-F:]+(/[0-9]{1,3})?$ ]] \
+    || { fail "Источник: адрес или CIDR (IPv4/IPv6) либо «-»"; return 1; }
+  [[ "$port" =~ ^[0-9]+$ ]] && [[ "$port" -ge 1 && "$port" -le 65535 ]] \
+    || { fail "Порт: число 1-65535"; return 1; }
+  [[ "$proto" == "tcp" || "$proto" == "udp" ]] \
+    || { fail "Протокол: tcp или udp"; return 1; }
+  return 0
+}
+
+# Аргументы для ufw. Порядок слов у него фиксирован, а `from any` пишем даже
+# для «любого источника»: без него форма `allow to any port N` невалидна, и
+# пришлось бы держать две разные ветки сборки команды и, главное, две разные
+# строки для `ufw delete` — они должны совпадать с добавленными дословно.
+_access_ufw_args() {
+  local iface="$1" src="$2" port="$3" proto="$4"
+  local -a a=(allow)
+  [[ "$iface" != "-" ]] && a+=(in on "$iface")
+  [[ "$src" == "-" ]] && a+=(from any) || a+=(from "$src")
+  a+=(to any port "$port" proto "$proto")
+  printf '%s\n' "${a[@]}"
+}
+
+# Человекочитаемая область действия — для вывода status и diag.
+_access_scope() {
+  local iface="$1" src="$2" out=""
+  [[ "$iface" != "-" ]] && out="на $iface" || out="на любом интерфейсе"
+  [[ "$src" != "-" ]] && out="$out с $src" || out="$out с любого адреса"
+  echo "$out"
+}
+
+# Есть ли правило в живом ufw. Сверяем колонки To/From из `ufw status`:
+# IPv6-дубль («(v6)» в To) не совпадёт и в расчёт не идёт — нам достаточно
+# знать, что правило вообще доехало.
+_access_in_ufw() {
+  local iface="$1" src="$2" port="$3" proto="$4" want_to want_from
+  want_to="${port}/${proto}"
+  [[ "$iface" != "-" ]] && want_to="${want_to} on ${iface}"
+  want_from="Anywhere"
+  [[ "$src" != "-" ]] && want_from="$src"
+  ufw status 2>/dev/null | awk -v t="$want_to" -v f="$want_from" '
+    index($0, "ALLOW") > 0 {
+      i = index($0, "ALLOW")
+      to = substr($0, 1, i - 1); sub(/[[:space:]]+$/, "", to)
+      rest = substr($0, i)
+      sub(/^ALLOW[[:space:]]+(IN|OUT)?[[:space:]]*/, "", rest)
+      sub(/[[:space:]]*#.*$/, "", rest); sub(/[[:space:]]+$/, "", rest)
+      if (to == t && rest == f) found = 1
+    }
+    END { exit found ? 0 : 1 }'
+}
+
+# Прогон всех объявленных правил через ufw. Идемпотентно: на уже существующее
+# правило ufw отвечает «Skipping adding existing rule» и кодом 0, так что
+# apply можно гонять сколько угодно — в том числе из setup.sh при каждой
+# переустановке.
+_access_apply() {
+  local iface src port proto ok_n=0 bad=0
+  local -a A
+  while read -r iface src port proto; do
+    [[ -z "$iface" ]] && continue
+    if ! _access_valid "$iface" "$src" "$port" "$proto"; then
+      fail "Строка пропущена: RULE $iface $src $port $proto"
+      bad=$((bad + 1)); continue
+    fi
+    mapfile -t A < <(_access_ufw_args "$iface" "$src" "$port" "$proto")
+    if ufw "${A[@]}" comment 'xm access' >/dev/null 2>&1; then
+      ok_n=$((ok_n + 1))
+    else
+      fail "UFW не принял: ${port}/${proto} $(_access_scope "$iface" "$src")"
+      bad=$((bad + 1))
+    fi
+  done < <(_access_rules)
+  ACCESS_OK_N="$ok_n"; ACCESS_BAD_N="$bad"
+  [[ "$bad" -eq 0 ]]
 }
 
 # ─── Фронт: демультиплексор по SNI на публичном порту ────────────────────────
@@ -3738,6 +3867,25 @@ diag-fw)
       info "Убрать: sudo ufw delete allow <порт>/<proto> — и проверить, что SSH при этом остался разрешён"
     fi
 
+    # Объявленные локальные правила. Здесь важно не «открыто ли», а «не
+    # потерялось ли»: setup.sh --reinstall и `ufw reset` сносят их молча, и
+    # обнаруживается это обычно по неработающей службе, а не по выводу diag.
+    if [[ -f "$ACCESS_STATE" ]]; then
+      sep
+      echo -e "${BOLD}Локальные правила доступа:${NC}"
+      AC_MISS=0
+      while read -r ai as ap apr; do
+        [[ -z "$ai" ]] && continue
+        if _access_in_ufw "$ai" "$as" "$ap" "$apr"; then
+          ok "${ap}/${apr} $(_access_scope "$ai" "$as")"
+        else
+          fail "${ap}/${apr} $(_access_scope "$ai" "$as") — объявлено, а в ufw НЕТ"
+          AC_MISS=$((AC_MISS + 1))
+        fi
+      done < <(_access_rules)
+      [[ "$AC_MISS" -gt 0 ]] && info "Вернуть: sudo xm access apply"
+    fi
+
     sep
     echo -e "${BOLD}fail2ban:${NC}"
     if systemctl is-active --quiet fail2ban; then
@@ -4219,6 +4367,172 @@ front)
         RLIM=$(grep -oE 'limit_conn[[:space:]]+reality_conn[[:space:]]+[0-9]+' /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null | grep -oE '[0-9]+$')
         [[ -n "$RLIM" ]] && info "Лимит fallback: $RLIM $(_front_enabled && echo '(общий: за фронтом ключ у всех 127.0.0.1)' || echo '(по IP клиента)')"
         [[ -f "$FRONT_LOG" ]] && info "Зонды на фронте: $(wc -l < "$FRONT_LOG") записей — sudo xm nginx-probes"
+        echo ""
+        ;;
+    esac
+    ;;
+
+# access — порты своих служб, которые должны уцелеть после переустановки.
+#
+# Команда намеренно ничего не знает о том, что за служба за портом: её работа —
+# помнить тройку (интерфейс, источник, порт) и возвращать её в ufw после того,
+# как setup.sh --reinstall или `ufw reset` всё переписали.
+access)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm access${NC}"; exit 1; }
+    ASUB="${2:-status}"
+
+    # Разбор общий для add и del: <порт>/<proto> [интерфейс|-] [источник|-].
+    # --force ловим в любой позиции, иначе он уехал бы в интерфейс.
+    _access_parse() {
+      ASPEC="${1:-}"; AIFACE="${2:--}"; ASRC="${3:--}"
+      [[ "$AIFACE" == "--force" ]] && AIFACE="-"
+      [[ "$ASRC"   == "--force" ]] && ASRC="-"
+      [[ -z "$AIFACE" ]] && AIFACE="-"
+      [[ -z "$ASRC"   ]] && ASRC="-"
+      if [[ "$ASPEC" != */* ]]; then
+        echo -e "${BOLD}Использование:${NC} xm access $ASUB <порт>/<tcp|udp> [интерфейс|-] [источник CIDR|-]"
+        echo    "  xm access $ASUB 8080/tcp wg0              — только с интерфейса wg0"
+        echo    "  xm access $ASUB 8080/tcp - 203.0.113.5    — только с одного адреса"
+        return 1
+      fi
+      APORT="${ASPEC%%/*}"; APROTO="${ASPEC##*/}"
+      return 0
+    }
+
+    case "$ASUB" in
+      add)
+        _access_parse "${3:-}" "${4:-}" "${5:-}" || exit 1
+        AFORCE=false
+        for a in "$@"; do [[ "$a" == "--force" ]] && AFORCE=true; done
+
+        # Правило без интерфейса и без источника — это «наружу всему миру», и
+        # почти всегда не то, чего хотели. У службы за таким портом обычно нет
+        # своего TLS, а лишний открытый порт с чужим баннером сканер находит
+        # первым же проходом (diag-dpi, блок B) — вся маскировка REALITY при
+        # этом обесценивается соседней строкой в выводе nmap.
+        if [[ "$AIFACE" == "-" && "$ASRC" == "-" ]]; then
+          fail "Без интерфейса и без источника порт открывается всему интернету"
+          info "Ограничь интерфейсом (туннель, локальный бридж) или адресом —"
+          info "тогда снаружи порта не видно вообще, и сканеру нечего находить."
+          $AFORCE || { info "Если нужно именно так: повтори команду с --force"; exit 1; }
+          warn "--force: ${APORT}/${APROTO} будет открыт всему интернету"
+        fi
+
+        _access_valid "$AIFACE" "$ASRC" "$APORT" "$APROTO" || exit 1
+        _access_state_init
+
+        # Повторный add тем же правилом не должен плодить строки. Фильтруем
+        # awk'ом по точному совпадению, а не sed'ом: в источнике есть «/» от
+        # CIDR, и он ломает разделитель шаблона.
+        ATMP=$(mktemp)
+        awk -v r="RULE $AIFACE $ASRC $APORT $APROTO" '$0 != r' "$ACCESS_STATE" > "$ATMP"
+        cat "$ATMP" > "$ACCESS_STATE"; rm -f "$ATMP"
+        echo "RULE $AIFACE $ASRC $APORT $APROTO" >> "$ACCESS_STATE"
+        ok "Объявлено: ${APORT}/${APROTO} $(_access_scope "$AIFACE" "$ASRC")"
+
+        if _access_apply; then
+          if ufw status 2>/dev/null | grep -q "Status: active"; then
+            ok "UFW: применено (правил в ufw: $ACCESS_OK_N)"
+          else
+            info "UFW не активен — правило сохранено и применится при включении"
+          fi
+        else
+          warn "Часть правил не применилась — sudo xm access status"
+        fi
+        info "Файл переживает переустановку: $ACCESS_STATE"
+        echo ""
+        ;;
+
+      del)
+        _access_parse "${3:-}" "${4:-}" "${5:-}" || exit 1
+        [[ -f "$ACCESS_STATE" ]] || { fail "Объявленных правил нет"; exit 1; }
+        grep -qx "RULE $AIFACE $ASRC $APORT $APROTO" "$ACCESS_STATE" \
+          || { fail "Такого правила нет — посмотри: sudo xm access status"; exit 1; }
+
+        ATMP=$(mktemp)
+        awk -v r="RULE $AIFACE $ASRC $APORT $APROTO" '$0 != r' "$ACCESS_STATE" > "$ATMP"
+        cat "$ATMP" > "$ACCESS_STATE"; rm -f "$ATMP"
+        ok "Убрано из объявленных: ${APORT}/${APROTO} $(_access_scope "$AIFACE" "$ASRC")"
+
+        mapfile -t AARGS < <(_access_ufw_args "$AIFACE" "$ASRC" "$APORT" "$APROTO")
+        if ufw delete "${AARGS[@]}" >/dev/null 2>&1; then
+          ok "UFW: правило снято"
+        else
+          warn "UFW правило не снял — проверь вручную: sudo ufw status numbered"
+        fi
+        echo ""
+        ;;
+
+      apply)
+        [[ -f "$ACCESS_STATE" ]] || { info "Объявленных правил нет — нечего применять"; exit 0; }
+        if _access_apply; then
+          ok "Применено правил: $ACCESS_OK_N"
+        else
+          fail "Не применилось: $ACCESS_BAD_N (применено: $ACCESS_OK_N)"
+          exit 1
+        fi
+        ufw status 2>/dev/null | grep -q "Status: active" \
+          || info "UFW не активен — правила вступят в силу при включении"
+        echo ""
+        ;;
+
+      clear)
+        [[ -f "$ACCESS_STATE" ]] || { info "Объявленных правил нет"; exit 0; }
+        echo -e "\n${BOLD}${CYAN}[ Снятие всех локальных правил ]${NC}\n"
+        while read -r ai as ap apr; do
+          [[ -n "$ai" ]] && info "${ap}/${apr} $(_access_scope "$ai" "$as")"
+        done < <(_access_rules)
+        read -rp "Снять их в ufw и забыть? Введи ДА: " ACLR
+        [[ "$ACLR" == "ДА" ]] || { info "Отменено, ничего не изменено"; exit 0; }
+        while read -r ai as ap apr; do
+          [[ -z "$ai" ]] && continue
+          mapfile -t AARGS < <(_access_ufw_args "$ai" "$as" "$ap" "$apr")
+          ufw delete "${AARGS[@]}" >/dev/null 2>&1 \
+            && ok "UFW: снято ${ap}/${apr}" \
+            || warn "UFW не снял ${ap}/${apr} — проверь: sudo ufw status numbered"
+        done < <(_access_rules)
+        rm -f "$ACCESS_STATE"
+        ok "Объявленных правил больше нет"
+        echo ""
+        ;;
+
+      *)
+        echo -e "\n${BOLD}${CYAN}[ Локальные правила доступа ]${NC}\n"
+        if [[ ! -f "$ACCESS_STATE" ]]; then
+          info "Правил нет — ни одного лишнего порта проект не открывает"
+          sep
+          echo -e "${BOLD}Добавить${NC}"
+          echo    "  xm access add 8080/tcp wg0              только с интерфейса wg0"
+          echo    "  xm access add 8080/tcp - 203.0.113.5    только с одного адреса"
+          echo ""
+          exit 0
+        fi
+        # Построчно, а не таблицей: область действия пишется по-русски, а
+        # printf выравнивает по БАЙТАМ — кириллица в колонках разъезжается.
+        AMISS=0
+        while read -r ai as ap apr; do
+          [[ -z "$ai" ]] && continue
+          ADESC="${ap}/${apr} — $(_access_scope "$ai" "$as")"
+          # Слушателя ищем по номеру порта в конце локального адреса: правило
+          # разрешает порт, а на каком адресе служба его держит — её дело.
+          if [[ "$apr" == "udp" ]]; then ALST=$(ss -uln 2>/dev/null | tail -n +2)
+          else ALST=$(ss -tln 2>/dev/null | tail -n +2); fi
+          if echo "$ALST" | awk -v pp=":$ap" '$4 ~ pp"$"' | grep -q .; then ALIVE=1; else ALIVE=0; fi
+          if ! _access_in_ufw "$ai" "$as" "$ap" "$apr"; then
+            fail "$ADESC · объявлено, а в ufw НЕТ"
+            AMISS=$((AMISS + 1))
+          elif [[ "$ALIVE" -eq 0 ]]; then
+            warn "$ADESC · в ufw есть, но на порту никто не слушает"
+          else
+            ok "$ADESC · в ufw есть, слушатель есть"
+          fi
+        done < <(_access_rules)
+        sep
+        [[ "$AMISS" -gt 0 ]] \
+          && warn "Правил нет в ufw: $AMISS — вернуть: sudo xm access apply" \
+          || ok "Все объявленные правила стоят в ufw"
+        info "Объявления живут в $ACCESS_STATE и переживают setup.sh --reinstall"
+        info "Убрать одно: sudo xm access del <порт>/<proto> [интерфейс|-] [источник|-]"
         echo ""
         ;;
     esac
@@ -4956,6 +5270,7 @@ neighbors)
     echo -e "  ${GREEN}xm self-update${NC}   только /usr/local/bin/xm — больше ничего"
     echo -e "  ${GREEN}xm front${NC}         только stream-enabled/front.conf + worker_connections;"
     echo    "                   апстримы соседей — из /usr/local/etc/xray/front.conf"
+    echo -e "  ${GREEN}xm access${NC}        только правила ufw из /usr/local/etc/xray/access.conf"
     echo -e "  ${GREEN}xm harden${NC}        config.json + stream-enabled/reality-fallback.conf,"
     echo    "                   затем nginx reload — и только если nginx -t прошёл"
     echo -e "  ${GREEN}xm set-sni${NC}       то же самое плюс перезапуск xray"
@@ -4985,6 +5300,8 @@ neighbors)
     echo -e "  ${GREEN}xm set-port <порт> [--tcp]${NC}  Сменить порт inbound (проверка занятости + UFW + откат)"
     echo -e "  ${GREEN}xm front${NC}             Разделить публичный порт по SNI с соседней службой"
     echo    "                       front on | off | add <sni> <порт> | del <sni> | status"
+    echo -e "  ${GREEN}xm access${NC}            Порты своих служб, которые переживут переустановку"
+    echo    "                       access status | add <порт>/<proto> [iface|-] [src|-] | del | apply | clear"
     echo ""
     echo -e "${BOLD}Бэкапы:${NC}"
     echo "  xm backup / restore / backups"
