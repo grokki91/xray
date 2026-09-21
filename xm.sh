@@ -19,7 +19,7 @@
 #   Доступ:      access [status|add <порт>/<proto> [iface|-] [src|-]|del|apply|clear]
 #   Стабильность: tune [--check|--off] / watchdog on|off|now|status
 #   Соседи:      neighbors — что ещё живёт на сервере и что трогает xm
-#   Диагностика: diag / diag-dpi [--quick] / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
+#   Диагностика: diag / diag-dpi [--quick] / sni-scan [--local [CIDR]] / diag-ntp / diag-ports / diag-tls / diag-fw / diag-log
 # =============================================================================
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
@@ -59,6 +59,15 @@ REALITY_CERT_PQ_MAX=$((REALITY_CERT_LIMIT - 3400))
 # пять секунд — полсотни запасов, а на мёртвом домене экономят минуты.
 SNI_PROBES=10
 SNI_PROBE_TIMEOUT=5
+
+# RealiTLScanner (XTLS, MPL-2.0) — поиск домена-маски в своей же сети.
+# Версия и контрольные суммы прибиты намеренно: сторонний бинарник в
+# инструменте безопасности не качается «последним» вслепую. При смене версии
+# суммы обязаны меняться вместе с ней, иначе установка откажется ставить файл.
+RTS_VER="v0.2.3"
+RTS_BIN="/usr/local/lib/xm/RealiTLScanner"
+RTS_SHA256_AMD64="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
+RTS_SHA256_ARM64="27bdd3e53d4391c66c8df3391d3c3fb5eb2dc356125f2fb33ac58fcaaf8f88b3"
 
 ok()   { echo -e "  ${GREEN}[✓]${NC} $*"; }
 fail() { echo -e "  ${RED}[✗]${NC} $*"; }
@@ -1811,6 +1820,87 @@ _sni_cert_gate() {
   fi
 }
 
+# ─── ASN: правдоподобен ли домен-маска для нашей сети ────────────────────────
+#
+# У REALITY мисматч ASN есть ВСЕГДА: наш адрес физически не может быть edge'ом
+# чужого домена. Подбором другого глобального CDN это не лечится — лечится
+# только ЦЕНА проверки для цензора.
+#
+# Дешевле всего ему случай, когда домен раздаёт собственная сеть владельца
+# (www.cloudflare.com → AS13335 CLOUDFLARENET): достаточно статического списка
+# диапазонов, он известен всем и не меняется годами. Это же и распознаётся
+# дешевле всего у нас: если второй уровень имени встречается в названии сети
+# её edge'а — значит домен обслуживает сам владелец, и мы в худшем классе.
+# Домен в НАШЕЙ сети не даёт сигнала вовсе.
+
+# _asn_info <ip> → "ASN|BGP-префикс|имя сети". Team Cymru отдаёт всё тремя
+# полями за один запрос, отдельного обращения за префиксом не нужно.
+_asn_info() {
+  local ip="$1" line
+  command -v whois &>/dev/null || return 1
+  line=$(whois -h whois.cymru.com " -v $ip" 2>/dev/null | tail -1)
+  [[ "$line" == *"|"* ]] || return 1
+  awk -F'|' '{ for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+               if ($1 ~ /^[0-9]+$/) print $1 "|" $3 "|" $7 }' <<< "$line"
+}
+
+# Второй уровень имени: www.cloudflare.com → cloudflare. Нужен для сверки
+# с названием сети — эвристика «домен раздаёт сам владелец».
+_domain_label() {
+  awk -F. '{ if (NF >= 2) print tolower($(NF-1)); else print tolower($0) }' <<< "$1"
+}
+
+# Скачать RealiTLScanner с проверкой суммы. Идемпотентно: файл с верной суммой
+# не перекачивается. Коды: 0 — готов, 1 — не скачался/архитектура, 2 — сумма.
+_rts_ensure() {
+  local arch want url tmp sum
+  case "$(uname -m)" in
+    x86_64)  arch="amd64"; want="$RTS_SHA256_AMD64" ;;
+    aarch64) arch="arm64"; want="$RTS_SHA256_ARM64" ;;
+    *)       return 1 ;;
+  esac
+  if [[ -x "$RTS_BIN" ]]; then
+    sum=$(sha256sum "$RTS_BIN" 2>/dev/null | awk '{print $1}')
+    [[ "$sum" == "$want" ]] && return 0
+  fi
+  mkdir -p "$(dirname "$RTS_BIN")"
+  tmp=$(mktemp) || return 1
+  url="https://github.com/XTLS/RealiTLScanner/releases/download/${RTS_VER}/RealiTLScanner-linux-${arch}"
+  curl -fsSL --max-time 180 -o "$tmp" "$url" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  sum=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}')
+  [[ "$sum" == "$want" ]] || { rm -f "$tmp"; return 2; }
+  chmod 755 "$tmp"; mv "$tmp" "$RTS_BIN"
+}
+
+# _rts_candidates <cidr> <свой-ip> [лимит] → имена доменов по одному в строке.
+#
+# Свой адрес исключается обязательно: наш же сервер ответит сертификатом
+# ТЕКУЩЕЙ маски, и кандидат «сам на себя» попал бы в список отличным соседом.
+_rts_candidates() {
+  local cidr="$1" self="$2" lim="${3:-12}" out
+  out=$(mktemp /tmp/xm-rts.XXXXXX.csv) || return 1
+  "$RTS_BIN" -addr "$cidr" -port 443 -thread 16 -timeout 5 -out "$out" >/dev/null 2>&1
+  # CSV: IP,ORIGIN,TLS,ALPN,CURVE,CERT_LENGTH,CERT_SIGNATURE,CERT_PUBLICKEY,
+  #      CERT_DOMAIN,CERT_ISSUER,GEO_CODE. CERT_LENGTH вида "2728(certs count: 3)".
+  # Разделитель-запятая безопасен, хотя CERT_ISSUER закавычен и запятую
+  # содержит («Let's Encrypt, US»): он идёт ДЕСЯТЫМ, а читаем мы поля до
+  # девятого — в них запятая невозможна (имя хоста, версия TLS, число).
+  # Wildcard отбрасываем: в SNI нужен конкретный хост, «*.example.com» в dest
+  # не подставить.
+  awk -F',' -v lim="$REALITY_CERT_WARN" -v self="$self" '
+    NR == 1 { next }
+    $1 == self { next }
+    $3 ~ /1\.3/ && $4 == "h2" {
+      d = $9; gsub(/"/, "", d); gsub(/^[ \t]+|[ \t]+$/, "", d)
+      if (d == "" || d ~ /^\*/ || d !~ /\./) next
+      if (d ~ /\.(local|internal|lan|invalid)$/) next
+      n = $6; sub(/\(.*/, "", n); n += 0
+      if (n <= 0 || n >= lim) next
+      print n "\t" d
+    }' "$out" 2>/dev/null | sort -n | awk -F'\t' '!seen[$2]++ { print $2 }' | head -"$lim"
+  rm -f "$out"
+}
+
 # =============================================================================
 # _selftest <xhttp|tcp> — живой хендшейк через loopback поверх _tunnel_up.
 # Единственная проверка, дающая бинарный ответ «сервер или клиент»: REALITY
@@ -3231,6 +3321,34 @@ dpi|diag-dpi)
       && ok "Все источники SNI согласованы ($SNI) — тесты ниже валидны" \
       || warn "Есть рассинхрон. Исправь: sudo xm set-sni $SNI — иначе результаты ниже вводят в заблуждение"
 
+    # A2 — правдоподобен ли домен-маска для НАШЕЙ сети. Блок A выше проверяет,
+    # что все источники называют один домен; здесь — стоит ли вообще называть
+    # именно его. Мисматч ASN у REALITY неустраним, вопрос в цене проверки.
+    echo -e "\n  ${BOLD}A2. Домен-маска против нашего ASN${NC}"
+    if ! command -v whois &>/dev/null; then
+      info "whois не установлен — ASN не проверить. Поставить: ${BOLD}sudo apt install -y whois${NC}"
+    else
+      A_EDGE_IP=$(getent ahostsv4 "$SNI" 2>/dev/null | awk '{print $1}' | sort -u | head -1)
+      A_OUR=""; A_THEIR=""
+      [[ -n "$SERVER_IP" ]]  && A_OUR=$(_asn_info "$SERVER_IP" 2>/dev/null)
+      [[ -n "$A_EDGE_IP" ]]  && A_THEIR=$(_asn_info "$A_EDGE_IP" 2>/dev/null)
+      if [[ -z "$A_OUR" || -z "$A_THEIR" ]]; then
+        info "ASN не определился (whois.cymru.com недоступен?) — проверка пропущена"
+      else
+        IFS='|' read -r A_OUR_AS  A_OUR_PFX  A_OUR_NAME  <<< "$A_OUR"
+        IFS='|' read -r A_TH_AS   A_TH_PFX   A_TH_NAME   <<< "$A_THEIR"
+        info "Наш AS${A_OUR_AS} ${A_OUR_NAME} | edge домена-маски AS${A_TH_AS} ${A_TH_NAME}"
+        if [[ "$A_OUR_AS" == "$A_TH_AS" ]]; then
+          ok "Домен-маска живёт в нашей же сети — мисматча ASN нет, признака цензору не даём"
+        elif [[ "$(_domain_label "$SNI")" != "" ]] \
+             && grep -qiF -- "$(_domain_label "$SNI")" <<< "$A_TH_NAME"; then
+          dfail "Домен раздаёт СОБСТВЕННАЯ сеть владельца, а мы в чужой: проверка сводится к сверке со статическим списком диапазонов, который есть у любого цензора и не меняется годами. Это самый дешёвый для него случай. Подобрать соседа: ${BOLD}sudo xm sni-scan --local${NC}"
+        else
+          dwarn "Домен-маска в чужой сети (мисматч ASN). Не худший случай — имя не совпадает с названием сети, значит сверка списком дороже. Убрать признак совсем: ${BOLD}sudo xm sni-scan --local${NC}"
+        fi
+      fi
+    fi
+
 # ══ B. Активное зондирование ═════════════════════════════════════════════════
     sep
     echo -e "${BOLD}B. Активное зондирование (что видит сканер на нашем порту)${NC}"
@@ -3972,11 +4090,65 @@ sni-scan)
     # хендшейков с таймаутом на кандидата, который не может победить.
     POOL=(www.apple.com swcdn.apple.com dl.google.com
           cdn.jsdelivr.net www.cloudflare.com)
+
+    # --local [CIDR] — искать соседей в своей сети вместо глобального пула.
+    # Любой домен отсюда мисматча ASN не даёт вовсе, тогда как весь пул выше
+    # даёт его по определению. Диапазон по умолчанию — своя /24: 256 адресов
+    # уходят за полминуты и заведомо принадлежат тому же хостеру.
+    LOCAL_MODE=0; LOCAL_CIDR=""
+    declare -a LOCAL_SET=()
+    if [[ "${2:-}" == "--local" ]]; then
+      LOCAL_MODE=1; LOCAL_CIDR="${3:-}"
+    fi
+
+    if [[ "$LOCAL_MODE" -eq 1 ]]; then
+      echo -e "${BOLD}${CYAN}[ Подбор домена-маски в своей сети ]${NC}"
+      MY_IP=$(_get_server_ip)
+      if [[ -z "$MY_IP" || "$MY_IP" == "SERVER_IP" ]]; then
+        fail "Не определить свой внешний адрес"; exit 1
+      fi
+      [[ -z "$LOCAL_CIDR" ]] && LOCAL_CIDR="${MY_IP%.*}.0/24"
+
+      if command -v whois &>/dev/null; then
+        MY_ASN_LINE=$(_asn_info "$MY_IP" 2>/dev/null)
+        if [[ -n "$MY_ASN_LINE" ]]; then
+          IFS='|' read -r M_AS M_PFX M_NAME <<< "$MY_ASN_LINE"
+          info "Наша сеть: AS${M_AS} ${M_NAME} (анонс ${M_PFX})"
+          [[ "$LOCAL_CIDR" != "$M_PFX" ]] \
+            && info "Весь анонс целиком: ${BOLD}sudo xm sni-scan --local ${M_PFX}${NC}"
+        fi
+      else
+        warn "whois не установлен — ASN не покажу. Поставить: sudo apt install -y whois"
+      fi
+
+      info "Качаю RealiTLScanner ${RTS_VER} (XTLS, MPL-2.0)..."
+      _rts_ensure; RTS_RC=$?
+      case "$RTS_RC" in
+        0) : ;;
+        2) fail "Контрольная сумма RealiTLScanner не сошлась — бинарник НЕ установлен."
+           fail "Это либо подмена файла, либо новая сборка под тем же тегом. Разберись прежде чем запускать."; exit 1 ;;
+        *) fail "RealiTLScanner не скачался (сеть или неподдерживаемая архитектура)"; exit 1 ;;
+      esac
+
+      warn "Сканирую ${LOCAL_CIDR}. Это обращения к чужим адресам — у части хостеров против правил."
+      info "До минуты..."
+      mapfile -t LOCAL_SET < <(_rts_candidates "$LOCAL_CIDR" "$MY_IP" 10)
+      if [[ ${#LOCAL_SET[@]} -eq 0 ]]; then
+        sep
+        fail "Соседей с TLS1.3 + h2 и компактным сертификатом в ${LOCAL_CIDR} нет."
+        info "Попробуй весь анонс хостера или оставь глобальный домен: sudo xm sni-scan"
+        exit 1
+      fi
+      ok "Кандидатов найдено: ${#LOCAL_SET[@]} — замеряю их так же, как глобальные"
+      POOL=("${LOCAL_SET[@]}")
+    else
+      echo -e "${BOLD}${CYAN}[ Подбор домена-маски ]${NC}"
+    fi
+
     CUR=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
     if [[ -n "$CUR" ]] && ! printf '%s\n' "${POOL[@]}" | grep -qx "$CUR"; then
       POOL=("$CUR" "${POOL[@]}")
     fi
-    echo -e "${BOLD}${CYAN}[ Подбор домена-маски ]${NC}"
     info "$SNI_PROBES хендшейков на домен, ${#POOL[@]} доменов — одна-три минуты"
     sep
     printf "  %-24s %8s %4s %7s %6s  %s\n" "домен" "cert,б" "h2" "RTT,мс" "проб" "вердикт"
@@ -4060,8 +4232,15 @@ sni-scan)
       ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES})"
       info "В окно ML-DSA (${REALITY_CERT_PQ_MIN}–${REALITY_CERT_PQ_MAX} б) не попал никто — xm pq останется недоступен"
       [[ "$BEST" != "$CUR" ]] && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST${NC}"
+    elif [[ "$LOCAL_MODE" -eq 1 ]]; then
+      fail "Ни один сосед не прошёл замер — возьми диапазон шире (весь анонс хостера) или оставь глобальный домен"
     else
       fail "Ни один кандидат не прошёл — расширь POOL в xm.sh"
+    fi
+    if [[ "$LOCAL_MODE" -eq 1 ]]; then
+      info "Смысл соседа — в отсутствии мисматча ASN, а не в RTT. Но малонагруженный сайт, к которому наш адрес стучится круглосуточно, — своя аномалия: выбирай тот, что похож на живой сервис."
+    else
+      info "Все кандидаты выше — чужие сети, то есть мисматч ASN по определению. Искать соседа: ${BOLD}sudo xm sni-scan --local${NC}"
     fi
     [[ -n "$BEST" && "$BEST_FAIL" -gt 0 ]] \
       && warn "Даже лучший кандидат потерял ${BEST_FAIL} из ${SNI_PROBES} проб — путь ОТ ЭТОГО VPS до масок нестабилен, дело может быть не в домене"
@@ -5363,6 +5542,7 @@ neighbors)
     echo -e "  ${GREEN}xm selftest [--tcp|--all]${NC}        Живой хендшейк через loopback — НАЧИНАЙ С НЕЁ"
     echo -e "  ${GREEN}xm diag-dpi [--quick]${NC}            Устойчивость к DPI: зонды, DNS-утечки, профиль трафика"
     echo -e "  ${GREEN}xm sni-scan${NC}                      Замер доменов-масок (cert/h2/RTT)"
+    echo -e "  ${GREEN}xm sni-scan --local [CIDR]${NC}       Искать домен-маску в своей сети (без мисматча ASN)"
     echo -e "  ${GREEN}xm reality-debug on|off${NC}          Почему REALITY отказывает (авто-off 15 мин)"
     echo -e "  ${GREEN}xm diag${NC}                          Полная диагностика"
     echo -e "  ${GREEN}xm neighbors${NC}                     Кто ещё живёт на сервере и что трогает xm"

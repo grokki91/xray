@@ -255,6 +255,97 @@ _sni_probe() {
 }
 
 # =============================================================================
+# Домен-маска в своей же сети
+#
+# ЗАЧЕМ: у REALITY мисматч ASN есть ВСЕГДА — наш VPS физически не является
+# edge'ом чужого домена, и подбором другого глобального CDN это не лечится.
+# Лечится только цена проверки. Самый дешёвый для цензора случай — домен,
+# который раздаёт собственная сеть владельца (www.cloudflare.com → AS13335):
+# хватает статического списка диапазонов, известного всем и не меняющегося
+# годами. Домен, живущий в НАШЕЙ сети, не даёт сигнала вообще: соединение к
+# соседу с нашего адреса выглядит ровно так, как и должно выглядеть.
+#
+# ЧЕМ ПЛАТИМ, и это не мелочь: сосед по стойке — как правило малонагруженный
+# сайт. Круглосуточный поток TLS-сессий к нему с одного адреса сам по себе
+# аномалия, которой у большого CDN не возникает. Плюс сосед может исчезнуть
+# завтра, тогда как CDN-домены живут годами. Поэтому это выбор пользователя,
+# а не действие по умолчанию.
+# =============================================================================
+RTS_VER="v0.2.3"
+RTS_BIN="/usr/local/lib/xm/RealiTLScanner"
+# Контрольные суммы прибиты намеренно: это сторонний бинарник в инструменте
+# безопасности, и качать «последнее» вслепую нельзя. При смене RTS_VER суммы
+# обязаны меняться вместе с ней, иначе установка откажется ставить файл.
+RTS_SHA256_AMD64="a55595446de9f1c2e6c5c3cd766a7320a11115947df48f101749bb62c8055592"
+RTS_SHA256_ARM64="27bdd3e53d4391c66c8df3391d3c3fb5eb2dc356125f2fb33ac58fcaaf8f88b3"
+
+# _asn_info <ip> → "ASN|BGP-префикс|имя сети", пусто если не определилось.
+# Team Cymru отдаёт всё тремя полями за один запрос, поэтому отдельного
+# обращения за префиксом не нужно.
+_asn_info() {
+  local ip="$1" line
+  line=$(whois -h whois.cymru.com " -v $ip" 2>/dev/null | tail -1) || line=""
+  [[ "$line" == *"|"* ]] || return 1
+  awk -F'|' '{ for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+               if ($1 ~ /^[0-9]+$/) print $1 "|" $3 "|" $7 }' <<< "$line"
+}
+
+# Скачать RealiTLScanner (XTLS, MPL-2.0) с проверкой суммы. Идемпотентно:
+# уже лежащий файл с верной суммой не перекачивается.
+# Коды: 0 — готов, 1 — не скачался/архитектура не та, 2 — сумма не сошлась.
+_rts_ensure() {
+  local arch want url tmp sum
+  case "$(uname -m)" in
+    x86_64)  arch="amd64"; want="$RTS_SHA256_AMD64" ;;
+    aarch64) arch="arm64"; want="$RTS_SHA256_ARM64" ;;
+    *)       return 1 ;;
+  esac
+  if [[ -x "$RTS_BIN" ]]; then
+    sum=$(sha256sum "$RTS_BIN" 2>/dev/null | awk '{print $1}') || sum=""
+    [[ "$sum" == "$want" ]] && return 0
+  fi
+  mkdir -p "$(dirname "$RTS_BIN")"
+  tmp=$(mktemp) || return 1
+  url="https://github.com/XTLS/RealiTLScanner/releases/download/${RTS_VER}/RealiTLScanner-linux-${arch}"
+  curl -fsSL --max-time 180 -o "$tmp" "$url" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  sum=$(sha256sum "$tmp" 2>/dev/null | awk '{print $1}') || sum=""
+  [[ "$sum" == "$want" ]] || { rm -f "$tmp"; return 2; }
+  chmod 755 "$tmp"; mv "$tmp" "$RTS_BIN"
+}
+
+# _rts_candidates <cidr> <свой-ip> [лимит] → имена доменов, по одному в строке.
+#
+# Свой адрес исключается обязательно: на повторном прогоне (xm sni-scan --local)
+# наш же сервер ответит сертификатом текущей маски, и кандидат «сам на себя»
+# попал бы в список как отличный сосед.
+_rts_candidates() {
+  local cidr="$1" self="$2" lim="${3:-12}" out
+  out=$(mktemp /tmp/rts.XXXXXX.csv) || return 1
+  "$RTS_BIN" -addr "$cidr" -port 443 -thread 16 -timeout 5 -out "$out" >/dev/null 2>&1 || true
+  # CSV: IP,ORIGIN,TLS,ALPN,CURVE,CERT_LENGTH,CERT_SIGNATURE,CERT_PUBLICKEY,
+  #      CERT_DOMAIN,CERT_ISSUER,GEO_CODE. CERT_LENGTH вида "2728(certs count: 3)".
+  # Разделитель-запятая здесь безопасен, хотя CERT_ISSUER закавычен и запятую
+  # содержит («Let's Encrypt, US»): он идёт ДЕСЯТЫМ, а нам нужны поля до
+  # девятого включительно — в них запятая невозможна (имя хоста, версия TLS,
+  # число). Сдвиг ломает только GEO_CODE, который мы не читаем.
+  # Отбираем только TLS 1.3 + h2: без первого REALITY не работает вообще,
+  # без второго не живёт XHTTP. Wildcard-имена отбрасываем — в SNI нужен
+  # конкретный хост, а «*.example.com» в dest не подставить.
+  awk -F',' -v lim="$REALITY_CERT_WARN" -v self="$self" '
+    NR == 1 { next }
+    $1 == self { next }
+    $3 ~ /1\.3/ && $4 == "h2" {
+      d = $9; gsub(/"/, "", d); gsub(/^[ \t]+|[ \t]+$/, "", d)
+      if (d == "" || d ~ /^\*/ || d !~ /\./) next
+      if (d ~ /\.(local|internal|lan|invalid)$/) next
+      n = $6; sub(/\(.*/, "", n); n += 0
+      if (n <= 0 || n >= lim) next
+      print n "\t" d
+    }' "$out" 2>/dev/null | sort -n | awk -F'\t' '!seen[$2]++ { print $2 }' | head -"$lim"
+  rm -f "$out"
+}
+
+# =============================================================================
 # _selftest_vless <xhttp|tcp> <uuid> <port> <sni> <sid> <pubkey> [path] [mode]
 #
 # ЗАЧЕМ ЭТО ГЛАВНАЯ ПРОВЕРКА: REALITY при провале хендшейка НЕ ПИШЕТ НИЧЕГО
@@ -421,12 +512,78 @@ header "Настройка параметров"
 SNI_POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net www.apple.com)
 
 echo -e "${BOLD}Подбор домена-маски (SNI / dest)${NC}"
+echo ""
+echo -e "  У REALITY мисматч ASN есть ${BOLD}всегда${NC}: наш адрес физически не может быть"
+echo -e "  edge'ом чужого домена. Глобальный CDN отдаёт этот признак бесплатно —"
+echo -e "  диапазоны Cloudflare или Google есть у любого цензора и не меняются."
+echo -e "  Домен ${BOLD}в нашей же сети${NC} сигнала не даёт вовсе."
+echo ""
+echo -e "  ${YELLOW}Цена:${NC} сосед по сети обычно малонагружен, и круглосуточный поток TLS"
+echo -e "  к нему с одного адреса — уже своя аномалия, которой у CDN не бывает."
+echo -e "  Сосед может и исчезнуть, тогда как CDN-домены живут годами."
+echo -e "  Само сканирование чужих адресов может нарушать правила хостера."
+echo ""
+read -rp "Просканировать свою подсеть /24 в поисках кандидатов? [y/N]: " LOCAL_SCAN
+
+declare -a SNI_LOCAL=()
+if [[ "${LOCAL_SCAN,,}" == "y" || "${LOCAL_SCAN,,}" == "yes" || "${LOCAL_SCAN,,}" == "д" ]]; then
+  # whois нужен до секции 2 (зависимости) — ставим точечно. Не вышло — не
+  # беда: сканирование просто пропускается, установка идёт дальше на пуле.
+  if ! command -v whois &>/dev/null; then
+    info "Ставлю whois (нужен для определения ASN)..."
+    apt-get update -qq 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends whois 2>/dev/null || true
+  fi
+
+  MY_IP=$(_fetch_server_ip 2>/dev/null) || MY_IP=""
+  if [[ -z "$MY_IP" || "$MY_IP" == "ТВОЙ_IP" ]]; then
+    warn "Не определить свой внешний адрес — сканирование пропущено"
+  else
+    # ASN здесь только для показа: диапазон для скана берётся из своего же
+    # адреса, поэтому без whois сканирование работает — молча теряется
+    # строка «наша сеть», и всё.
+    MY_ASN=""; MY_PREFIX=""; MY_ASNAME=""
+    IFS='|' read -r MY_ASN MY_PREFIX MY_ASNAME <<< "$(_asn_info "$MY_IP" 2>/dev/null || echo '||')"
+    [[ -n "$MY_ASN" ]] && info "Наша сеть: AS${MY_ASN} ${MY_ASNAME} (анонс ${MY_PREFIX})"
+
+    # Сканируем /24 вокруг своего адреса, а не весь BGP-анонс: 256 адресов
+    # уходят за полминуты и заведомо принадлежат тому же хостеру, тогда как
+    # префикс может быть /20 и шире. Диапазон пошире — через xm sni-scan --local.
+    MY_24="${MY_IP%.*}.0/24"
+    info "Качаю RealiTLScanner ${RTS_VER} (XTLS, MPL-2.0)..."
+    if _rts_ensure; then
+      RTS_RC=0
+    else
+      RTS_RC=$?
+    fi
+    case "$RTS_RC" in
+      0) info "Сканирую ${MY_24} — до минуты..."
+         mapfile -t SNI_LOCAL < <(_rts_candidates "$MY_24" "$MY_IP" 8 2>/dev/null || true)
+         if [[ ${#SNI_LOCAL[@]} -gt 0 ]]; then
+           success "Найдено соседей с TLS1.3+h2: ${#SNI_LOCAL[@]}"
+         else
+           warn "В своей /24 подходящих соседей нет — остаётся глобальный пул"
+         fi ;;
+      2) warn "Контрольная сумма RealiTLScanner не сошлась — бинарник НЕ установлен."
+         warn "Это либо подмена файла, либо репозиторий выпустил новую сборку под тем же тегом." ;;
+      *) warn "RealiTLScanner не скачался (сеть или неподдерживаемая архитектура)" ;;
+    esac
+  fi
+  echo ""
+fi
+
+# Локальные кандидаты идут первыми: при прочих равных выбирается сосед.
+SNI_POOL=("${SNI_LOCAL[@]}" "${SNI_POOL[@]}")
+
 info "Замеряю кандидатов: cert, OCSP, ALPN h2, TLS1.3, RTT — ~20 сек..."
 echo ""
 printf "  %-22s %8s %6s %5s %7s %7s  %s\n" "домен" "cert,б" "OCSP" "h2" "TLS1.3" "RTT,мс" "вердикт"
 
 declare -a SNI_OK=()
+declare -a SNI_OK_LOCAL=()
 for h in "${SNI_POOL[@]}"; do
+  IS_LOCAL=0
+  for l in ${SNI_LOCAL[@]+"${SNI_LOCAL[@]}"}; do [[ "$l" == "$h" ]] && { IS_LOCAL=1; break; }; done
   IFS='|' read -r P_CERT P_OCSP P_ALPN P_TLS13 P_X25519 P_RTT P_REDIR <<< "$(_sni_probe "$h")"
   if [[ "$P_CERT" == "-1" ]]; then
     printf "  %-22s %8s %6s %5s %7s %7s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "-" "-" "НЕДОСТУПЕН"
@@ -442,15 +599,25 @@ for h in "${SNI_POOL[@]}"; do
   # RTT платится на КАЖДОМ входящем соединении (REALITY идёт к dest всегда).
   [[ "$P_RTT" -gt 150 && "$V" == "ГОДИТСЯ" ]] && { V="МЕДЛЕННЫЙ"; C="$YELLOW"; }
   [[ -n "$P_REDIR" && "$V" == "ГОДИТСЯ" ]] && { V="РЕДИРЕКТ→$P_REDIR"; C="$YELLOW"; }
+  VP="$V"; [[ "$IS_LOCAL" -eq 1 ]] && VP="$V · СВОЙ ASN"
   printf "  %-22s %8s %6s %5s %7s %7s  ${C}%s${NC}\n" \
     "$h" "$P_CERT" "$([[ ${P_OCSP:-0} -gt 0 ]] && echo да || echo нет)" \
-    "$P_ALPN" "$P_TLS13" "$P_RTT" "$V"
-  [[ "$V" == "ГОДИТСЯ" ]] && SNI_OK+=("$P_CERT $h")
+    "$P_ALPN" "$P_TLS13" "$P_RTT" "$VP"
+  if [[ "$V" == "ГОДИТСЯ" ]]; then
+    SNI_OK+=("$P_CERT $h")
+    [[ "$IS_LOCAL" -eq 1 ]] && SNI_OK_LOCAL+=("$P_CERT $h")
+  fi
 done
 echo ""
 
-# Лучший = наименьший cert среди прошедших ВСЕ проверки (больше запас до лимита)
-if [[ ${#SNI_OK[@]} -gt 0 ]]; then
+# Сосед из своей сети выигрывает у любого глобального CDN, даже с бóльшим
+# сертификатом: запас до лимита REALITY — вопрос пары килобайт, а мисматч ASN
+# проверяется одним сравнением и работает против нас постоянно.
+# Внутри каждой группы по-прежнему наименьший cert — больше запас до лимита.
+if [[ ${#SNI_OK_LOCAL[@]} -gt 0 ]]; then
+  DEST_SNI=$(printf '%s\n' "${SNI_OK_LOCAL[@]}" | sort -n | head -1 | awk '{print $2}')
+  success "Рекомендация: ${BOLD}$DEST_SNI${NC} — сосед по нашей сети, мисматча ASN нет"
+elif [[ ${#SNI_OK[@]} -gt 0 ]]; then
   DEST_SNI=$(printf '%s\n' "${SNI_OK[@]}" | sort -n | head -1 | awk '{print $2}')
   success "Рекомендация: ${BOLD}$DEST_SNI${NC} — наибольший запас до лимита REALITY"
 else
@@ -644,10 +811,13 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y --no-install-recommends \
   -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
-  curl wget unzip uuid-runtime openssl ufw \
+  curl wget unzip uuid-runtime openssl ufw whois \
   nginx libnginx-mod-stream libnginx-mod-http-headers-more-filter \
   fail2ban jq python3 python3-cryptography \
   chrony qrencode unattended-upgrades tcpdump
+# whois: определение ASN через whois.cymru.com. Нужен и diag-dpi (правдоподобен
+# ли домен-маска для нашей сети), и подбору соседей. Пакет 52 КБ, свой протокол
+# на :43 — HTTP-API для этого потребовал бы ключей и внешней зависимости.
 # python3-cryptography: нужен _derive_pubkey в xm.sh (xm pubkey, xm diag [3b],
 # вычисление publicKey из privateKey). Без него ключи считать нечем — остаётся
 # только фолбэк на client-info.txt, который расходится после ручных правок.
