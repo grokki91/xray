@@ -16,6 +16,7 @@
 | **sysctl-профиль** | BBR + fq, буферы под реальный RTT, очередь accept, MTU probing |
 | **watchdog** | systemd-таймер раз в 2 мин: резолвится ли `dest`, живы ли fallback и Xray |
 | **fail2ban** | Джейл `sshd`. Джейла по трафику REALITY намеренно нет — бан демаскирует |
+| **RealiTLScanner** | [XTLS](https://github.com/XTLS/RealiTLScanner), версия и sha256 прибиты. Ищет домен-маску среди соседей по сети |
 | **chrony** | Синхронизация времени (нужна для `maxTimeDiff` REALITY) |
 | **unattended-upgrades** | Автообновления пакетов ОС: ветки `-security` и `-updates`, без автоперезагрузки |
 | **UFW** | Файрвол. Свои порты открывает установка; порт соседней службы объявляется отдельно (`xm access`) и переустановку переживает |
@@ -44,7 +45,7 @@ sudo git clone https://github.com/grokki91/xray.git /opt/xray && sudo bash /opt/
 
 | Параметр | Что это | Рекомендация |
 |---|---|---|
-| **SNI / dest** | Домен, под который маскируется сервер | `www.apple.com` |
+| **SNI / dest** | Домен, под который маскируется сервер | сосед по своей сети (скрипт предложит поиск) |
 | **HTTP path** | Путь запроса в XHTTP-трафике | любой из списка |
 | **Режим XHTTP** | `auto` или `stream-one` | `auto` |
 | **uTLS fingerprint** | Какой браузер имитирует TLS-отпечаток клиента | `chrome` |
@@ -137,6 +138,9 @@ xm selftest [--tcp|--all]   # живой хендшейк через loopback �
 xm diag                     # полная диагностика — первым при проблемах
 xm diag-dpi [--quick]       # устойчивость к DPI: зонды, DNS-утечки, профиль трафика
 xm sni-scan                 # замер доменов-масок (cert / h2 / RTT / потери проб)
+xm sni-scan --local [CIDR]  # искать маску в своей сети: у домена из чужой сети
+                            # ASN не совпадает с нашим, и это проверяется одним
+                            # сравнением со списком диапазонов
 xm neighbors                # кто ещё живёт на сервере и что трогает xm
 xm reality-debug on|off     # почему REALITY отказывает (авто-off через 15 мин)
 xm diag-ntp | diag-ports | diag-tls | diag-fw | diag-log
