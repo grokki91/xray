@@ -290,6 +290,9 @@ git fetch origin main && git checkout main && git reset --hard origin/main
 - `SKILL.md` — роль, контекст, правила ответа, чувствительные данные;
 - `references/verification.md` — что собрать с живого VPS и как построить
   тесты перед push;
-- `references/publishing.md` — README, тело PR, коммиты.
+- `references/publishing.md` — README, тело PR, коммиты;
+- `references/lessons.md` — обобщённые уроки прошлых разборов (без данных
+  установки); детали конкретного сервера — не здесь и не в этом файле, а в
+  `sudo xm journal` на самом VPS.
 
 Активировать скилл в начале сессии и отвечать по-русски.

@@ -13,6 +13,7 @@
 #   Nginx:       nginx-status / nginx-log / nginx-reload / nginx-probes
 #   Fail2ban:    ban-list / ban-ssh-stat / unban
 #   Логи:        log / log-live / log-clear
+#   Журнал:      journal [show|add "текст"]
 #   Инфо:        info / paths / uuid / pubkey
 #   Анти-DPI:    harden [--check|--off|--dot|--nonip [drop|skip|off]] / pq status|on|off
 #   Фронт:       front [status|on|off|add <sni> <порт>|del <sni>]
@@ -29,6 +30,11 @@ CONFIG="/usr/local/etc/xray/config.json"
 BACKUP_DIR="/usr/local/etc/xray/backups"
 LOG="/var/log/xray/error.log"
 CLIENT_FILE="/usr/local/etc/xray/client-info.txt"
+# Локальный журнал разбора проблем этой установки — не в репозитории, не в
+# git-чекауте. Создаётся setup.sh, переустановку и self-update переживает.
+# Общие, не привязанные к установке уроки живут отдельно, в репозитории:
+# .claude/skills/xray-dpi/references/lessons.md
+JOURNAL_FILE="/usr/local/etc/xray/journal.md"
 XM_BIN="/usr/local/bin/xm"
 # Путь к git-чекауту репозитория, из которого ставился xm. Пишется setup.sh и
 # xm self-update — чтобы обновление знало, откуда тянуть, и не приходилось
@@ -2991,6 +2997,32 @@ log)       tail -50 "$LOG" 2>/dev/null || echo "Лог пуст" ;;
 log-live)  tail -f "$LOG" ;;
 log-clear) > "$LOG"; echo -e "${GREEN}Лог очищен${NC}" ;;
 
+# Журнал разбора проблем этой установки. Отдельно от $LOG (это вывод Xray) —
+# сюда идут выводы и решения самого разбора, вручную, а не построчно из
+# процесса. Файл заводит setup.sh; add создаёт его и здесь же, если сервер
+# получил эту команду через self-update раньше, чем переустановку.
+journal)
+    case "${2:-show}" in
+      add)
+        [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm journal add \"текст\"${NC}"; exit 1; }
+        JTEXT="${3:-}"
+        [[ -z "$JTEXT" ]] && { echo -e "${RED}Пусто: sudo xm journal add \"текст\"${NC}"; exit 1; }
+        [[ -f "$JOURNAL_FILE" ]] || install -m 600 -o root -g root /dev/null "$JOURNAL_FILE"
+        ( umask 077; printf '\n## %s\n%s\n' "$(date -Is)" "$JTEXT" >> "$JOURNAL_FILE" )
+        ok "Добавлено: $JOURNAL_FILE"
+        ;;
+      show)
+        if [[ -f "$JOURNAL_FILE" ]]; then
+          cat "$JOURNAL_FILE"
+        else
+          echo "Журнала ещё нет. Создастся сам при первом: sudo xm journal add \"текст\""
+        fi
+        ;;
+      *)
+        echo -e "${RED}xm journal [show|add \"текст\"]${NC}"; exit 1 ;;
+    esac
+    ;;
+
 # ─── Инфо ────────────────────────────────────────────────────────────────────
 info)
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════${NC}"
@@ -3030,6 +3062,7 @@ paths)
     echo "  Бэкапы:      $BACKUP_DIR"
     echo "  Лог Xray:    $LOG"
     echo "  Клиент-файл: $CLIENT_FILE"
+    echo "  Журнал:      $JOURNAL_FILE"
     echo "  Бинарник:    $(which xray)"
     echo "  Nginx conf:  /etc/nginx/stream-enabled/reality-fallback.conf  (тракт REALITY)"
     echo "  Nginx :80:   /etc/nginx/sites-available/fallback  (только 301-редирект)"
