@@ -255,9 +255,28 @@ _dns_hijack_on() {
 # Засчитываем только "yes". При "opportunistic" резолвед молча сваливается в
 # открытый UDP, как только :853 не отвечает, — то есть даёт ровно ту утечку,
 # от которой мы защищаемся, и не оставляет ни одного признака.
+#
+# Разметка `resolvectl status` менялась между релизами systemd, и проверять
+# надо обе. По systemd 247 включительно состояние печаталось отдельной строкой
+# «DNSOverTLS setting: yes»; с 248 это токен в общей строке «Protocols:», где
+# boolean выводится как +DNSOverTLS / -DNSOverTLS, а третье значение — как
+# DNSOverTLS=opportunistic (systemd, src/resolve/resolvectl.c,
+# strv_extend_extended_bool). На Ubuntu 22.04 и 24.04 формат новый, поэтому
+# проверка только по старой строке не совпадала там никогда: harden откатывал
+# поднявшийся DoT как «не поднялся», а diag и итоговая сводка показывали
+# открытый UDP независимо от реального состояния резолвера.
+# Оба шаблона дают строгий «yes» и мимо opportunistic: у него нет «+», а
+# «DNSOverTLS=opportunistic» под шаблон со знаком не подходит.
+# Смотрим только секцию Global — наш профиль задаёт именно её, а линки без
+# своей настройки её наследуют. COLUMNS фиксируем потому, что строка Protocols
+# печатается таблицей и на узком выводе переносится по словам, разрывая знак
+# и имя токена.
 _resolved_dot_on() {
-  resolvectl status 2>/dev/null \
-    | grep -qiE '^[[:space:]]*DNSOverTLS setting:[[:space:]]*yes[[:space:]]*$'
+  local g
+  g=$(COLUMNS=200 resolvectl status 2>/dev/null | sed -n '1,/^Link /p')
+  [[ -z "$g" ]] && return 1
+  grep -qiE '^[[:space:]]*DNSOverTLS setting:[[:space:]]*yes[[:space:]]*$' <<<"$g" && return 0
+  grep -qE '^[[:space:]]*Protocols:.*[[:space:]]\+DNSOverTLS([[:space:]]|$)' <<<"$g"
 }
 
 # Эффективный список апстримов резолвера: main-конфиг плюс ВСЕ drop-in в
@@ -288,19 +307,42 @@ _resolved_dns_file() {
 # Наш список апстримов одной строкой — для сравнения и для точечной правки.
 _resolved_dot_dns() { printf '%s' "$RESOLVED_DOT_CONF" | sed -n 's/^DNS=//p'; }
 
+# Причина отказа _resolved_write_dot текстом. Отдельно, потому что печатают
+# её два вызывающих, и потому что раньше на любой отказ выдавалась одна и та
+# же догадка про хостера — она и уводила разбор в сторону.
+_resolved_dot_why() {
+  case "$1" in
+    2) echo "systemd-resolved не активен после перезапуска — смотри systemctl status systemd-resolved" ;;
+    3) echo "DNSOverTLS=yes не вступил в силу — вероятно, наш drop-in перекрыт файлом с более поздним именем в /etc/systemd/resolved.conf.d" ;;
+    4) echo "строгий DoT включился, но имя не резолвится — вероятно, :853 до апстримов не проходит (проверить: openssl s_client -connect 1.1.1.1:853)" ;;
+    *) echo "причина не определена" ;;
+  esac
+}
+
 # Записать наш профиль DoT, перезапустить резолвед, проверить и откатиться
-# самому, если DoT не поднялся (хостер режет :853).
+# самому, если не заработало. Код возврата называет, на чём именно споткнулось:
+#   0 — DoT поднялся, имя резолвится
+#   2 — systemd-resolved не активен после перезапуска
+#   3 — резолвед жив, но строгий DoT не включился
+#   4 — строгий DoT включён, а резолвинг не работает
+# Разведены потому, что лечатся по-разному и вызывающий печатает ту причину,
+# которая сработала. Про закрытый :853 честно говорить только в случае 4: в
+# остальных трёх до хостера дело ещё не дошло.
 _resolved_write_dot() {
-  local bak=""
+  local bak="" rc=0
   [[ -f "$RESOLVED_DROPIN" ]] && {
     bak="${RESOLVED_DROPIN}.bak_$(date +%Y%m%d_%H%M%S)"; cp "$RESOLVED_DROPIN" "$bak"; }
   mkdir -p "$(dirname "$RESOLVED_DROPIN")"
   printf '%s\n' "$RESOLVED_DOT_CONF" > "$RESOLVED_DROPIN"
   systemctl restart systemd-resolved 2>/dev/null; sleep 1
-  _resolved_dot_on && resolvectl query example.com &>/dev/null && return 0
+  if   ! systemctl is-active --quiet systemd-resolved; then rc=2
+  elif ! _resolved_dot_on;                             then rc=3
+  elif ! resolvectl query example.com &>/dev/null;     then rc=4
+  else return 0
+  fi
   if [[ -n "$bak" ]]; then cp "$bak" "$RESOLVED_DROPIN"; else rm -f "$RESOLVED_DROPIN"; fi
   systemctl restart systemd-resolved 2>/dev/null
-  return 1
+  return $rc
 }
 
 # Классификация DNS-дампа по АДРЕСУ ИСТОЧНИКА пакета. Источник — единственное,
@@ -4844,7 +4886,9 @@ harden)
         ok "Применено: четыре апстрима по :853 (Cloudflare ×2, Quad9, Google), FallbackDNS пуст"
         info "Файл: $RESOLVED_DROPIN — убирается вместе с sudo xm harden --off"
       else
+        DOT_RC=$?
         fail "DoT с нашими апстримами не поднялся — откат, прежняя конфигурация на месте"
+        warn "Причина: $(_resolved_dot_why "$DOT_RC")"
         warn "Проверь вручную: sudo resolvectl query example.com, затем sudo resolvectl status"
         exit 1
       fi
@@ -4981,7 +5025,9 @@ harden)
     elif _resolved_write_dot; then
       ok "systemd-resolved: DNSOverTLS=yes, четыре апстрима по :853 (Cloudflare ×2, Quad9, Google)"
     else
-      fail "DoT не поднялся (хостер режет :853?) — шаг откачен"
+      DOT_RC=$?
+      fail "DoT не поднялся — шаг откачен"
+      warn "Причина: $(_resolved_dot_why "$DOT_RC")"
       warn "Системный резолвинг остаётся открытым; остальные шаги harden продолжаю"
     fi
 
