@@ -85,7 +85,7 @@ _get_field() {
 }
 
 # SNI из whitelist-map: строка строго вида "X   X;".
-# [FIX] Прежняя регулярка '^\s*\w+\s+\w+;' совпадала также с
+# Прежняя регулярка '^\s*\w+\s+\w+;' совпадала также с
 # "resolver_timeout 5s;" и "set_real_ip_from 127.0.0.1;" — при чтении спасал
 # head -1, но sed -i в set-sni шёл без адресации и переписывал ИХ ТОЖЕ.
 _get_nginx_sni() {
@@ -3146,7 +3146,7 @@ for svc in xray nginx fail2ban chrony; do
     fi
 
     echo -e "\n${BOLD}[ 9 ] Логирование (анонимность)${NC}"; sep
-    # [FIX-9] Заменено с проверки geoip:cn/ir — она рапортовала защиту,
+    # Заменено с проверки geoip:cn/ir — она рапортовала защиту,
     # которой нет (routing работает после аутентификации, поле ip = назначение).
     ACC=$(jq -r '.log.access // "<не задано>"' "$CONFIG")
     if [[ "$ACC" == "none" ]]; then
@@ -3295,7 +3295,7 @@ dpi|diag-dpi)
     # B4 — голый HTTP на TLS-порт. Настоящий веб-сервер отвечает 400 Bad Request.
     echo -e "\n  ${BOLD}B4. Открытый HTTP-запрос на TLS-порт${NC}"
     # curl при неудаче сам печатает "000" И возвращает !=0 — `|| echo 000`
-    # склеил бы два кода в "000000" (см. FIX-14). Ошибку глушим отдельно.
+    # склеил бы два кода в "000000". Ошибку глушим отдельно.
     OUR_H=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://${SERVER_IP}:${PORT}/" 2>/dev/null) || true
     REAL_H=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 "http://${SNI}:443/" 2>/dev/null) || true
     OUR_H=${OUR_H:-000}; REAL_H=${REAL_H:-000}
@@ -3658,16 +3658,20 @@ dpi|diag-dpi)
       # Один проход: накопительно, за сутки и метка последнего реального отказа.
       # Формат nginx — "2026/08/31 15:56:41", нули на месте, поэтому сравнение
       # строк работает как сравнение времени, без парсинга дат.
-      read -r E_RESOLV E_RESET E_TMOUT E_NOHOST D_RESOLV D_RESET D_TMOUT D_ALL EL_LAST < <(
+      # "no host in upstream" — следы режима strict, снятого вместе с
+      # переходом на mimic. Не считаем и не печатаем, но пропускаем через
+      # next: иначе эти строки попадут в общий счётчик отказов и в метку
+      # последнего отказа, состарив картину на месяцы назад.
+      read -r E_RESOLV E_RESET E_TMOUT D_RESOLV D_RESET D_TMOUT D_ALL EL_LAST < <(
         awk -v cut="$EL_CUT" '
           { ts = $1 " " $2; rec = (cut != "" && ts >= cut) }
           /could not be resolved/ { r++; if (rec) dr++ }
           /reset by peer/         { s++; if (rec) ds++ }
           /upstream timed out/    { t++; if (rec) dt++ }
-          /no host in upstream/   { n++; next }
+          /no host in upstream/   { next }
           { last = ts; if (rec) da++ }
-          END { printf "%d %d %d %d %d %d %d %d %s\n",
-                       r, s, t, n, dr, ds, dt, da, (last == "" ? "-" : last) }
+          END { printf "%d %d %d %d %d %d %d %s\n",
+                       r, s, t, dr, ds, dt, da, (last == "" ? "-" : last) }
         ' "$EL")
       echo ""
       if [[ -z "$EL_CUT" ]]; then
@@ -3693,8 +3697,6 @@ dpi|diag-dpi)
         EL_EP=$(date -d "${EL_LAST//\//-}" +%s 2>/dev/null)
         [[ -n "$EL_EP" ]] && info "  Последний реальный отказ: $EL_LAST ($(( ($(date +%s) - EL_EP) / 3600 )) ч назад)"
       fi
-      [[ "${E_NOHOST:-0}" -gt 0 ]] \
-        && info "  ${E_NOHOST} × пустой апстрим — следы старого режима strict (до mimic), не текущая проблема"
     fi
 
     # G3 — счётчики ядра: потери ДО того, как соединение доходит до Xray.
@@ -3963,7 +3965,12 @@ sni-scan)
     # Пул массовых CDN-имён: домен-маска должна быть тем, обращение к чему с
     # этого адреса никого не удивит. Узкий пул = узкий выбор — на четырёх
     # именах в окно ML-DSA могло не попасть ни одно, и менять было бы не на что.
-    POOL=(www.apple.com swcdn.apple.com dl.google.com www.microsoft.com
+    #
+    # www.microsoft.com в пул не входит: cert+OCSP ≈ 9085 б против буфера
+    # REALITY ~8192 б (замерено, см. setup.sh), то есть вердикт «НЕ ГОДИТСЯ»
+    # известен заранее. Держать его здесь значило тратить SNI_PROBES
+    # хендшейков с таймаутом на кандидата, который не может победить.
+    POOL=(www.apple.com swcdn.apple.com dl.google.com
           cdn.jsdelivr.net www.cloudflare.com)
     CUR=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG")
     if [[ -n "$CUR" ]] && ! printf '%s\n' "${POOL[@]}" | grep -qx "$CUR"; then
@@ -5141,13 +5148,26 @@ self-update)
         || ok "geo-базы свежие ($GEO_AGE дн.)"
     fi
 
-    if _dns_doh_on && _dns_hijack_on && _ngx_mimic_on; then
+    # Проверяем ВСЁ, что делает harden, а не три шага из пяти. Прежняя версия
+    # не смотрела ни на строгий DoT, ни на резолвер nginx — и печатала
+    # «применён полностью» на сервере, где diag-dpi одновременно ругался и на
+    # открытый UDP/53 у стаба, и на resolver 1.1.1.1 в fallback. Ложное
+    # «всё хорошо» здесь дороже отсутствия строки: пользователь не запускает
+    # harden именно потому, что ему сказали, что он не нужен.
+    NGX_RSLV_LOCAL=0
+    grep -qE '^[[:space:]]*resolver[[:space:]]+127\.0\.0\.53' \
+         /etc/nginx/stream-enabled/reality-fallback.conf 2>/dev/null && NGX_RSLV_LOCAL=1
+
+    if _dns_doh_on && _dns_hijack_on && _ngx_mimic_on \
+       && _resolved_dot_on && [[ "$NGX_RSLV_LOCAL" == "1" ]]; then
       ok "Анти-DPI хардening применён полностью"
     else
       warn "Хардening применён не весь                ${BOLD}sudo xm harden${NC}"
       _dns_doh_on    || echo "        · DoH на сервере выключен — домены резолвит хостер открытым текстом"
       _dns_hijack_on || echo "        · перехват :53 выключен"
       _ngx_mimic_on  || echo "        · nginx-fallback рвёт соединение на чужой SNI"
+      _resolved_dot_on || echo "        · системный резолвер без строгого DoT — уходит открытым UDP/53"
+      [[ "$NGX_RSLV_LOCAL" == "1" ]] || echo "        · nginx-fallback резолвит домен-маску публичным DNS мимо стаба"
     fi
 
     sep
