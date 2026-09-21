@@ -149,6 +149,7 @@ xm diag-ntp | diag-ports | diag-tls | diag-fw | diag-log
 **Прочее**
 ```bash
 xm log | log-live | log-clear
+xm journal [show|add "текст"]      # локальный журнал разбора проблем этого сервера
 xm ban-list | unban <ip>
 xm nginx-status | nginx-log | nginx-reload | nginx-probes
 xm info | paths | uuid | pubkey
@@ -208,6 +209,7 @@ URI и QR-коды умирают) и переписывает `nginx.conf`, `si
 /usr/local/etc/xray/client-info.txt    — данные клиентов (chmod 600)
 /usr/local/etc/xray/front.conf         — маршруты фронта по SNI (chmod 600)
 /usr/local/etc/xray/backups/           — автобэкапы
+/usr/local/etc/xray/journal.md         — журнал разбора проблем (chmod 600, только на сервере)
 /var/log/xray/error.log                — лог Xray
 /usr/local/bin/xm                      — менеджер
 ```
