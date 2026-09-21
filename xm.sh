@@ -1254,22 +1254,52 @@ _counters_snap_write() {
   ( umask 077; printf '%s\n' "$snap" > "$COUNTERS_SNAP" ) 2>/dev/null
 }
 
-# Фактический backlog слушающих сокетов nginx и Xray. Для LISTEN-сокета
-# Send-Q в ss — это и есть backlog. Счётчик overflows видит последствие,
-# но не называет причину; здесь она видна прямо.
+# Слушающие сокеты nginx/Xray, у которых backlog ниже порога $1; $2 сужает
+# выборку до одного процесса. Для LISTEN-сокета Send-Q в ss — это и есть
+# backlog. Вынесено отдельно, потому что смотреть на факт должны одинаково и
+# диагностика, и починка: пока выборка жила только в diag-dpi, tune чинил по
+# своему признаку и рапортовал успех на сокете, который diag тем же прогоном
+# показывал урезанным.
+_backlog_low() {
+  ss -tlnpH 2>/dev/null | awk -v m="$1" -v who="${2:-nginx|xray}" '
+    BEGIN { re = "\"(" who ")\"" }
+    $0 ~ re && $3+0 < m {
+      printf "      %-24s backlog=%-6s %s\n", $4, $3, ($0 ~ /"nginx"/ ? "nginx" : "xray") }'
+}
+
+# Backlog, которого вообще можно добиться: запрошенное в listen() ядро режет
+# по net.core.somaxconn, поэтому достижимо меньшее из двух. Считаем именно
+# его, иначе при урезанном somaxconn nginx уходил бы в круг перезапусков за
+# значением, которого ядро всё равно не даст.
+_ngx_backlog_want() {
+  local smc; smc=$(sysctl -n net.core.somaxconn 2>/dev/null)
+  [[ -n "$smc" && "$smc" -gt 0 && "$smc" -lt "$NGX_BACKLOG" ]] && { echo "$smc"; return 0; }
+  echo "$NGX_BACKLOG"
+}
+
+# Фактический backlog слушающих сокетов nginx и Xray. Счётчик overflows видит
+# последствие, но не называет причину; здесь она видна прямо.
+# Порог у двоих разный: Xray (Go) берёт backlog из somaxconn, а nginx задаёт
+# его сам и упирается в меньшее из своего значения и somaxconn. Один порог на
+# обоих означал бы, что при somaxconn выше NGX_BACKLOG диагностика вечно
+# ругается на nginx, а tune столь же вечно отвечает, что чинить нечего, — ровно
+# тот разнобой между диагностикой и починкой, который здесь и устраняется.
 _backlog_report() {
-  local smc out
+  local smc want out
   smc=$(sysctl -n net.core.somaxconn 2>/dev/null)
   [[ -z "$smc" ]] && return 0
-  out=$(ss -tlnpH 2>/dev/null | awk -v m="$smc" '
-    /"nginx"|"xray"/ && $3+0 < m {
-      printf "      %-24s backlog=%-6s %s\n", $4, $3, ($0 ~ /"nginx"/ ? "nginx" : "xray") }')
+  want=$(_ngx_backlog_want)
+  out=$(_backlog_low "$smc" xray; _backlog_low "$want" nginx)
   if [[ -z "$out" ]]; then
-    ok "backlog слушающих сокетов не ниже somaxconn (${smc})"; return 0
+    ok "backlog слушающих сокетов не ниже целевого (xray ${smc}, nginx ${want})"; return 0
   fi
-  dwarn "backlog ниже somaxconn (${smc}) — на эти сокеты sysctl-профиль не подействовал:"
+  dwarn "backlog ниже целевого (xray ${smc}, nginx ${want}) — на эти сокеты sysctl-профиль не подействовал:"
   printf '%s\n' "$out"
-  echo -e "      ${CYAN}nginx задаёт backlog сам (по умолчанию 511) и somaxconn не наследует.${NC}"
+  # Подсказка про nginx — только когда в списке действительно есть его сокеты:
+  # у Xray backlog берётся из somaxconn, и объяснение про «задаёт сам» для него
+  # неверно.
+  grep -q 'nginx$' <<<"$out" \
+    && echo -e "      ${CYAN}nginx задаёт backlog сам (по умолчанию 511) и somaxconn не наследует.${NC}"
   echo -e "      ${CYAN}Чинит: ${BOLD}sudo xm tune${NC}"
 }
 
@@ -1299,19 +1329,39 @@ _ngx_backlog_fix() {
       rc=1
     fi
   done
-  if [[ "$changed" -eq 0 ]]; then
-    [[ "$rc" -eq 0 ]] && ok "backlog в конфигах nginx уже проставлен"
-    return $rc
+  if [[ "$changed" -eq 1 ]]; then
+    systemctl reload nginx || { fail "nginx reload не удался"; return 1; }
+    sleep 1
   fi
-  systemctl reload nginx || { fail "nginx reload не удался"; return 1; }
-  # Reload переоткрывает сокет не всегда, а backlog живёт на самом сокете.
-  # Поэтому проверяем по факту, а не по успеху reload.
-  sleep 1
-  if ss -tlnpH 2>/dev/null | awk '/"nginx"/{print $3}' | grep -qv "^${NGX_BACKLOG}$"; then
-    info "reload не переставил backlog на живых сокетах — перезапускаю nginx"
-    systemctl restart nginx; sleep 1
+
+  # Конфиг — это то, что nginx ПРОСИТ у ядра; backlog живёт на самом сокете и
+  # фиксируется в момент listen(), где ядро режет его по somaxconn. Отсюда
+  # расхождение, которое ветка «менять нечего» пропускала молча: nginx поднялся
+  # раньше, чем применился sysctl-профиль, в конфигах нужное значение уже
+  # стоит, а на сокетах — прежнее, урезанное старым somaxconn. Reload сокеты не
+  # пересоздаёт, снимает это только restart. Поэтому решает не «изменился ли
+  # файл», а факт на сокете — и смотрим на него всегда, в том числе когда
+  # править в файлах было нечего.
+  local want low
+  want=$(_ngx_backlog_want)
+  low=$(_backlog_low "$want" nginx)
+  if [[ -n "$low" ]]; then
+    info "backlog на живых сокетах nginx ниже ${want} — reload их не пересоздаёт, перезапускаю nginx"
+    systemctl restart nginx || { fail "nginx restart не удался"; return 1; }
+    sleep 1
+    low=$(_backlog_low "$want" nginx)
   fi
-  ok "backlog в listen nginx → ${NGX_BACKLOG}"
+  if [[ -n "$low" ]]; then
+    warn "backlog на сокетах nginx ниже ${want} даже после перезапуска:"
+    printf '%s\n' "$low"
+    warn "Очередь accept продолжит переполняться — проверь listen-директивы nginx вручную"
+    return 1
+  fi
+  if [[ "$changed" -eq 1 ]]; then
+    ok "backlog в listen nginx → ${want}"
+  elif [[ "$rc" -eq 0 ]]; then
+    ok "backlog nginx: ${want} и в конфигах, и на живых сокетах"
+  fi
   return $rc
 }
 
