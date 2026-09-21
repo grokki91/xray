@@ -287,7 +287,11 @@ _asn_info() {
   local ip="$1" line
   line=$(whois -h whois.cymru.com " -v $ip" 2>/dev/null | tail -1) || line=""
   [[ "$line" == *"|"* ]] || return 1
+  # В имени сети Cymru отдаёт «HANDLE - Организация, CC», а когда handle не
+  # зарегистрирован — подставляет туда сам номер AS. Срезаем его: иначе строка
+  # печатается как «AS64500 AS64500 - Организация».
   awk -F'|' '{ for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+               sub(/^AS[0-9]+[ \t]*-[ \t]*/, "", $7)
                if ($1 ~ /^[0-9]+$/) print $1 "|" $3 "|" $7 }' <<< "$line"
 }
 
@@ -314,13 +318,27 @@ _rts_ensure() {
   chmod 755 "$tmp"; mv "$tmp" "$RTS_BIN"
 }
 
+# _ip_in_cidr <ip> <cidr> — адрес внутри диапазона? Без DNS и без внешних
+# утилит: 32 бита укладываются в арифметику bash.
+_ip_in_cidr() {
+  local ip="$1" cidr="$2" base bits mask a b c d ipn basen
+  [[ "$ip"   =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  [[ "$cidr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || return 1
+  base="${cidr%/*}"; bits="${cidr#*/}"
+  [[ "$bits" -le 32 ]] || return 1
+  IFS=. read -r a b c d <<< "$ip";   ipn=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+  IFS=. read -r a b c d <<< "$base"; basen=$(( (a << 24) | (b << 16) | (c << 8) | d ))
+  mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+  (( (ipn & mask) == (basen & mask) ))
+}
+
 # _rts_candidates <cidr> <свой-ip> [лимит] → имена доменов, по одному в строке.
 #
 # Свой адрес исключается обязательно: на повторном прогоне (xm sni-scan --local)
 # наш же сервер ответит сертификатом текущей маски, и кандидат «сам на себя»
 # попал бы в список как отличный сосед.
 _rts_candidates() {
-  local cidr="$1" self="$2" lim="${3:-12}" out
+  local cidr="$1" self="$2" lim="${3:-12}" out d ip
   out=$(mktemp /tmp/rts.XXXXXX.csv) || return 1
   "$RTS_BIN" -addr "$cidr" -port 443 -thread 16 -timeout 5 -out "$out" >/dev/null 2>&1 || true
   # CSV: IP,ORIGIN,TLS,ALPN,CURVE,CERT_LENGTH,CERT_SIGNATURE,CERT_PUBLICKEY,
@@ -342,7 +360,20 @@ _rts_candidates() {
       n = $6; sub(/\(.*/, "", n); n += 0
       if (n <= 0 || n >= lim) next
       print n "\t" d
-    }' "$out" 2>/dev/null | sort -n | awk -F'\t' '!seen[$2]++ { print $2 }' | head -"$lim"
+    }' "$out" 2>/dev/null | sort -n | awk -F'\t' '!seen[$2]++ { print $2 }' \
+  | while read -r d; do
+      # Сертификат найден в нашем диапазоне — но dest у REALITY ходит ПО ИМЕНИ,
+      # и где лежит имя, скан не говорит. Сосед, который сам работает через
+      # REALITY, отдаёт украденный сертификат CDN: без этой проверки
+      # www.cloudflare.com попал бы в список «соседей», резолвясь при этом в
+      # чужую сеть, то есть ровно в тот мисматч ASN, от которого мы и уходим.
+      # Оставляем только имена с адресом внутри сканированного диапазона —
+      # и не своим: dest на самого себя это петля.
+      for ip in $(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u); do
+        [[ "$ip" == "$self" ]] && continue
+        if _ip_in_cidr "$ip" "$cidr"; then echo "$d"; break; fi
+      done
+    done | head -"$lim"
   rm -f "$out"
 }
 
@@ -558,10 +589,10 @@ if [[ "${LOCAL_SCAN,,}" == "y" || "${LOCAL_SCAN,,}" == "yes" || "${LOCAL_SCAN,,}
       RTS_RC=$?
     fi
     case "$RTS_RC" in
-      0) info "Сканирую ${MY_24} — до минуты..."
+      0) info "Сканирую ${MY_24} — до полутора минут..."
          mapfile -t SNI_LOCAL < <(_rts_candidates "$MY_24" "$MY_IP" 8 2>/dev/null || true)
          if [[ ${#SNI_LOCAL[@]} -gt 0 ]]; then
-           success "Найдено соседей с TLS1.3+h2: ${#SNI_LOCAL[@]}"
+           success "Найдено соседей в своей сети: ${#SNI_LOCAL[@]}"
          else
            warn "В своей /24 подходящих соседей нет — остаётся глобальный пул"
          fi ;;
