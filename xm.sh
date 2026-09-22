@@ -255,9 +255,28 @@ _dns_hijack_on() {
 # Засчитываем только "yes". При "opportunistic" резолвед молча сваливается в
 # открытый UDP, как только :853 не отвечает, — то есть даёт ровно ту утечку,
 # от которой мы защищаемся, и не оставляет ни одного признака.
+#
+# Разметка `resolvectl status` менялась между релизами systemd, и проверять
+# надо обе. По systemd 247 включительно состояние печаталось отдельной строкой
+# «DNSOverTLS setting: yes»; с 248 это токен в общей строке «Protocols:», где
+# boolean выводится как +DNSOverTLS / -DNSOverTLS, а третье значение — как
+# DNSOverTLS=opportunistic (systemd, src/resolve/resolvectl.c,
+# strv_extend_extended_bool). На Ubuntu 22.04 и 24.04 формат новый, поэтому
+# проверка только по старой строке не совпадала там никогда: harden откатывал
+# поднявшийся DoT как «не поднялся», а diag и итоговая сводка показывали
+# открытый UDP независимо от реального состояния резолвера.
+# Оба шаблона дают строгий «yes» и мимо opportunistic: у него нет «+», а
+# «DNSOverTLS=opportunistic» под шаблон со знаком не подходит.
+# Смотрим только секцию Global — наш профиль задаёт именно её, а линки без
+# своей настройки её наследуют. COLUMNS фиксируем потому, что строка Protocols
+# печатается таблицей и на узком выводе переносится по словам, разрывая знак
+# и имя токена.
 _resolved_dot_on() {
-  resolvectl status 2>/dev/null \
-    | grep -qiE '^[[:space:]]*DNSOverTLS setting:[[:space:]]*yes[[:space:]]*$'
+  local g
+  g=$(COLUMNS=200 resolvectl status 2>/dev/null | sed -n '1,/^Link /p')
+  [[ -z "$g" ]] && return 1
+  grep -qiE '^[[:space:]]*DNSOverTLS setting:[[:space:]]*yes[[:space:]]*$' <<<"$g" && return 0
+  grep -qE '^[[:space:]]*Protocols:.*[[:space:]]\+DNSOverTLS([[:space:]]|$)' <<<"$g"
 }
 
 # Эффективный список апстримов резолвера: main-конфиг плюс ВСЕ drop-in в
@@ -288,19 +307,42 @@ _resolved_dns_file() {
 # Наш список апстримов одной строкой — для сравнения и для точечной правки.
 _resolved_dot_dns() { printf '%s' "$RESOLVED_DOT_CONF" | sed -n 's/^DNS=//p'; }
 
+# Причина отказа _resolved_write_dot текстом. Отдельно, потому что печатают
+# её два вызывающих, и потому что раньше на любой отказ выдавалась одна и та
+# же догадка про хостера — она и уводила разбор в сторону.
+_resolved_dot_why() {
+  case "$1" in
+    2) echo "systemd-resolved не активен после перезапуска — смотри systemctl status systemd-resolved" ;;
+    3) echo "DNSOverTLS=yes не вступил в силу — вероятно, наш drop-in перекрыт файлом с более поздним именем в /etc/systemd/resolved.conf.d" ;;
+    4) echo "строгий DoT включился, но имя не резолвится — вероятно, :853 до апстримов не проходит (проверить: openssl s_client -connect 1.1.1.1:853)" ;;
+    *) echo "причина не определена" ;;
+  esac
+}
+
 # Записать наш профиль DoT, перезапустить резолвед, проверить и откатиться
-# самому, если DoT не поднялся (хостер режет :853).
+# самому, если не заработало. Код возврата называет, на чём именно споткнулось:
+#   0 — DoT поднялся, имя резолвится
+#   2 — systemd-resolved не активен после перезапуска
+#   3 — резолвед жив, но строгий DoT не включился
+#   4 — строгий DoT включён, а резолвинг не работает
+# Разведены потому, что лечатся по-разному и вызывающий печатает ту причину,
+# которая сработала. Про закрытый :853 честно говорить только в случае 4: в
+# остальных трёх до хостера дело ещё не дошло.
 _resolved_write_dot() {
-  local bak=""
+  local bak="" rc=0
   [[ -f "$RESOLVED_DROPIN" ]] && {
     bak="${RESOLVED_DROPIN}.bak_$(date +%Y%m%d_%H%M%S)"; cp "$RESOLVED_DROPIN" "$bak"; }
   mkdir -p "$(dirname "$RESOLVED_DROPIN")"
   printf '%s\n' "$RESOLVED_DOT_CONF" > "$RESOLVED_DROPIN"
   systemctl restart systemd-resolved 2>/dev/null; sleep 1
-  _resolved_dot_on && resolvectl query example.com &>/dev/null && return 0
+  if   ! systemctl is-active --quiet systemd-resolved; then rc=2
+  elif ! _resolved_dot_on;                             then rc=3
+  elif ! resolvectl query example.com &>/dev/null;     then rc=4
+  else return 0
+  fi
   if [[ -n "$bak" ]]; then cp "$bak" "$RESOLVED_DROPIN"; else rm -f "$RESOLVED_DROPIN"; fi
   systemctl restart systemd-resolved 2>/dev/null
-  return 1
+  return $rc
 }
 
 # Классификация DNS-дампа по АДРЕСУ ИСТОЧНИКА пакета. Источник — единственное,
@@ -1254,22 +1296,52 @@ _counters_snap_write() {
   ( umask 077; printf '%s\n' "$snap" > "$COUNTERS_SNAP" ) 2>/dev/null
 }
 
-# Фактический backlog слушающих сокетов nginx и Xray. Для LISTEN-сокета
-# Send-Q в ss — это и есть backlog. Счётчик overflows видит последствие,
-# но не называет причину; здесь она видна прямо.
+# Слушающие сокеты nginx/Xray, у которых backlog ниже порога $1; $2 сужает
+# выборку до одного процесса. Для LISTEN-сокета Send-Q в ss — это и есть
+# backlog. Вынесено отдельно, потому что смотреть на факт должны одинаково и
+# диагностика, и починка: пока выборка жила только в diag-dpi, tune чинил по
+# своему признаку и рапортовал успех на сокете, который diag тем же прогоном
+# показывал урезанным.
+_backlog_low() {
+  ss -tlnpH 2>/dev/null | awk -v m="$1" -v who="${2:-nginx|xray}" '
+    BEGIN { re = "\"(" who ")\"" }
+    $0 ~ re && $3+0 < m {
+      printf "      %-24s backlog=%-6s %s\n", $4, $3, ($0 ~ /"nginx"/ ? "nginx" : "xray") }'
+}
+
+# Backlog, которого вообще можно добиться: запрошенное в listen() ядро режет
+# по net.core.somaxconn, поэтому достижимо меньшее из двух. Считаем именно
+# его, иначе при урезанном somaxconn nginx уходил бы в круг перезапусков за
+# значением, которого ядро всё равно не даст.
+_ngx_backlog_want() {
+  local smc; smc=$(sysctl -n net.core.somaxconn 2>/dev/null)
+  [[ -n "$smc" && "$smc" -gt 0 && "$smc" -lt "$NGX_BACKLOG" ]] && { echo "$smc"; return 0; }
+  echo "$NGX_BACKLOG"
+}
+
+# Фактический backlog слушающих сокетов nginx и Xray. Счётчик overflows видит
+# последствие, но не называет причину; здесь она видна прямо.
+# Порог у двоих разный: Xray (Go) берёт backlog из somaxconn, а nginx задаёт
+# его сам и упирается в меньшее из своего значения и somaxconn. Один порог на
+# обоих означал бы, что при somaxconn выше NGX_BACKLOG диагностика вечно
+# ругается на nginx, а tune столь же вечно отвечает, что чинить нечего, — ровно
+# тот разнобой между диагностикой и починкой, который здесь и устраняется.
 _backlog_report() {
-  local smc out
+  local smc want out
   smc=$(sysctl -n net.core.somaxconn 2>/dev/null)
   [[ -z "$smc" ]] && return 0
-  out=$(ss -tlnpH 2>/dev/null | awk -v m="$smc" '
-    /"nginx"|"xray"/ && $3+0 < m {
-      printf "      %-24s backlog=%-6s %s\n", $4, $3, ($0 ~ /"nginx"/ ? "nginx" : "xray") }')
+  want=$(_ngx_backlog_want)
+  out=$(_backlog_low "$smc" xray; _backlog_low "$want" nginx)
   if [[ -z "$out" ]]; then
-    ok "backlog слушающих сокетов не ниже somaxconn (${smc})"; return 0
+    ok "backlog слушающих сокетов не ниже целевого (xray ${smc}, nginx ${want})"; return 0
   fi
-  dwarn "backlog ниже somaxconn (${smc}) — на эти сокеты sysctl-профиль не подействовал:"
+  dwarn "backlog ниже целевого (xray ${smc}, nginx ${want}) — на эти сокеты sysctl-профиль не подействовал:"
   printf '%s\n' "$out"
-  echo -e "      ${CYAN}nginx задаёт backlog сам (по умолчанию 511) и somaxconn не наследует.${NC}"
+  # Подсказка про nginx — только когда в списке действительно есть его сокеты:
+  # у Xray backlog берётся из somaxconn, и объяснение про «задаёт сам» для него
+  # неверно.
+  grep -q 'nginx$' <<<"$out" \
+    && echo -e "      ${CYAN}nginx задаёт backlog сам (по умолчанию 511) и somaxconn не наследует.${NC}"
   echo -e "      ${CYAN}Чинит: ${BOLD}sudo xm tune${NC}"
 }
 
@@ -1299,19 +1371,39 @@ _ngx_backlog_fix() {
       rc=1
     fi
   done
-  if [[ "$changed" -eq 0 ]]; then
-    [[ "$rc" -eq 0 ]] && ok "backlog в конфигах nginx уже проставлен"
-    return $rc
+  if [[ "$changed" -eq 1 ]]; then
+    systemctl reload nginx || { fail "nginx reload не удался"; return 1; }
+    sleep 1
   fi
-  systemctl reload nginx || { fail "nginx reload не удался"; return 1; }
-  # Reload переоткрывает сокет не всегда, а backlog живёт на самом сокете.
-  # Поэтому проверяем по факту, а не по успеху reload.
-  sleep 1
-  if ss -tlnpH 2>/dev/null | awk '/"nginx"/{print $3}' | grep -qv "^${NGX_BACKLOG}$"; then
-    info "reload не переставил backlog на живых сокетах — перезапускаю nginx"
-    systemctl restart nginx; sleep 1
+
+  # Конфиг — это то, что nginx ПРОСИТ у ядра; backlog живёт на самом сокете и
+  # фиксируется в момент listen(), где ядро режет его по somaxconn. Отсюда
+  # расхождение, которое ветка «менять нечего» пропускала молча: nginx поднялся
+  # раньше, чем применился sysctl-профиль, в конфигах нужное значение уже
+  # стоит, а на сокетах — прежнее, урезанное старым somaxconn. Reload сокеты не
+  # пересоздаёт, снимает это только restart. Поэтому решает не «изменился ли
+  # файл», а факт на сокете — и смотрим на него всегда, в том числе когда
+  # править в файлах было нечего.
+  local want low
+  want=$(_ngx_backlog_want)
+  low=$(_backlog_low "$want" nginx)
+  if [[ -n "$low" ]]; then
+    info "backlog на живых сокетах nginx ниже ${want} — reload их не пересоздаёт, перезапускаю nginx"
+    systemctl restart nginx || { fail "nginx restart не удался"; return 1; }
+    sleep 1
+    low=$(_backlog_low "$want" nginx)
   fi
-  ok "backlog в listen nginx → ${NGX_BACKLOG}"
+  if [[ -n "$low" ]]; then
+    warn "backlog на сокетах nginx ниже ${want} даже после перезапуска:"
+    printf '%s\n' "$low"
+    warn "Очередь accept продолжит переполняться — проверь listen-директивы nginx вручную"
+    return 1
+  fi
+  if [[ "$changed" -eq 1 ]]; then
+    ok "backlog в listen nginx → ${want}"
+  elif [[ "$rc" -eq 0 ]]; then
+    ok "backlog nginx: ${want} и в конфигах, и на живых сокетах"
+  fi
   return $rc
 }
 
@@ -4794,7 +4886,9 @@ harden)
         ok "Применено: четыре апстрима по :853 (Cloudflare ×2, Quad9, Google), FallbackDNS пуст"
         info "Файл: $RESOLVED_DROPIN — убирается вместе с sudo xm harden --off"
       else
+        DOT_RC=$?
         fail "DoT с нашими апстримами не поднялся — откат, прежняя конфигурация на месте"
+        warn "Причина: $(_resolved_dot_why "$DOT_RC")"
         warn "Проверь вручную: sudo resolvectl query example.com, затем sudo resolvectl status"
         exit 1
       fi
@@ -4931,7 +5025,9 @@ harden)
     elif _resolved_write_dot; then
       ok "systemd-resolved: DNSOverTLS=yes, четыре апстрима по :853 (Cloudflare ×2, Quad9, Google)"
     else
-      fail "DoT не поднялся (хостер режет :853?) — шаг откачен"
+      DOT_RC=$?
+      fail "DoT не поднялся — шаг откачен"
+      warn "Причина: $(_resolved_dot_why "$DOT_RC")"
       warn "Системный резолвинг остаётся открытым; остальные шаги harden продолжаю"
     fi
 
