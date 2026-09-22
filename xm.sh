@@ -5458,7 +5458,6 @@ self-update)
     fi
     ok "Синтаксис нового xm.sh в порядке"
 
-    OLD_V=$(grep -m1 -oE 'xm — Xray Manager Helper +v[0-9.]+' "$XM_BIN" 2>/dev/null | grep -oE 'v[0-9.]+' || echo "?")
     if [[ -f "$XM_BIN" ]]; then
       mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
       XM_BAK="$BACKUP_DIR/xm_$(date +%Y%m%d_%H%M%S).bak"
@@ -5474,8 +5473,10 @@ self-update)
     # процесса остаётся старый inode, он доигрывает себя целым.
     install -m 755 "$REPO/xm.sh" "${XM_BIN}.new" || { fail "Не записать ${XM_BIN}.new"; exit 1; }
     mv -f "${XM_BIN}.new" "$XM_BIN" || { fail "Не удалось заменить $XM_BIN"; rm -f "${XM_BIN}.new"; exit 1; }
-    NEW_V=$(grep -m1 -oE 'xm — Xray Manager Helper +v[0-9.]+' "$XM_BIN" 2>/dev/null | grep -oE 'v[0-9.]+' || echo "?")
-    ok "Установлен $XM_BIN  (${OLD_V} → ${NEW_V})"
+    # Версию не печатаем: строки с номером в файле нет, и оба grep'а годами
+    # возвращали «?». Коммит чекаута — признак, который действительно есть и
+    # по которому установленное однозначно сопоставляется с репозиторием.
+    ok "Установлен $XM_BIN (из $BR@$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null))"
 
     mkdir -p "$(dirname "$XM_SRC_FILE")"
     echo "$REPO" > "$XM_SRC_FILE"; chmod 644 "$XM_SRC_FILE"
