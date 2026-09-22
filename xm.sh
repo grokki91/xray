@@ -495,19 +495,22 @@ _tunnel_code() {
   echo "${code:-000}"
 }
 
-# _socks_dns <resolver_ip> <домен> → OK | TIMEOUT | ERR
+# _socks_dns <resolver_ip> <домен> [тип] → OK | TIMEOUT | ERR
 # DNS поверх TCP через SOCKS5 тоннеля. Резолвер 192.0.2.1 (RFC 5737 TEST-NET-1)
 # заведомо мёртв и не маршрутизируется — ответ физически может прийти ТОЛЬКО
 # если сервер перехватывает :53 и отвечает сам. Бинарный тест перехвата.
+# Тип запроса по умолчанию A (1); 65 (HTTPS/SVCB) нужен, чтобы увидеть путь
+# не-A/AAAA — там ответа может не быть вовсе, и это молчание клиент оплачивает
+# таймаутом.
 _socks_dns() {
-  python3 - "$TUN_PORT" "$1" "$2" <<'PY' 2>/dev/null || echo "ERR"
+  python3 - "$TUN_PORT" "$1" "$2" "${3:-1}" <<'PY' 2>/dev/null || echo "ERR"
 import socket, struct, sys
-sp, rip, name = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+sp, rip, name, qt = int(sys.argv[1]), sys.argv[2], sys.argv[3], int(sys.argv[4])
 def query(n):
     b = struct.pack(">HHHHHH", 0x2a2a, 0x0100, 1, 0, 0, 0)
     for l in n.split("."):
         b += bytes([len(l)]) + l.encode()
-    return b + b"\x00" + struct.pack(">HH", 1, 1)
+    return b + b"\x00" + struct.pack(">HH", qt, 1)
 try:
     s = socket.create_connection(("127.0.0.1", sp), 5)
     s.settimeout(8)
@@ -626,7 +629,12 @@ _harden_unpatch() {
 # Android с 11-й версии спрашивает HTTPS/SVCB (тип 65) перед каждым
 # соединением. При drop запрос отбрасывается молча, и на телефоне это
 # выглядит как «соединение — переподключение». Отдельная ручка нужна, чтобы
-# проверять эту гипотезу, не снося вместе с ней DoH, DoT и mimic.
+# менять этот режим, не снося вместе с ним DoH, DoT и mimic.
+#
+# reject закрывает ровно эту цену: ответ (REFUSED) уходит клиенту сразу, а
+# сам запрос наружу не идёт — приватность та же, что у drop, ожидания нет.
+# Принимается с Xray v25.7.26, поэтому drop остаётся запасным вариантом для
+# сборок старше.
 #
 # Цена skip: запрос не-A/AAAA покидает VPS открытым UDP. Утечка узкая (тип 65,
 # не имена сайтов), но это утечка — режим диагностический.
@@ -3706,6 +3714,15 @@ dpi|diag-dpi)
       # Пока он ходит открытым UDP, каждое такое попадание — имя на проводе.
       if _resolved_dot_on; then
         ok "systemd-resolved: DNSOverTLS=yes — что попало в системный резолвер, уходит по :853, а не открытым UDP"
+        # Под строгим DoT недоступность апстрима — это не замедление, а отказ
+        # резолвинга: резолвед обязан вернуть ошибку, а не уйти в открытый UDP.
+        # Отказ резолвинга здесь равен мёртвому dest у REALITY, то есть «принял
+        # TCP и молча закрыл» — подписи прокси. Поэтому число апстримов тут
+        # такой же признак, как сам факт DoT, а не справка.
+        RDNS_N=$(_resolved_dns_line | wc -w)
+        [[ "${RDNS_N:-0}" -ge 3 ]] \
+          && ok "Апстримов DoT: $RDNS_N — падение одного провайдера резолвинг не роняет" \
+          || dwarn "Апстримов DoT всего ${RDNS_N:-0}: под строгим DoT недоступность одного из них — это отказ резолвинга целиком, а значит мёртвый dest и обрывы у всех клиентов. Профиль на четыре: ${BOLD}sudo xm harden --dot${NC}"
       else
         dwarn "systemd-resolved без строгого DoT: всё, что попадёт в системный резолвер (а туда попадает не только не-Xray), уйдёт с VPS открытым UDP/53. Исправить: ${BOLD}sudo xm harden${NC}"
       fi
@@ -3744,6 +3761,21 @@ dpi|diag-dpi)
           TIMEOUT) dfail "E4: запрос на 192.0.2.1:53 ушёл наружу и умер по таймауту → перехвата НЕТ, plain-DNS клиента покидает VPS как есть" ;;
           *)       dwarn "E4: тест не отработал (SOCKS/python) — проверь вручную" ;;
         esac
+
+        # E4b — что клиент получает на HTTPS/SVCB (тип 65). Android с 11-й
+        # версии спрашивает этот тип перед соединением, и при nonIPQuery=drop
+        # ответа нет вовсе: телефон ждёт свой таймаут на каждое имя, а на
+        # экране это «соединение — переподключение». Спрашиваем следствием, а
+        # не значением в конфиге: набор режимов и их смысл между сборками Xray
+        # менялись, а ждёт клиент или нет — видно только по ответу.
+        if [[ "$DNSR" == "OK" ]]; then
+          DNS65=$(_socks_dns "192.0.2.1" "example.com" 65)
+          case "$DNS65" in
+            OK)      ok "E4b: на HTTPS/SVCB (тип 65) сервер отвечает сразу — клиент не ждёт таймаута" ;;
+            TIMEOUT) dwarn "E4b: на HTTPS/SVCB (тип 65) ответа нет — клиент ждёт свой таймаут на каждое имя. Режим reject отвечает отказом сразу и наружу при этом ничего не выпускает: ${BOLD}sudo xm harden --nonip reject${NC} (принимается с Xray v25.7.26, обновить: ${BOLD}sudo xm update${NC})" ;;
+            *)       dwarn "E4b: тест не отработал (SOCKS/python) — проверь вручную" ;;
+          esac
+        fi
 
         # E5 — утечка по факту, с атрибуцией. Два имени с РАЗНОЙ судьбой внутри
         # DoH, и разница между ними — это и есть диагноз:
@@ -4845,10 +4877,16 @@ harden)
     NONIP_CUR=""
     if _dns_hijack_on; then
       NONIP_CUR=$(_nonip_current)
+      # Режимы различаются не только приватностью: наружу не уходит ни при
+      # reject, ни при drop, но drop молчит, и клиент платит за это таймаутом.
+      # Валить их в одну строку «не drop → утечка» нельзя: для reject это
+      # неправда, а совет по такой строке уводит не туда.
       case "${NONIP_CUR:-}" in
-        drop) ok "Запросы не-A/AAAA: drop — наружу не уходят. Ценой того, что Android не получает ответа на свои HTTPS/SVCB и ждёт таймаута" ;;
-        "")   info "Запросы не-A/AAAA: поле не задано — поведение по умолчанию этой сборки Xray" ;;
-        *)    warn "Запросы не-A/AAAA: ${NONIP_CUR} — не drop, часть запросов покидает VPS открытым UDP" ;;
+        reject) ok "Запросы не-A/AAAA: reject — наружу не уходят, клиент получает отказ сразу и не ждёт" ;;
+        drop)   warn "Запросы не-A/AAAA: drop — наружу не уходят, но ответа нет вовсе: Android спрашивает HTTPS/SVCB перед соединением и ждёт таймаут на каждое имя. Приватность та же, ожидания нет: ${BOLD}sudo xm harden --nonip reject${NC}" ;;
+        skip)   warn "Запросы не-A/AAAA: skip — часть запросов покидает VPS открытым UDP. Вернуть: ${BOLD}sudo xm harden --nonip reject${NC}" ;;
+        "")     info "Запросы не-A/AAAA: поле не задано — поведение по умолчанию этой сборки Xray (у сборок до v25.7.26 это молчаливый drop)" ;;
+        *)      warn "Запросы не-A/AAAA: ${NONIP_CUR} — значение не из известных; что принимает эта сборка: ${BOLD}sudo xm harden --nonip${NC}" ;;
       esac
     fi
 
@@ -4919,7 +4957,8 @@ harden)
           _nonip_try "$v" && ok "  $v — принимается" || info "  $v — сборка отвергает"
         done
         echo ""
-        echo -e "  ${BOLD}sudo xm harden --nonip drop${NC}   отбрасывать (приватно; Android ждёт таймаута)"
+        echo -e "  ${BOLD}sudo xm harden --nonip reject${NC} отвечать отказом сразу — приватно и без ожидания ${GREEN}(рабочий режим)${NC}"
+        echo -e "  ${BOLD}sudo xm harden --nonip drop${NC}   отбрасывать молча — приватно, но клиент ждёт свой таймаут"
         echo -e "  ${BOLD}sudo xm harden --nonip skip${NC}   пропускать на исходный адрес — ${YELLOW}уходит открытым UDP${NC}"
         echo -e "  ${BOLD}sudo xm harden --nonip off${NC}    убрать поле, оставить поведение сборки по умолчанию"
         echo ""
@@ -4952,7 +4991,9 @@ harden)
       fi
       ok "nonIPQuery: ${NONIP_CUR:-<не задано>} → ${NONIP_NEW:-<не задано>}, Xray перезапущен"
       [[ "$NONIP_NEW" == "skip" ]] && \
-        warn "skip — режим на время проверки: запросы не-A/AAAA теперь покидают VPS открытым UDP. Вернуть: sudo xm harden --nonip drop"
+        warn "skip — режим на время проверки: запросы не-A/AAAA теперь покидают VPS открытым UDP. Вернуть: sudo xm harden --nonip reject"
+      [[ "$NONIP_NEW" == "drop" ]] && \
+        warn "drop не отвечает вовсе — клиент ждёт таймаут на каждый запрос не-A/AAAA. Та же приватность без ожидания: sudo xm harden --nonip reject"
       exit 0
     fi
 
@@ -5065,23 +5106,37 @@ harden)
       systemctl restart xray 2>/dev/null || true
     }
 
-    # nonIPQuery=drop: запросы не-A/AAAA (HTTPS/SVCB, TXT) отбрасываются, а не
-    # пересылаются наружу открытым текстом. Приватность важнее ECH-подсказок.
-    # Поле старое (legacy), но на редких сборках может не приняться — тогда
-    # второй заход без него.
-    if ! _harden_patch "$QS" "$DS" "drop" | _atomic_write_config; then
-      fail "jq-патч не сработал — конфиг не тронут"; exit 1
-    fi
-    if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
-      warn "Xray не принял nonIPQuery — повторяю без него"
+    # Запросы не-A/AAAA (HTTPS/SVCB, TXT) не уходят наружу открытым текстом ни
+    # при reject, ни при drop — разница в том, что получает клиент. reject
+    # отвечает REFUSED сразу; drop молчит, и Android, который с 11-й версии
+    # спрашивает тип 65 перед соединением, ждёт на каждое имя свой таймаут.
+    # Приватность у обоих одинаковая, поэтому молчание — просто лишняя цена.
+    # reject принимается с Xray v25.7.26; на сборках старше допустим только
+    # drop, а на совсем редких не принимается и само поле — отсюда цепочка, а
+    # не одно значение. Что приняла ЭТА сборка, решает xray -test, а не версия
+    # в строке: сборки бывают собранными не из релизного тега. Само поле
+    # объявлено устаревшим в пользу settings.rules; когда его уберут совсем,
+    # цепочка дойдёт до последнего шага — а там сборка уже отвечает на не-A/AAAA
+    # сама, без поля, так что откат ведёт в нужную сторону, а не в молчание.
+    NONIP_SET="none"
+    for v in reject drop ""; do
       cp "$HBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
-      _harden_patch "$QS" "$DS" "" | _atomic_write_config
-      if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
-        fail "Конфиг невалиден — откат"; xray -test -config "$CONFIG" 2>&1 | tail -5 | sed 's/^/    /'
-        _harden_restore; exit 1
+      if _harden_patch "$QS" "$DS" "$v" | _atomic_write_config \
+         && xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+        NONIP_SET="$v"; break
       fi
+    done
+    if [[ "$NONIP_SET" == "none" ]]; then
+      fail "Конфиг с dns-блоком невалиден ни в одном из режимов — откат"
+      xray -test -config "$CONFIG" 2>&1 | tail -5 | sed 's/^/    /'
+      _harden_restore; exit 1
     fi
     ok "config.json: dns(DoH) + outbound dns-out + routing :53 → dns-out"
+    case "$NONIP_SET" in
+      reject) ok "Запросы не-A/AAAA: reject — наружу не уходят, клиент получает отказ сразу" ;;
+      drop)   warn "Запросы не-A/AAAA: drop — наружу не уходят, но ответа нет вовсе: клиент ждёт таймаут на каждое имя. reject эта сборка не принимает (нужен Xray v25.7.26+): ${BOLD}sudo xm update${NC}, потом ${BOLD}sudo xm harden${NC}" ;;
+      "")     warn "Поле nonIPQuery эта сборка не приняла — режим запросов не-A/AAAA остался дефолтным для неё. Что она умеет: ${BOLD}sudo xm harden --nonip${NC}" ;;
+    esac
 
     systemctl restart xray; sleep 2
     if ! systemctl is-active --quiet xray; then
@@ -5592,7 +5647,7 @@ neighbors)
     echo -e "            ${GREEN}set-sni <домен>${NC}          домен-маска в config+nginx, с откатом"
     echo -e "            ${GREEN}set-port <порт> [--tcp]${NC}  порт inbound (443 предпочтителен)"
     echo -e "            ${GREEN}add-tcp${NC}                  второй inbound XTLS-Vision/TCP"
-    echo -e "${BOLD}${GREEN}Анти-DPI${NC}    harden [--check|--off|--dot|--nonip drop|skip|off]"
+    echo -e "${BOLD}${GREEN}Анти-DPI${NC}    harden [--check|--off|--dot|--nonip reject|drop|skip|off]"
     echo    "                                     DoH, строгий DoT, перехват :53, mimic"
     echo    "            tune [--check|--off]     сетевой стек, таймауты, watchdog"
     echo    "            watchdog on|off|now|status"

@@ -1159,8 +1159,8 @@ else
   if _has_ipv6; then DNS_QS="UseIP";   DNS_DS="UseIPv4v6"
   else               DNS_QS="UseIPv4"; DNS_DS="UseIPv4"; fi
 
-  # nonIPQuery=drop: HTTPS/SVCB и TXT не уходят наружу открытым текстом.
-  # На редких сборках поле не принимается — тогда второй заход без него.
+  # Пишет dns-блок с заданным режимом запросов не-A/AAAA и возвращает 1, если
+  # ЭТА сборка Xray такой конфиг не приняла.
   _write_dns_cfg() {
     local nonip="$1" tmp
     tmp=$(mktemp "$(dirname "$XRAY_CONFIG")/config.XXXXXX.json")
@@ -1182,17 +1182,32 @@ else
   # временный файл за конфиг.
   CFG_NODNS=$(mktemp "$(dirname "$XRAY_CONFIG")/config.nodns.XXXXXX")
   cat "$XRAY_CONFIG" > "$CFG_NODNS"
-  if _write_dns_cfg "drop"; then
-    success "DNS: DoH ($DOH_OK резолвера) + перехват :53"
-  else
+  # HTTPS/SVCB и TXT не уходят наружу открытым текстом ни при reject, ни при
+  # drop. Разница в том, что получает клиент: reject отвечает отказом сразу,
+  # drop молчит — и Android, который спрашивает тип 65 перед соединением, ждёт
+  # на каждое имя свой таймаут. Приватность одинаковая, значит молчание —
+  # лишняя цена. reject принимается с Xray v25.7.26, на сборках старше — только
+  # drop, на редких не принимается и само поле: отсюда цепочка, а не одно
+  # значение. Что приняла эта сборка, решает xray -test внутри _write_dns_cfg.
+  NONIP_SET="none"
+  for nonip_mode in reject drop ""; do
     cat "$CFG_NODNS" > "$XRAY_CONFIG"
-    if _write_dns_cfg ""; then
-      success "DNS: DoH ($DOH_OK резолвера) + перехват :53"
-    else
+    if _write_dns_cfg "$nonip_mode"; then NONIP_SET="$nonip_mode"; break; fi
+  done
+  case "$NONIP_SET" in
+    none)
       warn "dns-блок не принят этой сборкой Xray — конфиг без него"
-      cat "$CFG_NODNS" > "$XRAY_CONFIG"
-    fi
-  fi
+      cat "$CFG_NODNS" > "$XRAY_CONFIG" ;;
+    reject)
+      success "DNS: DoH ($DOH_OK резолвера) + перехват :53, не-A/AAAA → отказ сразу" ;;
+    drop)
+      success "DNS: DoH ($DOH_OK резолвера) + перехват :53"
+      warn "Сборка Xray старше v25.7.26: не-A/AAAA отбрасываются молча, клиент ждёт таймаута."
+      warn "После обновления: sudo xm update && sudo xm harden" ;;
+    *)
+      success "DNS: DoH ($DOH_OK резолвера) + перехват :53"
+      warn "nonIPQuery эта сборка не приняла — режим не-A/AAAA остался её дефолтным" ;;
+  esac
   chmod 640 "$XRAY_CONFIG"; chown root:nogroup "$XRAY_CONFIG"
   rm -f "$CFG_NODNS"
 fi
