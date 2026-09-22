@@ -5379,6 +5379,27 @@ self-update)
       || { fail "На origin нет ни текущей ветки, ни main"; exit 1; }
     info "Ветка: $BR"
 
+    # Ветка чекаута — не обязательно та, откуда приходят обновления. Здесь это
+    # уже стоило месяцев: сервер остался на ветке давно слитого PR, fetch
+    # честно отвечал «новых коммитов нет», и всё, что уезжало в main после того
+    # слияния, до сервера не доходило — при зелёной строке в выводе. Поэтому
+    # сверяемся не только с origin/$BR, но и с веткой по умолчанию на origin.
+    DEF_BR=$(git -C "$REPO" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+    if [[ -z "$DEF_BR" ]]; then
+      git -C "$REPO" remote set-head origin --auto >/dev/null 2>&1
+      DEF_BR=$(git -C "$REPO" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+    fi
+    [[ -z "$DEF_BR" ]] && DEF_BR="main"
+    if [[ "$BR" != "$DEF_BR" ]] && git -C "$REPO" rev-parse --verify --quiet "origin/$DEF_BR" >/dev/null 2>&1; then
+      BEHIND=$(git -C "$REPO" rev-list --count "HEAD..origin/$DEF_BR" 2>/dev/null || echo 0)
+      if [[ "${BEHIND:-0}" -gt 0 ]]; then
+        warn "Чекаут на ветке $BR, а в origin/$DEF_BR новее на $BEHIND коммитов — по этой ветке они НЕ приедут"
+        echo -e "      Перейти на ветку по умолчанию: ${BOLD}cd $REPO && sudo git checkout $DEF_BR && sudo xm self-update${NC}"
+      else
+        info "Ветка $BR — не $DEF_BR, но отставания от неё нет"
+      fi
+    fi
+
     LOCAL_SHA=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
     REMOTE_SHA=$(git -C "$REPO" rev-parse --short "origin/$BR" 2>/dev/null)
     AHEAD=$(git -C "$REPO" rev-list --count "HEAD..origin/$BR" 2>/dev/null || echo 0)
