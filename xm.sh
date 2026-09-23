@@ -25,15 +25,20 @@ XM_SRC_FILE="/usr/local/etc/xray/xm-source"
 REALITY_CERT_WARN=7000
 REALITY_CERT_LIMIT=8192
 
-# Окно, в котором домен-маска годится ещё и под ML-DSA-65.
-# Нижняя граница — тот же порог, что в diag-dpi (блок C): при более мелком
-# сертификате +3.3 КБ подписи становятся заметной долей ответа, и мы меняем
-# одну зацепку для DPI на другую.
-# Верхняя — та же арифметика, что в xm pq: EST + 3400 должно остаться ниже
-# лимита REALITY, иначе хендшейк порвётся. Считается от лимита, чтобы две
-# константы не разъехались при правке одной.
-REALITY_CERT_PQ_MIN=3500
-REALITY_CERT_PQ_MAX=$((REALITY_CERT_LIMIT - 3400))
+# С какого размера сертификата домен-маска годится ещё и под ML-DSA-65.
+# Выведено из исходника REALITY (handshake_server_tls13.go, conn.go), а не из
+# оценки «подпись прибавится к ответу». С ML-DSA временный сертификат
+# REALITY — фиксированные 3509 б DER вместо 178, запись Certificate с ним —
+# 3544 б. Свои записи хендшейка REALITY добивает до длины записей dest,
+# поэтому длина ответа с ML-DSA не меняется вовсе, а если своя запись длиннее,
+# чем у dest, REALITY обрывает хендшейк. Нужен сертификат dest не меньше
+# этого; сверху ограничение то же, что и без ML-DSA, — REALITY_CERT_LIMIT.
+# _check_cert_size оценивает запись без ~20 б заголовков — отсюда 3530.
+# Это предварительный фильтр: OCSP оценка берёт с запасом, а сжатие
+# сертификата (RFC 8879), которое dest может включить клиенту с отпечатком
+# Chrome, не видит. Окончательно решает живой хендшейк в xm pq on: трафик не
+# пошёл — включение откатывается.
+REALITY_CERT_PQ_MIN=3530
 
 # Сколько хендшейков на домен делает sni-scan и с каким таймаутом.
 # Десять, а не три: замер на живом сервере дал кандидатов с долей отказов
@@ -1728,9 +1733,10 @@ _autoupd_origins() {
 # mldsa65Verify это проверяет. Смысл — MITM: публичный ключ REALITY раздаётся
 # в URI и утечь может элементарно.
 #
-# Цена: наш Certificate растёт примерно на 3.3 КБ, и при маленьком сертификате
-# у dest длина ответа начинает отличаться от настоящего сайта — одна зацепка
-# для DPI меняется на другую. Включать имеет смысл при cert от ~3500 б.
+# Цена: временный сертификат REALITY вырастает до 3.5 КБ и обязан влезть в
+# запись Certificate у dest, иначе REALITY рвёт хендшейк (см.
+# REALITY_CERT_PQ_MIN). Длина ответа при этом не меняется: свои записи REALITY
+# добивает до длины записей dest.
 # Клиенты без mldsa65Verify работают как раньше: проверка не требуется.
 _parse_mldsa() {
   MLDSA_SEED=$(echo "$1"   | grep -iE "^[[:space:]]*(seed|private)"           | awk '{print $NF}' | head -1 | tr -d '[:space:]')
@@ -3656,13 +3662,13 @@ dpi|diag-dpi)
     fi
 
     # ML-DSA-65: post-quantum подпись REALITY. Защищает от MITM тем, у кого
-    # утёк публичный ключ. Цена — наш Certificate растёт примерно на 3.3 КБ,
-    # поэтому у dest он должен быть НЕ МЕНЬШЕ ~3500 б, иначе размер ответа
-    # начинает отличаться от настоящего сайта — новый признак вместо старого.
+    # утёк публичный ключ. Цена — временный сертификат REALITY вырастает до
+    # 3.5 КБ и должен влезть в запись Certificate у dest, иначе REALITY рвёт
+    # хендшейк (см. REALITY_CERT_PQ_MIN).
     if jq -e '.inbounds[0].streamSettings.realitySettings.mldsa65Seed // empty' "$CONFIG" >/dev/null 2>&1; then
       ok "ML-DSA-65 (post-quantum) включён"
-      [[ "$CERT_EST" != "-1" && "$CERT_EST" -lt 3500 ]] && \
-        dwarn "…но Certificate у $SNI всего ~${CERT_EST} б (<3500): наш ответ заметно длиннее настоящего сайта. Либо домен покрупнее, либо sudo xm pq off"
+      [[ "$CERT_EST" != "-1" && "$CERT_EST" -lt "$REALITY_CERT_PQ_MIN" ]] && \
+        dwarn "…но Certificate у $SNI всего ~${CERT_EST} б (<${REALITY_CERT_PQ_MIN}): временный сертификат с подписью ML-DSA (3.5 КБ) в запись этого сайта, скорее всего, не влезает — REALITY рвёт хендшейк. Проверить: ${BOLD}sudo xm selftest${NC}; не проходит — домен покрупнее или ${BOLD}sudo xm pq off${NC}"
     else
       info "ML-DSA-65 выключен (штатно). Включить: sudo xm pq on — см. xm pq status"
     fi
@@ -4184,7 +4190,7 @@ selftest)
 sni-scan)
     # Пул массовых CDN-имён: домен-маска должна быть тем, обращение к чему с
     # этого адреса никого не удивит. Узкий пул = узкий выбор — на четырёх
-    # именах в окно ML-DSA могло не попасть ни одно, и менять было бы не на что.
+    # именах под ML-DSA могло не подойти ни одно, и менять было бы не на что.
     #
     # www.microsoft.com в пул не входит: cert+OCSP ≈ 9085 б против буфера
     # REALITY ~8192 б (замерено, см. setup.sh), то есть вердикт «НЕ ГОДИТСЯ»
@@ -4323,7 +4329,7 @@ sni-scan)
       V="ГОДИТСЯ"; C="$GREEN"; PQ=0; ELIG=1
       if   [[ "$EST" -ge "$REALITY_CERT_LIMIT" ]]; then V="НЕ ГОДИТСЯ"; C="$RED";    ELIG=0
       elif [[ "$EST" -ge "$REALITY_CERT_WARN"  ]]; then V="РИСК";       C="$YELLOW"; ELIG=0
-      elif [[ "$EST" -ge "$REALITY_CERT_PQ_MIN" && "$EST" -le "$REALITY_CERT_PQ_MAX" ]]; then
+      elif [[ "$EST" -ge "$REALITY_CERT_PQ_MIN" ]]; then
         V="ГОДИТСЯ +PQ"; PQ=1
       fi
       [[ "$H2" != "да" || "$T13" != "да" ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; ELIG=0; PQ=0; }
@@ -4360,15 +4366,15 @@ sni-scan)
     # ML-DSA навсегда; повторять это, поменяв только критерий, нет смысла.
     if [[ -n "$BEST_PQ" && -n "$BEST" && "$BEST_PQ" != "$BEST" ]]; then
       ok "Стабильнее всех: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES}) — ML-DSA недоступен"
-      ok "С окном ML-DSA: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES})"
+      ok "Годится под ML-DSA: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES})"
       echo -e "  Применить: ${BOLD}sudo xm set-sni <домен>${NC}; после второго — ещё ${BOLD}sudo xm pq on${NC}"
     elif [[ -n "$BEST_PQ" ]]; then
-      ok "Лучший кандидат: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES}) — попадает в окно ML-DSA"
+      ok "Лучший кандидат: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES}) — годится и под ML-DSA"
       [[ "$BEST_PQ" != "$CUR" ]] \
         && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST_PQ${NC}, затем ${BOLD}sudo xm pq on${NC}"
     elif [[ -n "$BEST" ]]; then
       ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES})"
-      info "В окно ML-DSA (${REALITY_CERT_PQ_MIN}–${REALITY_CERT_PQ_MAX} б) не попал никто — xm pq останется недоступен"
+      info "Сертификата от ${REALITY_CERT_PQ_MIN} б, в запись которого влезает подпись ML-DSA, нет ни у кого — xm pq останется недоступен"
       [[ "$BEST" != "$CUR" ]] && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST${NC}"
     elif [[ "$LOCAL_MODE" -eq 1 ]]; then
       fail "Ни один сосед не прошёл замер — возьми диапазон шире (весь анонс хостера) или оставь глобальный домен"
@@ -5227,13 +5233,11 @@ pq)
           warn "Размер сертификата $PQ_SNI не измерить — сайт недоступен с VPS"
         else
           info "Certificate у $PQ_SNI: ~${PQ_EST} б"
-          if [[ "$PQ_EST" -lt 3500 ]]; then
-            warn "Меньше 3500 б: с ML-DSA наш ответ станет заметно длиннее ответа настоящего сайта."
-            warn "Это меняет одну зацепку для DPI на другую. Взвесь: MITM-стойкость против маскировки."
-          elif [[ $((PQ_EST + 3400)) -ge "$REALITY_CERT_LIMIT" ]]; then
-            warn "~${PQ_EST} + 3.3 КБ подписи ≥ лимита REALITY (${REALITY_CERT_LIMIT} б) — хендшейк может рваться."
+          if [[ "$PQ_EST" -lt "$REALITY_CERT_PQ_MIN" ]]; then
+            warn "Меньше ${REALITY_CERT_PQ_MIN} б: временный сертификат REALITY с подписью ML-DSA (3.5 КБ) в запись"
+            warn "этого сайта, скорее всего, не влезет — и REALITY оборвёт хендшейк. Нужен домен покрупнее: sudo xm sni-scan"
           else
-            ok "Размер подходит: и маскировка не страдает, и в лимит REALITY укладываемся"
+            ok "Размер подходит: подпись влезает в запись Certificate сайта, длина ответа остаётся как у него"
           fi
         fi
         echo -e "\n  Включить:  ${BOLD}sudo xm pq on${NC}    Выключить: ${BOLD}sudo xm pq off${NC}"
@@ -5244,14 +5248,13 @@ pq)
         if ! xray help 2>&1 | grep -qi "mldsa65" && ! xray mldsa65 >/dev/null 2>&1; then
           fail "Эта сборка Xray не знает команды mldsa65 — обнови ядро: sudo xm update"; exit 1
         fi
+        # Порог — фильтр по оценке, а не приговор: решает живой хендшейк ниже,
+        # и он же откатывает включение, если трафик не пошёл.
         PQ_EST=$(_check_cert_size "$PQ_SNI")
-        if [[ "$PQ_EST" != "-1" && $((PQ_EST + 3400)) -ge "$REALITY_CERT_LIMIT" ]]; then
-          fail "Certificate $PQ_SNI ~${PQ_EST} б + 3.3 КБ подписи не влезает в лимит REALITY (${REALITY_CERT_LIMIT} б) — хендшейк сломается. Смени домен-маску: sudo xm sni-scan"
-          exit 1
-        fi
-        if [[ "$PQ_EST" != "-1" && "$PQ_EST" -lt 3500 ]]; then
-          warn "У $PQ_SNI сертификат ~${PQ_EST} б (<3500) — наш ответ станет длиннее настоящего сайта."
-          read -rp "Всё равно включить? [y/N]: " C; [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено."; exit 0; }
+        if [[ "$PQ_EST" != "-1" && "$PQ_EST" -lt "$REALITY_CERT_PQ_MIN" ]]; then
+          warn "У $PQ_SNI сертификат ~${PQ_EST} б (<${REALITY_CERT_PQ_MIN}): временный сертификат с подписью ML-DSA (3.5 КБ)"
+          warn "в его запись, скорее всего, не влезет, и REALITY оборвёт хендшейк. Живой хендшейк проверит и откатит сам."
+          read -rp "Всё равно попробовать? [y/N]: " C; [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено."; exit 0; }
         fi
 
         PQBAK=$(_backup_config before_pq); ok "Бэкап: $PQBAK"
