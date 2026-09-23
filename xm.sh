@@ -25,15 +25,20 @@ XM_SRC_FILE="/usr/local/etc/xray/xm-source"
 REALITY_CERT_WARN=7000
 REALITY_CERT_LIMIT=8192
 
-# Окно, в котором домен-маска годится ещё и под ML-DSA-65.
-# Нижняя граница — тот же порог, что в diag-dpi (блок C): при более мелком
-# сертификате +3.3 КБ подписи становятся заметной долей ответа, и мы меняем
-# одну зацепку для DPI на другую.
-# Верхняя — та же арифметика, что в xm pq: EST + 3400 должно остаться ниже
-# лимита REALITY, иначе хендшейк порвётся. Считается от лимита, чтобы две
-# константы не разъехались при правке одной.
-REALITY_CERT_PQ_MIN=3500
-REALITY_CERT_PQ_MAX=$((REALITY_CERT_LIMIT - 3400))
+# С какого размера сертификата домен-маска годится ещё и под ML-DSA-65.
+# Выведено из исходника REALITY (handshake_server_tls13.go, conn.go), а не из
+# оценки «подпись прибавится к ответу». С ML-DSA временный сертификат
+# REALITY — фиксированные 3509 б DER вместо 178, запись Certificate с ним —
+# 3544 б. Свои записи хендшейка REALITY добивает до длины записей dest,
+# поэтому длина ответа с ML-DSA не меняется вовсе, а если своя запись длиннее,
+# чем у dest, REALITY обрывает хендшейк. Нужен сертификат dest не меньше
+# этого; сверху ограничение то же, что и без ML-DSA, — REALITY_CERT_LIMIT.
+# _check_cert_size оценивает запись без ~20 б заголовков — отсюда 3530.
+# Это предварительный фильтр: OCSP оценка берёт с запасом, а сжатие
+# сертификата (RFC 8879), которое dest может включить клиенту с отпечатком
+# Chrome, не видит. Окончательно решает живой хендшейк в xm pq on: трафик не
+# пошёл — включение откатывается.
+REALITY_CERT_PQ_MIN=3530
 
 # Сколько хендшейков на домен делает sni-scan и с каким таймаутом.
 # Десять, а не три: замер на живом сервере дал кандидатов с долей отказов
@@ -1728,9 +1733,10 @@ _autoupd_origins() {
 # mldsa65Verify это проверяет. Смысл — MITM: публичный ключ REALITY раздаётся
 # в URI и утечь может элементарно.
 #
-# Цена: наш Certificate растёт примерно на 3.3 КБ, и при маленьком сертификате
-# у dest длина ответа начинает отличаться от настоящего сайта — одна зацепка
-# для DPI меняется на другую. Включать имеет смысл при cert от ~3500 б.
+# Цена: временный сертификат REALITY вырастает до 3.5 КБ и обязан влезть в
+# запись Certificate у dest, иначе REALITY рвёт хендшейк (см.
+# REALITY_CERT_PQ_MIN). Длина ответа при этом не меняется: свои записи REALITY
+# добивает до длины записей dest.
 # Клиенты без mldsa65Verify работают как раньше: проверка не требуется.
 _parse_mldsa() {
   MLDSA_SEED=$(echo "$1"   | grep -iE "^[[:space:]]*(seed|private)"           | awk '{print $NF}' | head -1 | tr -d '[:space:]')
@@ -3656,13 +3662,13 @@ dpi|diag-dpi)
     fi
 
     # ML-DSA-65: post-quantum подпись REALITY. Защищает от MITM тем, у кого
-    # утёк публичный ключ. Цена — наш Certificate растёт примерно на 3.3 КБ,
-    # поэтому у dest он должен быть НЕ МЕНЬШЕ ~3500 б, иначе размер ответа
-    # начинает отличаться от настоящего сайта — новый признак вместо старого.
+    # утёк публичный ключ. Цена — временный сертификат REALITY вырастает до
+    # 3.5 КБ и должен влезть в запись Certificate у dest, иначе REALITY рвёт
+    # хендшейк (см. REALITY_CERT_PQ_MIN).
     if jq -e '.inbounds[0].streamSettings.realitySettings.mldsa65Seed // empty' "$CONFIG" >/dev/null 2>&1; then
       ok "ML-DSA-65 (post-quantum) включён"
-      [[ "$CERT_EST" != "-1" && "$CERT_EST" -lt 3500 ]] && \
-        dwarn "…но Certificate у $SNI всего ~${CERT_EST} б (<3500): наш ответ заметно длиннее настоящего сайта. Либо домен покрупнее, либо sudo xm pq off"
+      [[ "$CERT_EST" != "-1" && "$CERT_EST" -lt "$REALITY_CERT_PQ_MIN" ]] && \
+        dwarn "…но Certificate у $SNI всего ~${CERT_EST} б (<${REALITY_CERT_PQ_MIN}): временный сертификат с подписью ML-DSA (3.5 КБ) в запись этого сайта, скорее всего, не влезает — REALITY рвёт хендшейк. Проверить: ${BOLD}sudo xm selftest${NC}; не проходит — домен покрупнее или ${BOLD}sudo xm pq off${NC}"
     else
       info "ML-DSA-65 выключен (штатно). Включить: sudo xm pq on — см. xm pq status"
     fi
@@ -4184,7 +4190,7 @@ selftest)
 sni-scan)
     # Пул массовых CDN-имён: домен-маска должна быть тем, обращение к чему с
     # этого адреса никого не удивит. Узкий пул = узкий выбор — на четырёх
-    # именах в окно ML-DSA могло не попасть ни одно, и менять было бы не на что.
+    # именах под ML-DSA могло не подойти ни одно, и менять было бы не на что.
     #
     # www.microsoft.com в пул не входит: cert+OCSP ≈ 9085 б против буфера
     # REALITY ~8192 б (замерено, см. setup.sh), то есть вердикт «НЕ ГОДИТСЯ»
@@ -4287,13 +4293,24 @@ sni-scan)
         printf "  %-24s %8s %4s %7s %6s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "-" "НЕДОСТУПЕН"; continue
       fi
 
+      # Имя резолвится один раз, пробы идут на адрес. С именем в -connect в
+      # каждую пробу входил резолв: колонка RTT мерила вместе с путём ещё и DNS
+      # (у массового имени кэш всегда тёплый — фора, которой у соседа нет), а
+      # сбой резолвинга засчитывался домену как потеря. В пути соединения REALITY
+      # резолва нет: nginx держит адрес dest valid=900s. Только IPv4 — как у
+      # nginx (ipv6=off).
+      HIP=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u | head -1)
+      if [[ -z "$HIP" ]]; then
+        printf "  %-24s %8s %4s %7s %6s  ${RED}%s${NC}\n" "$h" "$EST" "-" "-" "-" "НЕ РЕЗОЛВИТСЯ"; continue
+      fi
+
       # Несколько хендшейков вместо одного. Домен, который рвёт каждое второе
       # соединение, на единственной удачной попытке выглядел безупречно —
       # ровно та картина, из-за которой нестабильный dest и уезжал в конфиг.
       OK_N=0; RTT_SUM=0; H2=нет; T13=нет
       for _ in $(seq 1 "$SNI_PROBES"); do
         T0=$(date +%s%N)
-        HS=$(echo | timeout "$SNI_PROBE_TIMEOUT" openssl s_client -connect "$h:443" -servername "$h" \
+        HS=$(echo | timeout "$SNI_PROBE_TIMEOUT" openssl s_client -connect "$HIP:443" -servername "$h" \
              -tls1_3 -alpn h2 2>/dev/null)
         T1=$(date +%s%N)
         [[ -z "$HS" ]] && continue
@@ -4312,7 +4329,7 @@ sni-scan)
       V="ГОДИТСЯ"; C="$GREEN"; PQ=0; ELIG=1
       if   [[ "$EST" -ge "$REALITY_CERT_LIMIT" ]]; then V="НЕ ГОДИТСЯ"; C="$RED";    ELIG=0
       elif [[ "$EST" -ge "$REALITY_CERT_WARN"  ]]; then V="РИСК";       C="$YELLOW"; ELIG=0
-      elif [[ "$EST" -ge "$REALITY_CERT_PQ_MIN" && "$EST" -le "$REALITY_CERT_PQ_MAX" ]]; then
+      elif [[ "$EST" -ge "$REALITY_CERT_PQ_MIN" ]]; then
         V="ГОДИТСЯ +PQ"; PQ=1
       fi
       [[ "$H2" != "да" || "$T13" != "да" ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; ELIG=0; PQ=0; }
@@ -4349,15 +4366,15 @@ sni-scan)
     # ML-DSA навсегда; повторять это, поменяв только критерий, нет смысла.
     if [[ -n "$BEST_PQ" && -n "$BEST" && "$BEST_PQ" != "$BEST" ]]; then
       ok "Стабильнее всех: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES}) — ML-DSA недоступен"
-      ok "С окном ML-DSA: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES})"
+      ok "Годится под ML-DSA: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES})"
       echo -e "  Применить: ${BOLD}sudo xm set-sni <домен>${NC}; после второго — ещё ${BOLD}sudo xm pq on${NC}"
     elif [[ -n "$BEST_PQ" ]]; then
-      ok "Лучший кандидат: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES}) — попадает в окно ML-DSA"
+      ok "Лучший кандидат: ${BOLD}$BEST_PQ${NC} (~${BEST_PQ_EST} б, RTT ${BEST_PQ_RTT} мс, потерь ${BEST_PQ_FAIL}/${SNI_PROBES}) — годится и под ML-DSA"
       [[ "$BEST_PQ" != "$CUR" ]] \
         && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST_PQ${NC}, затем ${BOLD}sudo xm pq on${NC}"
     elif [[ -n "$BEST" ]]; then
       ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES})"
-      info "В окно ML-DSA (${REALITY_CERT_PQ_MIN}–${REALITY_CERT_PQ_MAX} б) не попал никто — xm pq останется недоступен"
+      info "Сертификата от ${REALITY_CERT_PQ_MIN} б, в запись которого влезает подпись ML-DSA, нет ни у кого — xm pq останется недоступен"
       [[ "$BEST" != "$CUR" ]] && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST${NC}"
     elif [[ "$LOCAL_MODE" -eq 1 ]]; then
       fail "Ни один сосед не прошёл замер — возьми диапазон шире (весь анонс хостера) или оставь глобальный домен"
@@ -5216,13 +5233,11 @@ pq)
           warn "Размер сертификата $PQ_SNI не измерить — сайт недоступен с VPS"
         else
           info "Certificate у $PQ_SNI: ~${PQ_EST} б"
-          if [[ "$PQ_EST" -lt 3500 ]]; then
-            warn "Меньше 3500 б: с ML-DSA наш ответ станет заметно длиннее ответа настоящего сайта."
-            warn "Это меняет одну зацепку для DPI на другую. Взвесь: MITM-стойкость против маскировки."
-          elif [[ $((PQ_EST + 3400)) -ge "$REALITY_CERT_LIMIT" ]]; then
-            warn "~${PQ_EST} + 3.3 КБ подписи ≥ лимита REALITY (${REALITY_CERT_LIMIT} б) — хендшейк может рваться."
+          if [[ "$PQ_EST" -lt "$REALITY_CERT_PQ_MIN" ]]; then
+            warn "Меньше ${REALITY_CERT_PQ_MIN} б: временный сертификат REALITY с подписью ML-DSA (3.5 КБ) в запись"
+            warn "этого сайта, скорее всего, не влезет — и REALITY оборвёт хендшейк. Нужен домен покрупнее: sudo xm sni-scan"
           else
-            ok "Размер подходит: и маскировка не страдает, и в лимит REALITY укладываемся"
+            ok "Размер подходит: подпись влезает в запись Certificate сайта, длина ответа остаётся как у него"
           fi
         fi
         echo -e "\n  Включить:  ${BOLD}sudo xm pq on${NC}    Выключить: ${BOLD}sudo xm pq off${NC}"
@@ -5233,14 +5248,13 @@ pq)
         if ! xray help 2>&1 | grep -qi "mldsa65" && ! xray mldsa65 >/dev/null 2>&1; then
           fail "Эта сборка Xray не знает команды mldsa65 — обнови ядро: sudo xm update"; exit 1
         fi
+        # Порог — фильтр по оценке, а не приговор: решает живой хендшейк ниже,
+        # и он же откатывает включение, если трафик не пошёл.
         PQ_EST=$(_check_cert_size "$PQ_SNI")
-        if [[ "$PQ_EST" != "-1" && $((PQ_EST + 3400)) -ge "$REALITY_CERT_LIMIT" ]]; then
-          fail "Certificate $PQ_SNI ~${PQ_EST} б + 3.3 КБ подписи не влезает в лимит REALITY (${REALITY_CERT_LIMIT} б) — хендшейк сломается. Смени домен-маску: sudo xm sni-scan"
-          exit 1
-        fi
-        if [[ "$PQ_EST" != "-1" && "$PQ_EST" -lt 3500 ]]; then
-          warn "У $PQ_SNI сертификат ~${PQ_EST} б (<3500) — наш ответ станет длиннее настоящего сайта."
-          read -rp "Всё равно включить? [y/N]: " C; [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено."; exit 0; }
+        if [[ "$PQ_EST" != "-1" && "$PQ_EST" -lt "$REALITY_CERT_PQ_MIN" ]]; then
+          warn "У $PQ_SNI сертификат ~${PQ_EST} б (<${REALITY_CERT_PQ_MIN}): временный сертификат с подписью ML-DSA (3.5 КБ)"
+          warn "в его запись, скорее всего, не влезет, и REALITY оборвёт хендшейк. Живой хендшейк проверит и откатит сам."
+          read -rp "Всё равно попробовать? [y/N]: " C; [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено."; exit 0; }
         fi
 
         PQBAK=$(_backup_config before_pq); ok "Бэкап: $PQBAK"
@@ -5379,6 +5393,27 @@ self-update)
       || { fail "На origin нет ни текущей ветки, ни main"; exit 1; }
     info "Ветка: $BR"
 
+    # Ветка чекаута — не обязательно та, откуда приходят обновления. Здесь это
+    # уже стоило месяцев: сервер остался на ветке давно слитого PR, fetch
+    # честно отвечал «новых коммитов нет», и всё, что уезжало в main после того
+    # слияния, до сервера не доходило — при зелёной строке в выводе. Поэтому
+    # сверяемся не только с origin/$BR, но и с веткой по умолчанию на origin.
+    DEF_BR=$(git -C "$REPO" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+    if [[ -z "$DEF_BR" ]]; then
+      git -C "$REPO" remote set-head origin --auto >/dev/null 2>&1
+      DEF_BR=$(git -C "$REPO" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+    fi
+    [[ -z "$DEF_BR" ]] && DEF_BR="main"
+    if [[ "$BR" != "$DEF_BR" ]] && git -C "$REPO" rev-parse --verify --quiet "origin/$DEF_BR" >/dev/null 2>&1; then
+      BEHIND=$(git -C "$REPO" rev-list --count "HEAD..origin/$DEF_BR" 2>/dev/null || echo 0)
+      if [[ "${BEHIND:-0}" -gt 0 ]]; then
+        warn "Чекаут на ветке $BR, а в origin/$DEF_BR новее на $BEHIND коммитов — по этой ветке они НЕ приедут"
+        echo -e "      Перейти на ветку по умолчанию: ${BOLD}cd $REPO && sudo git checkout $DEF_BR && sudo xm self-update${NC}"
+      else
+        info "Ветка $BR — не $DEF_BR, но отставания от неё нет"
+      fi
+    fi
+
     LOCAL_SHA=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)
     REMOTE_SHA=$(git -C "$REPO" rev-parse --short "origin/$BR" 2>/dev/null)
     AHEAD=$(git -C "$REPO" rev-list --count "HEAD..origin/$BR" 2>/dev/null || echo 0)
@@ -5390,11 +5425,34 @@ self-update)
       ok "Чекаут уже на $REMOTE_SHA — новых коммитов нет"
     fi
 
-    # Установленный xm мог разойтись с репозиторием, даже когда коммитов нет:
-    # правили руками на сервере. Сравниваем по факту, а не по git.
+    # Установленный xm мог разойтись с чекаутом, даже когда новых коммитов нет.
+    # Сравнение с одним рабочим деревом говорит только «отличается», а причин у
+    # этого три: чекаут передвинули руками (git checkout/pull без self-update),
+    # xm ставили из другого клона или ветки, или файл правили на сервере.
+    # Раньше здесь печаталась третья как догадка, и в разборе она стала выводом
+    # «работал код, которого нет ни в одной ветке». Первые две от третьей
+    # отличает история: версия, которая была в каком-то коммите, находится по
+    # хешу содержимого среди всех веток. -m — чтобы не пропустить версию,
+    # впервые появившуюся в merge-коммите. В выдаче --find-object и коммиты,
+    # где версия появилась, и те, где её сменили; нужен самый ранний из
+    # первых — у него в дереве она и лежит.
     DIVERGED=false
-    [[ -f "$XM_BIN" ]] && ! cmp -s "$REPO/xm.sh" "$XM_BIN" && DIVERGED=true
-    $DIVERGED && warn "Установленный $XM_BIN отличается от xm.sh в репозитории (правили руками?)"
+    if [[ -f "$XM_BIN" ]] && ! cmp -s "$REPO/xm.sh" "$XM_BIN"; then
+      DIVERGED=true
+      XM_BLOB=$(git -C "$REPO" hash-object -- "$XM_BIN" 2>/dev/null)
+      XM_FROM=""
+      if [[ -n "$XM_BLOB" ]]; then
+        while read -r c; do
+          [[ "$(git -C "$REPO" rev-parse -q --verify "$c:xm.sh" 2>/dev/null)" == "$XM_BLOB" ]] && XM_FROM="$c"
+        done < <(git -C "$REPO" log --all -m --format='%h' --find-object="$XM_BLOB" -- xm.sh 2>/dev/null)
+      fi
+      if [[ -n "$XM_FROM" ]]; then
+        warn "Установленный $XM_BIN — не из текущего чекаута, а xm.sh из коммита $(git -C "$REPO" log -1 --format='%h (%ad, %s)' --date=short "$XM_FROM")"
+      else
+        warn "Установленный $XM_BIN не совпадает ни с одной версией xm.sh в истории $REPO — правили на сервере или ставили не из этого репозитория"
+        echo -e "      Что именно отличается: ${BOLD}diff $REPO/xm.sh $XM_BIN${NC}"
+      fi
+    fi
 
     if $SU_CHECK; then
       sep
@@ -5437,7 +5495,6 @@ self-update)
     fi
     ok "Синтаксис нового xm.sh в порядке"
 
-    OLD_V=$(grep -m1 -oE 'xm — Xray Manager Helper +v[0-9.]+' "$XM_BIN" 2>/dev/null | grep -oE 'v[0-9.]+' || echo "?")
     if [[ -f "$XM_BIN" ]]; then
       mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
       XM_BAK="$BACKUP_DIR/xm_$(date +%Y%m%d_%H%M%S).bak"
@@ -5453,8 +5510,10 @@ self-update)
     # процесса остаётся старый inode, он доигрывает себя целым.
     install -m 755 "$REPO/xm.sh" "${XM_BIN}.new" || { fail "Не записать ${XM_BIN}.new"; exit 1; }
     mv -f "${XM_BIN}.new" "$XM_BIN" || { fail "Не удалось заменить $XM_BIN"; rm -f "${XM_BIN}.new"; exit 1; }
-    NEW_V=$(grep -m1 -oE 'xm — Xray Manager Helper +v[0-9.]+' "$XM_BIN" 2>/dev/null | grep -oE 'v[0-9.]+' || echo "?")
-    ok "Установлен $XM_BIN  (${OLD_V} → ${NEW_V})"
+    # Версию не печатаем: строки с номером в файле нет, и оба grep'а годами
+    # возвращали «?». Коммит чекаута — признак, который действительно есть и
+    # по которому установленное однозначно сопоставляется с репозиторием.
+    ok "Установлен $XM_BIN (из $BR@$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null))"
 
     mkdir -p "$(dirname "$XM_SRC_FILE")"
     echo "$REPO" > "$XM_SRC_FILE"; chmod 644 "$XM_SRC_FILE"
