@@ -4287,13 +4287,24 @@ sni-scan)
         printf "  %-24s %8s %4s %7s %6s  ${RED}%s${NC}\n" "$h" "-" "-" "-" "-" "НЕДОСТУПЕН"; continue
       fi
 
+      # Имя резолвится один раз, пробы идут на адрес. С именем в -connect в
+      # каждую пробу входил резолв: колонка RTT мерила вместе с путём ещё и DNS
+      # (у массового имени кэш всегда тёплый — фора, которой у соседа нет), а
+      # сбой резолвинга засчитывался домену как потеря. В пути соединения REALITY
+      # резолва нет: nginx держит адрес dest valid=900s. Только IPv4 — как у
+      # nginx (ipv6=off).
+      HIP=$(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u | head -1)
+      if [[ -z "$HIP" ]]; then
+        printf "  %-24s %8s %4s %7s %6s  ${RED}%s${NC}\n" "$h" "$EST" "-" "-" "-" "НЕ РЕЗОЛВИТСЯ"; continue
+      fi
+
       # Несколько хендшейков вместо одного. Домен, который рвёт каждое второе
       # соединение, на единственной удачной попытке выглядел безупречно —
       # ровно та картина, из-за которой нестабильный dest и уезжал в конфиг.
       OK_N=0; RTT_SUM=0; H2=нет; T13=нет
       for _ in $(seq 1 "$SNI_PROBES"); do
         T0=$(date +%s%N)
-        HS=$(echo | timeout "$SNI_PROBE_TIMEOUT" openssl s_client -connect "$h:443" -servername "$h" \
+        HS=$(echo | timeout "$SNI_PROBE_TIMEOUT" openssl s_client -connect "$HIP:443" -servername "$h" \
              -tls1_3 -alpn h2 2>/dev/null)
         T1=$(date +%s%N)
         [[ -z "$HS" ]] && continue
