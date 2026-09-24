@@ -419,8 +419,11 @@ fi
 header "Параметры"
 
 # www.microsoft.com исключён навсегда: cert+OCSP ~9 КБ при буфере REALITY
-# ~8192 б — хендшейк рвётся молча. Порядок не важен, ниже живой замер.
-SNI_POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net www.apple.com)
+# ~8192 б — хендшейк рвётся молча. Имён Apple тоже нет: с v26.3.23 Xray сам
+# предупреждает, что apple/icloud в роли маски (с v26.7.28 — ещё microsoft и
+# зоны .ru/.ir/.cn) повышают шанс блокировки IP. Порядок не важен, ниже живой
+# замер.
+SNI_POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net)
 DEST_SNI="$SNI_ARG"
 declare -a SNI_OK=()
 

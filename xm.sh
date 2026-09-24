@@ -200,6 +200,26 @@ _xray_latest_ver() {
     | jq -r '.tag_name // empty'
 }
 
+# Версия установленного Xray-core числом x.y.z; пусто — не определилась.
+_xray_ver() { xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -1; }
+
+# _ver_ge <a> <b> — версия a не младше b.
+_ver_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$2" ]]; }
+
+# Предупреждения REALITY, которые Xray печатает при разборе конфига: с v26.3.23
+# он сам называет маски и порты, повышающие шанс блокировки IP. Список берём у
+# него, а не копируем сюда: XTLS расширяет его от релиза к релизу, и копия
+# отставала бы молча. Остальные команды проверяют конфиг через grep -q
+# "Configuration OK", и до владельца эти строки не доходили. По строке на
+# предупреждение, без повторов: у двух inbound с одной маской они совпадают.
+# Код 1 — конфиг не прошёл xray -test: «предупреждений нет» тогда не вывод.
+_xray_reality_warnings() {
+  local out
+  out=$(xray -test -config "$CONFIG" 2>&1)
+  grep -q "Configuration OK" <<< "$out" || return 1
+  grep -F '[Warning]' <<< "$out" | grep -oE 'REALITY: .*' | sort -u
+}
+
 # Бэкап config.json. Каталог 700, файл 600: внутри приватный ключ REALITY,
 # а cp по умолчанию создал бы 644 — ключ стал бы читаем любому пользователю
 # системы. Печатает путь к бэкапу.
@@ -2171,6 +2191,10 @@ set-sni)
       systemctl restart xray; sleep 1
       if systemctl is-active --quiet xray; then
         ok "Xray перезапущен с новым SNI"
+        # Маску Xray принимает и из своего списка риска — только предупреждает.
+        while IFS= read -r l; do
+          warn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: sudo xm sni-scan"
+        done < <(_xray_reality_warnings | grep 'Choosing')
       else
         fail "Xray не поднялся — откат config"
         cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
@@ -3435,6 +3459,31 @@ dpi|diag-dpi)
       fi
     fi
 
+    # A3 — что о маске говорит сам Xray (см. _xray_reality_warnings). Порт ≠443
+    # из того же вывода здесь не считаем: его оценивает B8 с учётом UFW, а Xray
+    # о файрволе не знает и ругается и на закрытый порт. Остальное печатаем его
+    # же словами: о предупреждении, которого мы не знаем, судить не нам.
+    echo -e "\n  ${BOLD}A3. Домен-маска глазами самого Xray${NC}"
+    XR_VER=$(_xray_ver)
+    if [[ -n "$XR_VER" ]] && ! _ver_ge "$XR_VER" "26.3.23"; then
+      info "Xray $XR_VER таких предупреждений ещё не печатает (появились в v26.3.23). Обновить: ${BOLD}sudo xm update${NC}"
+    elif ! XR_ALL=$(_xray_reality_warnings); then
+      dwarn "xray -test не проходит — что Xray думает о маске, не прочитать. Смотри: ${BOLD}sudo xm test${NC}"
+    else
+      XR_WARN=$(grep -v 'non-443' <<< "$XR_ALL")
+      if [[ -z "$XR_WARN" ]]; then
+        ok "Xray не предупреждает ни о маске, ни о других параметрах REALITY"
+      else
+        while IFS= read -r l; do
+          if [[ "$l" == *Choosing* ]]; then
+            dwarn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: ${BOLD}sudo xm sni-scan --local${NC} или ${BOLD}sudo xm sni-scan${NC}"
+          else
+            dwarn "Xray предупреждает: «${l#REALITY: }»"
+          fi
+        done <<< "$XR_WARN"
+      fi
+    fi
+
 # ══ B. Активное зондирование ═════════════════════════════════════════════════
     sep
     echo -e "${BOLD}B. Активное зондирование (что видит сканер на нашем порту)${NC}"
@@ -4198,8 +4247,12 @@ sni-scan)
     # REALITY ~8192 б (замерено, см. setup.sh), то есть вердикт «НЕ ГОДИТСЯ»
     # известен заранее. Держать его здесь значило тратить SNI_PROBES
     # хендшейков с таймаутом на кандидата, который не может победить.
-    POOL=(www.apple.com swcdn.apple.com dl.google.com
-          cdn.jsdelivr.net www.cloudflare.com)
+    #
+    # Имён Apple нет по той же логике: с v26.3.23 Xray сам предупреждает, что
+    # apple/icloud в роли маски (с v26.7.28 — ещё microsoft и зоны .ru/.ir/.cn)
+    # повышают шанс блокировки IP. Выигрыш на замере такого не оправдывает, а
+    # заданную руками маску из этого списка покажет diag-dpi, блок A3.
+    POOL=(dl.google.com cdn.jsdelivr.net www.cloudflare.com)
 
     # --local [CIDR] — искать соседей в своей сети вместо глобального пула.
     # Любой домен отсюда мисматча ASN не даёт вовсе, тогда как весь пул выше
