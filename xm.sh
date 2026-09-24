@@ -2814,6 +2814,21 @@ update)
       exit 0
     fi
 
+    # REALITY с Xray v26.9.8 принимает только ClientHello с X25519MLKEM768 перед
+    # X25519 (XTLS/REALITY 8cdf7bf). Для остальных клиентов это не ошибка, а
+    # таймаут: сервер уводит их в fallback как зонд, и в логе остаётся лишь
+    # «processed invalid connection». Проверено на v26.9.9: sing-box 1.14.2,
+    # ядро Xray v25.4.30 и fp=edge/ios не проходят, chrome от v25.7.26 проходит.
+    # Сказать надо до обновления, пока клиенты ещё работают.
+    UPD_NEW=$(_xray_latest_ver | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+    UPD_CUR=$(_xray_ver)
+    if [[ -n "$UPD_NEW" && -n "$UPD_CUR" ]] && ! _ver_ge "$UPD_CUR" "26.9.8" && _ver_ge "$UPD_NEW" "26.9.8"; then
+      warn "Xray $UPD_NEW пускает только клиентов, чей ClientHello несёт X25519MLKEM768. Перестанут подключаться:"
+      warn "  REALITY-клиенты на ядре sing-box (Hiddify, NekoBox), ядра Xray старше v25.7.26,"
+      warn "  fp кроме chrome (firefox и safari — только на ядре клиента от v26.3.27)."
+      warn "У них будет таймаут без ошибки. Сначала обнови или смени клиентов, потом ядро."
+    fi
+
     echo ""
     read -rp "Обновить Xray-core? Сервис будет перезапущен. [y/N]: " UPD_CONFIRM
     [[ "$UPD_CONFIRM" =~ ^[Yy]$ ]] || { info "Отменено."; exit 0; }
@@ -3737,12 +3752,19 @@ dpi|diag-dpi)
     info "XHTTP mode: $XMODE | path: $XPATH"
     [[ "$XPATH" == "/" || -z "$XPATH" ]] && dwarn "path = «/» — слишком голо, возьми путь похожий на статику/API реального сайта"
 
+    # Годится ClientHello нынешнего браузера — с ключом X25519MLKEM768 перед
+    # X25519. Только такой принимает REALITY с Xray v26.9.8 (XTLS/REALITY
+    # 8cdf7bf), остальных он уводит в fallback как зонд: клиент видит сертификат
+    # настоящего сайта и таймаут. В ядре клиента ключ есть у chrome с v25.7.26,
+    # у firefox и safari — с v26.3.27 (раньше это Firefox 120 и Safari 16).
+    # Прочие пресеты — браузеры пятилетней давности (edge = Edge 85, ios =
+    # iOS 14, android = OkHttp) или случайные (random, randomized: могут объявить
+    # X25519MLKEM768 и не прислать ключ). Проверено дампом ClientHello.
     FP=$(_get_fp)
     case "$FP" in
-      chrome|edge) ok "uTLS fingerprint: $FP — самый массовый фон" ;;
-      randomized)  ok "uTLS fingerprint: randomized — вариативный" ;;
-      firefox)     info "uTLS fingerprint: firefox — валиден, но реже в фоне" ;;
-      *)           dwarn "uTLS fingerprint: $FP — проверь, что клиент его реально поддерживает" ;;
+      chrome)         ok "uTLS fingerprint: chrome — Chrome 133 с X25519MLKEM768 (в ядре клиента от v25.7.26)" ;;
+      firefox|safari) ok "uTLS fingerprint: $FP — с X25519MLKEM768 только в ядре клиента от v26.3.27; на ядре старше это браузер 2022–2023 года без него" ;;
+      *)              dwarn "uTLS fingerprint: $FP — ClientHello без X25519MLKEM768 или случайный: так не выглядит ни один нынешний браузер, а REALITY с Xray v26.9.8 его не пускает. Выдай клиентам chrome: строка FINGERPRINT в $CLIENT_FILE, затем ${BOLD}xm qr${NC}" ;;
     esac
 
 # ══ E. DNS ═══════════════════════════════════════════════════════════════════
