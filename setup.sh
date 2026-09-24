@@ -348,7 +348,9 @@ _selftest_vless() {
   cpid=$!
   sleep 2
   # Без `|| echo "000"`: curl и сам печатает 000, получалось бы "000000".
-  code=$(curl -s -x "socks5h://127.0.0.1:${sport}" --max-time 15 -o /dev/null \
+  # --noproxy '': NO_PROXY из окружения curl применяет и к явному -x, и имя из
+  # этого списка пошло бы в обход тоннеля — зелёный код без единого хендшейка.
+  code=$(curl -s --noproxy '' -x "socks5h://127.0.0.1:${sport}" --max-time 15 -o /dev/null \
          -w '%{http_code}' https://api.ipify.org 2>/dev/null) || true
   code=${code:-000}
   kill "$cpid" 2>/dev/null || true

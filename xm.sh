@@ -492,10 +492,12 @@ _tunnel_down() {
   TUN_PID=""; TUN_CFG=""; TUN_LOG=""
 }
 
-# HTTP-код запроса через поднятый тоннель (пустой URL → проверка выхода в сеть)
+# HTTP-код запроса через поднятый тоннель (пустой URL → проверка выхода в сеть).
+# --noproxy '': NO_PROXY из окружения curl применяет и к явному -x — имя из
+# этого списка ушло бы мимо тоннеля и вернуло 200 без единого хендшейка.
 _tunnel_code() {
   local url="${1:-https://api.ipify.org}" code
-  code=$(curl -s -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time 15 -o /dev/null \
+  code=$(curl -s --noproxy '' -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time 15 -o /dev/null \
          -w '%{http_code}' "$url" 2>/dev/null) || true
   echo "${code:-000}"
 }
