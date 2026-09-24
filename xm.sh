@@ -2602,6 +2602,11 @@ add-tcp)
 
     XHTTP_PORT_CURRENT=$(jq -r '.inbounds[0].port' "$CONFIG")
 
+    # 443 уже у XHTTP, значит этот inbound встанет на другой порт.
+    warn "REALITY не на 443 Xray сам помечает как повышающий шанс блокировки IP — заводи, только если есть клиенты без XHTTP."
+    warn "REALITY-клиент sing-box (Hiddify, NekoBox) шлёт ClientHello без X25519MLKEM768: с Xray v26.9.8 не пройдёт и сюда."
+    echo ""
+
     while true; do
       read -rp "Порт для TCP inbound [Enter=8443]: " PORT2_INPUT
       PORT2=${PORT2_INPUT:-8443}
