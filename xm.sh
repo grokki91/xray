@@ -220,6 +220,25 @@ _xray_reality_warnings() {
   grep -F '[Warning]' <<< "$out" | grep -oE 'REALITY: .*' | sort -u
 }
 
+# Маски, которые Xray с v26.7.28 сам помечает при разборе конфига как
+# повышающие шанс блокировки IP (infra/conf/transport_security.go, XTLS/Xray-core
+# PR #6508): зоны .ru/.ir/.cn и имена с apple/icloud/microsoft. Имя из
+# национальной зоны на зарубежном адресе — мисматч, который цензор своей страны
+# проверяет дёшево, и такие IP блокируют пачками; соседство по ASN от этого не
+# спасает. Стабильный релиз список может ещё не знать: на сентябрь 2026 это
+# v26.3.27 — только apple/icloud, всё новее выходит как pre-release. Поэтому
+# здесь нижняя граница, а не замена _xray_reality_warnings: то, что XTLS
+# добавит позже, придёт оттуда.
+# Печатает причину; код 1 — имя не помечено.
+_mask_risky_name() {
+  local n="${1,,}"
+  case "$n" in
+    *.ru|*.ir|*.cn)               echo "зона .${n##*.}" ;;
+    *apple*|*icloud*|*microsoft*) echo "apple/icloud/microsoft в имени" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Бэкап config.json. Каталог 700, файл 600: внутри приватный ключ REALITY,
 # а cp по умолчанию создал бы 644 — ключ стал бы читаем любому пользователю
 # системы. Печатает путь к бэкапу.
@@ -806,8 +825,12 @@ _ngx_http80_fix() {
 
   # 2. Server: значение берём с ЖИВОГО домена-маски, не выдумываем. Если строка
   # уже есть, но домен сменился — обновляем, иначе останется имя чужого сайта.
+  # Эталон — его :80, как у сканера и у теста B7 в diag-dpi: :443 домена может
+  # обслуживать другой сервер со своим Server, и тогда заголовок, снятый с
+  # https, B7 признавал чужим, а повторный harden — уже верным. https — только
+  # если :80 у домена не ответил.
   if grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null; then
-    for scheme in https http; do
+    for scheme in http https; do
       srv=$(curl -sI --max-time 8 "${scheme}://${sni}/" 2>/dev/null \
             | grep -im1 '^server:' | tr -d '\r' | sed 's/^[Ss]erver:[[:space:]]*//')
       [[ -n "$srv" ]] && break
@@ -2114,6 +2137,15 @@ set-sni)
       read -rp "Домен рискованный/недоступен. Всё равно применить? [y/N]: " C
       [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено, ничего не изменено."; exit 1; }
     fi
+    # Список риска самого Xray спрашиваем ДО смены, а не только печатаем после:
+    # после неё все выданные URI уже мертвы, и «возьми другую» стоило бы второго
+    # перевыпуска. Установленный Xray может этот список ещё не знать.
+    NEW_FLAG=""
+    if NEW_FLAG=$(_mask_risky_name "$NEW_SNI"); then
+      warn "Xray с v26.7.28 помечает такую маску (${NEW_FLAG}) как повышающую шанс блокировки IP — установленная версия может об этом ещё молчать"
+      read -rp "Всё равно применить? [y/N]: " C
+      [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено, ничего не изменено."; exit 1; }
+    fi
 
     # Бэкапы для отката: config.json + nginx-conf
     STAMP=$(date +%Y%m%d_%H%M%S)
@@ -2192,9 +2224,12 @@ set-sni)
       if systemctl is-active --quiet xray; then
         ok "Xray перезапущен с новым SNI"
         # Маску Xray принимает и из своего списка риска — только предупреждает.
-        while IFS= read -r l; do
-          warn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: sudo xm sni-scan"
-        done < <(_xray_reality_warnings | grep 'Choosing')
+        # Уже спрошенное выше по нижней границе списка второй раз не печатаем.
+        if [[ -z "$NEW_FLAG" ]]; then
+          while IFS= read -r l; do
+            warn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: sudo xm sni-scan"
+          done < <(_xray_reality_warnings | grep 'Choosing')
+        fi
       else
         fail "Xray не поднялся — откат config"
         cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
@@ -3484,24 +3519,32 @@ dpi|diag-dpi)
     # о файрволе не знает и ругается и на закрытый порт. Остальное печатаем его
     # же словами: о предупреждении, которого мы не знаем, судить не нам.
     echo -e "\n  ${BOLD}A3. Домен-маска глазами самого Xray${NC}"
-    XR_VER=$(_xray_ver)
+    XR_VER=$(_xray_ver); XR_ALL=""; XR_WARN=""; XR_READ=0; XR_CHOOSING=0
     if [[ -n "$XR_VER" ]] && ! _ver_ge "$XR_VER" "26.3.23"; then
       info "Xray $XR_VER таких предупреждений ещё не печатает (появились в v26.3.23). Обновить: ${BOLD}sudo xm update${NC}"
     elif ! XR_ALL=$(_xray_reality_warnings); then
       dwarn "xray -test не проходит — что Xray думает о маске, не прочитать. Смотри: ${BOLD}sudo xm test${NC}"
     else
+      XR_READ=1
       XR_WARN=$(grep -v 'non-443' <<< "$XR_ALL")
-      if [[ -z "$XR_WARN" ]]; then
-        ok "Xray не предупреждает ни о маске, ни о других параметрах REALITY"
-      else
-        while IFS= read -r l; do
-          if [[ "$l" == *Choosing* ]]; then
-            dwarn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: ${BOLD}sudo xm sni-scan --local${NC} или ${BOLD}sudo xm sni-scan${NC}"
-          else
-            dwarn "Xray предупреждает: «${l#REALITY: }»"
-          fi
-        done <<< "$XR_WARN"
-      fi
+      while IFS= read -r l; do
+        [[ -z "$l" ]] && continue
+        if [[ "$l" == *Choosing* ]]; then
+          XR_CHOOSING=1
+          dwarn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: ${BOLD}sudo xm sni-scan --local${NC} или ${BOLD}sudo xm sni-scan${NC}"
+        else
+          dwarn "Xray предупреждает: «${l#REALITY: }»"
+        fi
+      done <<< "$XR_WARN"
+    fi
+    # Молчание установленной сборки — не вердикт: её список масок может быть
+    # старше актуального (см. _mask_risky_name).
+    if [[ "$XR_CHOOSING" -eq 0 ]] && XR_FLAG=$(_mask_risky_name "$SNI"); then
+      dwarn "Маску $SNI (${XR_FLAG}) Xray с v26.7.28 помечает как повышающую шанс блокировки IP, установленный ${XR_VER:-Xray} об этом ещё молчит. Другая: ${BOLD}sudo xm sni-scan --local${NC} или ${BOLD}sudo xm sni-scan${NC}"
+    elif [[ "$XR_READ" -eq 1 && -z "$XR_WARN" ]]; then
+      [[ -n "$XR_ALL" ]] \
+        && ok "О маске Xray не предупреждает. Его предупреждение о порте ≠443 — в B8: там оно с учётом UFW, которого Xray не видит" \
+        || ok "Xray не предупреждает ни о маске, ни о других параметрах REALITY"
     fi
 
 # ══ B. Активное зондирование ═════════════════════════════════════════════════
@@ -4369,6 +4412,7 @@ sni-scan)
     printf "  %-24s %8s %4s %7s %6s  %s\n" "домен" "cert,б" "h2" "RTT,мс" "проб" "вердикт"
     BEST=""; BEST_RTT=999999; BEST_EST=0; BEST_FAIL=999
     BEST_PQ=""; BEST_PQ_RTT=999999; BEST_PQ_EST=0; BEST_PQ_FAIL=999
+    FLAG_N=0
     for h in "${POOL[@]}"; do
       EST=$(_check_cert_size "$h")
       if [[ "$EST" == "-1" ]]; then
@@ -4392,8 +4436,11 @@ sni-scan)
       OK_N=0; RTT_SUM=0; H2=нет; T13=нет
       for _ in $(seq 1 "$SNI_PROBES"); do
         T0=$(date +%s%N)
+        # С h2 сервер сразу шлёт двоичный кадр SETTINGS, и s_client печатает его
+        # в stdout. NUL из подстановки bash выкидывает сам, но с предупреждением
+        # на каждую такую пробу; нужны только текстовые строки сессии.
         HS=$(echo | timeout "$SNI_PROBE_TIMEOUT" openssl s_client -connect "$HIP:443" -servername "$h" \
-             -tls1_3 -alpn h2 2>/dev/null)
+             -tls1_3 -alpn h2 2>/dev/null | tr -d '\0')
         T1=$(date +%s%N)
         [[ -z "$HS" ]] && continue
         OK_N=$((OK_N + 1)); RTT_SUM=$(( RTT_SUM + (T1 - T0) / 1000000 ))
@@ -4415,6 +4462,12 @@ sni-scan)
         V="ГОДИТСЯ +PQ"; PQ=1
       fi
       [[ "$H2" != "да" || "$T13" != "да" ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; ELIG=0; PQ=0; }
+      # Годный по замеру домен из списка риска самого Xray (см. _mask_risky_name)
+      # в таблице остаётся — это данные, — но в выбор не идёт: зона .ru на
+      # зарубежном адресе стоит IP, а не пары миллисекунд.
+      if [[ "$ELIG" -eq 1 ]] && FLAG=$(_mask_risky_name "$h"); then
+        V="РИСК IP ($FLAG)"; C="$YELLOW"; ELIG=0; PQ=0; FLAG_N=$((FLAG_N + 1))
+      fi
       FAIL_N=$(( SNI_PROBES - OK_N ))
       [[ "$FAIL_N" -gt 0 ]] && { V="$V, РВЁТ"; C="$YELLOW"; }
 
@@ -4458,11 +4511,16 @@ sni-scan)
       ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES})"
       info "Сертификата от ${REALITY_CERT_PQ_MIN} б, в запись которого влезает подпись ML-DSA, нет ни у кого — xm pq останется недоступен"
       [[ "$BEST" != "$CUR" ]] && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST${NC}"
+    elif [[ "$FLAG_N" -gt 0 ]]; then
+      fail "Замер прошли только кандидаты из списка риска Xray — рекомендовать некого"
+      [[ "$LOCAL_MODE" -eq 1 ]] && info "Останься на глобальной маске: ${BOLD}sudo xm sni-scan${NC}"
     elif [[ "$LOCAL_MODE" -eq 1 ]]; then
       fail "Ни один сосед не прошёл замер — возьми диапазон шире (весь анонс хостера) или оставь глобальный домен"
     else
       fail "Ни один кандидат не прошёл — расширь POOL в xm.sh"
     fi
+    [[ "$FLAG_N" -gt 0 ]] \
+      && info "РИСК IP — имя из списка, который Xray с v26.7.28 помечает сам (зоны .ru/.ir/.cn, apple/icloud/microsoft). Национальную зону на зарубежном адресе цензор сверяет дёшево, такие IP блокируют пачками. Установленный Xray может этого ещё не знать"
     if [[ "$LOCAL_MODE" -eq 1 ]]; then
       info "Смысл соседа — в отсутствии мисматча ASN, а не в RTT. Но малонагруженный сайт, к которому наш адрес стучится круглосуточно, — своя аномалия: выбирай тот, что похож на живой сервис."
     else

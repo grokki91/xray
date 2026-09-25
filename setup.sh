@@ -203,8 +203,10 @@ _sni_probe() {
   o=0; printf '%s' "$raw" | grep -qi "OCSP Response Data" && o=1600 || true
   total=$(( b*3/4 + o + 10 + n*6 ))
 
+  # С h2 сервер сразу шлёт двоичный SETTINGS — NUL из него bash выкидывает с
+  # предупреждением на каждый домен; нужны только текстовые строки сессии.
   h13=$(echo | timeout 8 openssl s_client -connect "${host}:443" -servername "$host" \
-        -tls1_3 -alpn h2 2>/dev/null) || h13=""
+        -tls1_3 -alpn h2 2>/dev/null | tr -d '\0') || h13=""
   tls13="нет"; alpn2="нет"; x25519="нет"
   printf '%s' "$h13" | grep -q  "TLSv1.3"                      && tls13="да"   || true
   printf '%s' "$h13" | grep -qi "ALPN protocol: h2"            && alpn2="да"   || true
@@ -278,6 +280,20 @@ _ip_in_cidr() {
   IFS=. read -r a b c d <<< "$base"; basen=$(( (a << 24) | (b << 16) | (c << 8) | d ))
   mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
   (( (ipn & mask) == (basen & mask) ))
+}
+
+# Маски, которые Xray с v26.7.28 сам помечает как повышающие шанс блокировки IP
+# (XTLS/Xray-core PR #6508): зоны .ru/.ir/.cn и apple/icloud/microsoft в имени.
+# Национальную зону на зарубежном адресе цензор сверяет дёшево, и соседство по
+# ASN от этого не спасает. Стабильный Xray список может ещё не знать — отсюда
+# копия. Печатает причину; код 1 — имя не помечено.
+_mask_risky_name() {
+  local n="${1,,}"
+  case "$n" in
+    *.ru|*.ir|*.cn)               echo "зона .${n##*.}" ;;
+    *apple*|*icloud*|*microsoft*) echo "apple/icloud/microsoft в имени" ;;
+    *) return 1 ;;
+  esac
 }
 
 # _rts_candidates <cidr> <свой-ip> [лимит] → имена доменов по одному в строке.
@@ -479,6 +495,7 @@ if [[ -z "$DEST_SNI" ]]; then
   printf "  %-22s %8s %6s %5s %7s %7s  %s\n" "домен" "cert,б" "OCSP" "h2" "TLS1.3" "RTT,мс" "вердикт"
 
   declare -a SNI_OK_LOCAL=()
+  SNI_FLAGGED=0
   for h in "${SNI_POOL[@]}"; do
     IS_LOCAL=0
     for l in ${SNI_LOCAL[@]+"${SNI_LOCAL[@]}"}; do [[ "$l" == "$h" ]] && { IS_LOCAL=1; break; }; done
@@ -496,6 +513,11 @@ if [[ -z "$DEST_SNI" ]]; then
     # RTT платится на каждом входящем: REALITY ходит к dest всегда.
     [[ "$P_RTT" -gt 150 && "$V" == "ГОДИТСЯ" ]] && { V="МЕДЛЕННЫЙ"; C="$YELLOW"; }
     [[ -n "$P_REDIR" && "$V" == "ГОДИТСЯ" ]] && { V="РЕДИРЕКТ→$P_REDIR"; C="$YELLOW"; }
+    # Соседа из списка риска Xray не берём даже первым: мисматча ASN он не даёт,
+    # но сам повод блокировать IP.
+    if [[ "$V" == "ГОДИТСЯ" ]] && P_FLAG=$(_mask_risky_name "$h"); then
+      V="РИСК IP ($P_FLAG)"; C="$YELLOW"; SNI_FLAGGED=$((SNI_FLAGGED + 1))
+    fi
     VP="$V"; [[ "$IS_LOCAL" -eq 1 ]] && VP="$V · СВОЙ ASN"
     printf "  %-22s %8s %6s %5s %7s %7s  ${C}%s${NC}\n" \
       "$h" "$P_CERT" "$([[ ${P_OCSP:-0} -gt 0 ]] && echo да || echo нет)" \
@@ -506,6 +528,8 @@ if [[ -z "$DEST_SNI" ]]; then
     fi
   done
   echo ""
+  [[ "$SNI_FLAGGED" -gt 0 ]] \
+    && info "РИСК IP — имя из списка, который Xray с v26.7.28 помечает сам: такие маски не выбираются" || true
 
   # Сосед по своей сети выигрывает у любого CDN: запас до лимита REALITY —
   # вопрос пары килобайт, а мисматч ASN проверяется одним сравнением. Внутри
@@ -810,9 +834,11 @@ chown -R www-data:www-data /var/www/fallback
 # --- :80 → 301 -----------------------------------------------------------
 # Заголовок Server снимаем с живого домена-маски: server_tokens off убирает
 # только версию, слово nginx остаётся, и :80 выдаёт себя одним curl -I.
+# Эталон — :80 домена, с ним сравнивают сканер и тест B7; https — только если
+# :80 не ответил (у :443 бывает свой сервер со своим Server).
 # Каждый шаг гасится явно: под pipefail пустой grep уронил бы установку.
 DEST_SRV=""
-for scheme in https http; do
+for scheme in http https; do
   DEST_SRV=$( { curl -sI --max-time 8 "${scheme}://${DEST_SNI}/" 2>/dev/null || true; } \
              | { grep -im1 '^server:' || true; } | tr -d '\r' \
              | sed 's/^[Ss]erver:[[:space:]]*//') || DEST_SRV=""
