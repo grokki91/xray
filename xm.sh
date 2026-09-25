@@ -200,6 +200,26 @@ _xray_latest_ver() {
     | jq -r '.tag_name // empty'
 }
 
+# Версия установленного Xray-core числом x.y.z; пусто — не определилась.
+_xray_ver() { xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -1; }
+
+# _ver_ge <a> <b> — версия a не младше b.
+_ver_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$2" ]]; }
+
+# Предупреждения REALITY, которые Xray печатает при разборе конфига: с v26.3.23
+# он сам называет маски и порты, повышающие шанс блокировки IP. Список берём у
+# него, а не копируем сюда: XTLS расширяет его от релиза к релизу, и копия
+# отставала бы молча. Остальные команды проверяют конфиг через grep -q
+# "Configuration OK", и до владельца эти строки не доходили. По строке на
+# предупреждение, без повторов: у двух inbound с одной маской они совпадают.
+# Код 1 — конфиг не прошёл xray -test: «предупреждений нет» тогда не вывод.
+_xray_reality_warnings() {
+  local out
+  out=$(xray -test -config "$CONFIG" 2>&1)
+  grep -q "Configuration OK" <<< "$out" || return 1
+  grep -F '[Warning]' <<< "$out" | grep -oE 'REALITY: .*' | sort -u
+}
+
 # Бэкап config.json. Каталог 700, файл 600: внутри приватный ключ REALITY,
 # а cp по умолчанию создал бы 644 — ключ стал бы читаем любому пользователю
 # системы. Печатает путь к бэкапу.
@@ -492,10 +512,12 @@ _tunnel_down() {
   TUN_PID=""; TUN_CFG=""; TUN_LOG=""
 }
 
-# HTTP-код запроса через поднятый тоннель (пустой URL → проверка выхода в сеть)
+# HTTP-код запроса через поднятый тоннель (пустой URL → проверка выхода в сеть).
+# --noproxy '': NO_PROXY из окружения curl применяет и к явному -x — имя из
+# этого списка ушло бы мимо тоннеля и вернуло 200 без единого хендшейка.
 _tunnel_code() {
   local url="${1:-https://api.ipify.org}" code
-  code=$(curl -s -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time 15 -o /dev/null \
+  code=$(curl -s --noproxy '' -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time 15 -o /dev/null \
          -w '%{http_code}' "$url" 2>/dev/null) || true
   echo "${code:-000}"
 }
@@ -2169,6 +2191,10 @@ set-sni)
       systemctl restart xray; sleep 1
       if systemctl is-active --quiet xray; then
         ok "Xray перезапущен с новым SNI"
+        # Маску Xray принимает и из своего списка риска — только предупреждает.
+        while IFS= read -r l; do
+          warn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: sudo xm sni-scan"
+        done < <(_xray_reality_warnings | grep 'Choosing')
       else
         fail "Xray не поднялся — откат config"
         cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
@@ -2576,6 +2602,11 @@ add-tcp)
 
     XHTTP_PORT_CURRENT=$(jq -r '.inbounds[0].port' "$CONFIG")
 
+    # 443 уже у XHTTP, значит этот inbound встанет на другой порт.
+    warn "REALITY не на 443 Xray сам помечает как повышающий шанс блокировки IP — заводи, только если есть клиенты без XHTTP."
+    warn "REALITY-клиент sing-box (Hiddify, NekoBox) шлёт ClientHello без X25519MLKEM768: с Xray v26.9.8 не пройдёт и сюда."
+    echo ""
+
     while true; do
       read -rp "Порт для TCP inbound [Enter=8443]: " PORT2_INPUT
       PORT2=${PORT2_INPUT:-8443}
@@ -2786,6 +2817,21 @@ update)
         warn "Доступно обновление: $CUR_NUM → $NEW_NUM. Запусти: xm update"
       fi
       exit 0
+    fi
+
+    # REALITY с Xray v26.9.8 принимает только ClientHello с X25519MLKEM768 перед
+    # X25519 (XTLS/REALITY 8cdf7bf). Для остальных клиентов это не ошибка, а
+    # таймаут: сервер уводит их в fallback как зонд, и в логе остаётся лишь
+    # «processed invalid connection». Проверено на v26.9.9: sing-box 1.14.2,
+    # ядро Xray v25.4.30 и fp=edge/ios не проходят, chrome от v25.7.26 проходит.
+    # Сказать надо до обновления, пока клиенты ещё работают.
+    UPD_NEW=$(_xray_latest_ver | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+    UPD_CUR=$(_xray_ver)
+    if [[ -n "$UPD_NEW" && -n "$UPD_CUR" ]] && ! _ver_ge "$UPD_CUR" "26.9.8" && _ver_ge "$UPD_NEW" "26.9.8"; then
+      warn "Xray $UPD_NEW пускает только клиентов, чей ClientHello несёт X25519MLKEM768. Перестанут подключаться:"
+      warn "  REALITY-клиенты на ядре sing-box (Hiddify, NekoBox), ядра Xray старше v25.7.26,"
+      warn "  fp кроме chrome (firefox и safari — только на ядре клиента от v26.3.27)."
+      warn "У них будет таймаут без ошибки. Сначала обнови или смени клиентов, потом ядро."
     fi
 
     echo ""
@@ -3433,6 +3479,31 @@ dpi|diag-dpi)
       fi
     fi
 
+    # A3 — что о маске говорит сам Xray (см. _xray_reality_warnings). Порт ≠443
+    # из того же вывода здесь не считаем: его оценивает B8 с учётом UFW, а Xray
+    # о файрволе не знает и ругается и на закрытый порт. Остальное печатаем его
+    # же словами: о предупреждении, которого мы не знаем, судить не нам.
+    echo -e "\n  ${BOLD}A3. Домен-маска глазами самого Xray${NC}"
+    XR_VER=$(_xray_ver)
+    if [[ -n "$XR_VER" ]] && ! _ver_ge "$XR_VER" "26.3.23"; then
+      info "Xray $XR_VER таких предупреждений ещё не печатает (появились в v26.3.23). Обновить: ${BOLD}sudo xm update${NC}"
+    elif ! XR_ALL=$(_xray_reality_warnings); then
+      dwarn "xray -test не проходит — что Xray думает о маске, не прочитать. Смотри: ${BOLD}sudo xm test${NC}"
+    else
+      XR_WARN=$(grep -v 'non-443' <<< "$XR_ALL")
+      if [[ -z "$XR_WARN" ]]; then
+        ok "Xray не предупреждает ни о маске, ни о других параметрах REALITY"
+      else
+        while IFS= read -r l; do
+          if [[ "$l" == *Choosing* ]]; then
+            dwarn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: ${BOLD}sudo xm sni-scan --local${NC} или ${BOLD}sudo xm sni-scan${NC}"
+          else
+            dwarn "Xray предупреждает: «${l#REALITY: }»"
+          fi
+        done <<< "$XR_WARN"
+      fi
+    fi
+
 # ══ B. Активное зондирование ═════════════════════════════════════════════════
     sep
     echo -e "${BOLD}B. Активное зондирование (что видит сканер на нашем порту)${NC}"
@@ -3686,12 +3757,19 @@ dpi|diag-dpi)
     info "XHTTP mode: $XMODE | path: $XPATH"
     [[ "$XPATH" == "/" || -z "$XPATH" ]] && dwarn "path = «/» — слишком голо, возьми путь похожий на статику/API реального сайта"
 
+    # Годится ClientHello нынешнего браузера — с ключом X25519MLKEM768 перед
+    # X25519. Только такой принимает REALITY с Xray v26.9.8 (XTLS/REALITY
+    # 8cdf7bf), остальных он уводит в fallback как зонд: клиент видит сертификат
+    # настоящего сайта и таймаут. В ядре клиента ключ есть у chrome с v25.7.26,
+    # у firefox и safari — с v26.3.27 (раньше это Firefox 120 и Safari 16).
+    # Прочие пресеты — браузеры пятилетней давности (edge = Edge 85, ios =
+    # iOS 14, android = OkHttp) или случайные (random, randomized: могут объявить
+    # X25519MLKEM768 и не прислать ключ). Проверено дампом ClientHello.
     FP=$(_get_fp)
     case "$FP" in
-      chrome|edge) ok "uTLS fingerprint: $FP — самый массовый фон" ;;
-      randomized)  ok "uTLS fingerprint: randomized — вариативный" ;;
-      firefox)     info "uTLS fingerprint: firefox — валиден, но реже в фоне" ;;
-      *)           dwarn "uTLS fingerprint: $FP — проверь, что клиент его реально поддерживает" ;;
+      chrome)         ok "uTLS fingerprint: chrome — Chrome 133 с X25519MLKEM768 (в ядре клиента от v25.7.26)" ;;
+      firefox|safari) ok "uTLS fingerprint: $FP — с X25519MLKEM768 только в ядре клиента от v26.3.27; на ядре старше это браузер 2022–2023 года без него" ;;
+      *)              dwarn "uTLS fingerprint: $FP — ClientHello без X25519MLKEM768 или случайный: так не выглядит ни один нынешний браузер, а REALITY с Xray v26.9.8 его не пускает. Выдай клиентам chrome: строка FINGERPRINT в $CLIENT_FILE, затем ${BOLD}xm qr${NC}" ;;
     esac
 
 # ══ E. DNS ═══════════════════════════════════════════════════════════════════
@@ -4196,8 +4274,12 @@ sni-scan)
     # REALITY ~8192 б (замерено, см. setup.sh), то есть вердикт «НЕ ГОДИТСЯ»
     # известен заранее. Держать его здесь значило тратить SNI_PROBES
     # хендшейков с таймаутом на кандидата, который не может победить.
-    POOL=(www.apple.com swcdn.apple.com dl.google.com
-          cdn.jsdelivr.net www.cloudflare.com)
+    #
+    # Имён Apple нет по той же логике: с v26.3.23 Xray сам предупреждает, что
+    # apple/icloud в роли маски (с v26.7.28 — ещё microsoft и зоны .ru/.ir/.cn)
+    # повышают шанс блокировки IP. Выигрыш на замере такого не оправдывает, а
+    # заданную руками маску из этого списка покажет diag-dpi, блок A3.
+    POOL=(dl.google.com cdn.jsdelivr.net www.cloudflare.com)
 
     # --local [CIDR] — искать соседей в своей сети вместо глобального пула.
     # Любой домен отсюда мисматча ASN не даёт вовсе, тогда как весь пул выше

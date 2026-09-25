@@ -18,17 +18,19 @@ sudo bash setup.sh [опции]
   --sni <домен>   домен-маска (по умолчанию подбирается замером)
   --port <порт>   порт XHTTP (по умолчанию 443)
   --scan-local    искать маску среди соседей по своей сети (+1.5 мин)
-  --no-tcp        без второго inbound (XTLS-Vision/TCP)
+  --tcp           второй inbound XTLS-Vision/TCP на отдельном порту (не 443)
   --reinstall     переустановка: новые ключи, выданные URI умрут
 USAGE
 }
 
-SNI_ARG=""; PORT_ARG=""; SCAN_LOCAL=false; DUAL_INBOUND=true; REINSTALL=false
+SNI_ARG=""; PORT_ARG=""; SCAN_LOCAL=false; DUAL_INBOUND=false; REINSTALL=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --sni)   SNI_ARG="${2:-}";  [[ -n "$SNI_ARG"  ]] || error "--sni требует домен";  shift 2 ;;
     --port)  PORT_ARG="${2:-}"; [[ -n "$PORT_ARG" ]] || error "--port требует номер"; shift 2 ;;
     --scan-local) SCAN_LOCAL=true;    shift ;;
+    --tcp)        DUAL_INBOUND=true;  shift ;;
+    # Прежний флаг: второй inbound и так выключен по умолчанию.
     --no-tcp)     DUAL_INBOUND=false; shift ;;
     --reinstall)  REINSTALL=true;     shift ;;
     -h|--help)    usage; exit 0 ;;
@@ -348,7 +350,9 @@ _selftest_vless() {
   cpid=$!
   sleep 2
   # Без `|| echo "000"`: curl и сам печатает 000, получалось бы "000000".
-  code=$(curl -s -x "socks5h://127.0.0.1:${sport}" --max-time 15 -o /dev/null \
+  # --noproxy '': NO_PROXY из окружения curl применяет и к явному -x, и имя из
+  # этого списка пошло бы в обход тоннеля — зелёный код без единого хендшейка.
+  code=$(curl -s --noproxy '' -x "socks5h://127.0.0.1:${sport}" --max-time 15 -o /dev/null \
          -w '%{http_code}' https://api.ipify.org 2>/dev/null) || true
   code=${code:-000}
   kill "$cpid" 2>/dev/null || true
@@ -417,8 +421,11 @@ fi
 header "Параметры"
 
 # www.microsoft.com исключён навсегда: cert+OCSP ~9 КБ при буфере REALITY
-# ~8192 б — хендшейк рвётся молча. Порядок не важен, ниже живой замер.
-SNI_POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net www.apple.com)
+# ~8192 б — хендшейк рвётся молча. Имён Apple тоже нет: с v26.3.23 Xray сам
+# предупреждает, что apple/icloud в роли маски (с v26.7.28 — ещё microsoft и
+# зоны .ru/.ir/.cn) повышают шанс блокировки IP. Порядок не важен, ниже живой
+# замер.
+SNI_POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net)
 DEST_SNI="$SNI_ARG"
 declare -a SNI_OK=()
 
@@ -525,7 +532,7 @@ fi
 PATH_POOL=(/api/v2/assets/stream /video/hls/playlist.m3u8 /static/js/chunk-main.js
            /cdn-cgi/trace /download/update)
 XHTTP_PATH="${PATH_POOL[RANDOM % ${#PATH_POOL[@]}]}"
-XHTTP_MODE="auto"; SINGBOX_METHOD="GET"
+XHTTP_MODE="auto"
 UTLS_FP="chrome"
 
 XRAY_PORT="${PORT_ARG:-443}"
@@ -543,9 +550,12 @@ if _port_taken "$XRAY_PORT"; then
        Поделить 443 по SNI с соседней службой умеет sudo xm front on."
 fi
 
-# Второй inbound включён по умолчанию: XHTTP — транспорт Xray-core, клиенты на
-# ядре sing-box (Hiddify, NekoBox) могут его не поддерживать и молча отваливаться
-# по таймауту. XTLS-Vision понимают все, по устойчивости к DPI он не уступает.
+# Второй inbound — только по --tcp. 443 держит XHTTP, значит TCP/Vision встаёт
+# на другой порт, а REALITY не на 443 Xray с v26.3.23 сам помечает как
+# повышающий шанс блокировки IP. Заводился он ради клиентов на sing-box
+# (Hiddify, NekoBox), где нет XHTTP, но их REALITY-клиент вырезает
+# X25519MLKEM768 из отпечатка Chrome: такой ClientHello отличим от браузера, а
+# REALITY с Xray v26.9.8 его не принимает вовсе. Добавить позже: xm add-tcp.
 XRAY_PORT2=8443
 if $DUAL_INBOUND; then
   # 10443 занят локальным REALITY fallback.
@@ -553,6 +563,7 @@ if $DUAL_INBOUND; then
      || _port_taken "$XRAY_PORT2"; do
     XRAY_PORT2=$((XRAY_PORT2 + 1))
   done
+  warn "TCP/Vision на порту ${XRAY_PORT2}: REALITY не на 443 заметнее для сканера — держи, только если есть клиенты без XHTTP"
 fi
 
 PORTS_INFO="$XRAY_PORT"
@@ -1441,26 +1452,11 @@ VLESS URI (XHTTP):
 ${VLESS_URI_XHTTP}
 
 ───────────────────────────────────────────────────────
-sing-box JSON (XHTTP)
-XHTTP — транспорт Xray-core: клиенты на ядре sing-box
-(Hiddify, NekoBox) могут его не поддерживать — подключение
-висит и отваливается по таймауту. Для них — профиль
-TCP/XTLS-Vision ниже.
+Клиент — на ядре Xray-core не старше v26.3.27 (v2rayN,
+v2rayNG, Happ и др.). REALITY-клиент sing-box (Hiddify,
+NekoBox) шлёт ClientHello без X25519MLKEM768: он отличим
+от браузера, а REALITY с Xray v26.9.8 такой не принимает.
 ───────────────────────────────────────────────────────
-{
-  "type": "vless", "tag": "proxy-xhttp",
-  "server": "${SERVER_IP}", "server_port": ${XRAY_PORT},
-  "uuid": "${USER_UUID}",
-  "tls": {
-    "enabled": true, "server_name": "${DEST_SNI}",
-    "utls": { "enabled": true, "fingerprint": "${UTLS_FP}" },
-    "reality": { "enabled": true, "public_key": "${PUBLIC_KEY}", "short_id": "${SHORT_ID_1}" }
-  },
-  "transport": {
-    "type": "xhttp", "path": "${XHTTP_PATH}",
-    "host": "${DEST_SNI}", "method": "${SINGBOX_METHOD}", "mode": "${XHTTP_MODE}"
-  }
-}
 ${TCP_SECTION}
 
 ───────────────────────────────────────────────────────
