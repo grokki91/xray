@@ -107,12 +107,24 @@ _fetch_server_ip() {
 }
 
 # =============================================================================
-# Оценка размера TLS Certificate у dest. В ряде версий Xray буфер приёма
-# Certificate ~8192 б: большая цепочка или OCSP-staple рвут REALITY-хендшейк
-# молча, хотя curl к сайту отвечает 200. Печатает байты или -1 (недоступен).
+# Оценка размера TLS Certificate у dest. Запись Certificate длиннее буфера
+# REALITY рвёт хендшейк молча, хотя curl к сайту отвечает 200. Буфер — по
+# исходнику REALITY (tls.go): до Xray v26.9.8 — 8192 б, с v26.9.8 — 17 KiB;
+# подробно — _cert_limits в xm.sh. Маска подбирается до установки Xray, а
+# ставится всегда последний релиз, поэтому до шага 5 пороги — для v26.9.8+,
+# после установки (шаг 7) — по факту. Печатает байты или -1 (недоступен).
 # =============================================================================
-REALITY_CERT_WARN=7000     # запас до лимита; между warn и limit — риск на части версий
-REALITY_CERT_LIMIT=8192    # захардкоженный буфер REALITY в ряде версий Xray-core
+REALITY_CERT_WARN=16384    # больше одной записи TLS — как порежет dest, не угадать
+REALITY_CERT_LIMIT=17408   # буфер записи target у REALITY с v26.9.8
+_cert_limits() {
+  local v
+  v=$(xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -1) || v=""
+  if [[ -n "$v" && "$(printf '%s\n%s\n' "$v" 26.9.8 | sort -V | head -1)" == "26.9.8" ]]; then
+    REALITY_CERT_WARN=16384; REALITY_CERT_LIMIT=17408
+  else
+    REALITY_CERT_WARN=7000;  REALITY_CERT_LIMIT=8192
+  fi
+}
 
 # =============================================================================
 # DoH на сервере + перехват :53 из тоннеля: без dns-блока Xray резолвит
@@ -420,11 +432,10 @@ fi
 # =============================================================================
 header "Параметры"
 
-# www.microsoft.com исключён навсегда: cert+OCSP ~9 КБ при буфере REALITY
-# ~8192 б — хендшейк рвётся молча. Имён Apple тоже нет: с v26.3.23 Xray сам
-# предупреждает, что apple/icloud в роли маски (с v26.7.28 — ещё microsoft и
-# зоны .ru/.ir/.cn) повышают шанс блокировки IP. Порядок не важен, ниже живой
-# замер.
+# Имён Apple и Microsoft нет: с v26.3.23 Xray сам предупреждает, что
+# apple/icloud в роли маски (с v26.7.28 — ещё microsoft и зоны .ru/.ir/.cn)
+# повышают шанс блокировки IP. У www.microsoft.com вдобавок cert+OCSP ~9 КБ —
+# больше буфера REALITY до Xray v26.9.8. Порядок не важен, ниже живой замер.
 SNI_POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net)
 DEST_SNI="$SNI_ARG"
 declare -a SNI_OK=()
@@ -688,7 +699,9 @@ HTTP_CODE=$(curl -svo /dev/null "https://${DEST_SNI}" \
   || warn "dest ${DEST_SNI} отвечает HTTP $HTTP_CODE — проверь, что домен живой"
 
 # Решает TLS: не собрался хендшейк — REALITY форвардит зонды в никуда, и сервер
-# виден как прокси первым же сканом. Размер сертификата — второй барьер.
+# виден как прокси первым же сканом. Размер сертификата — второй барьер, и
+# теперь по порогу той версии Xray, что встала на шаге 5.
+_cert_limits
 CERT_EST=$(_check_cert_size "$DEST_SNI")
 if [[ "$CERT_EST" == "-1" ]]; then
   error "TLS-хендшейк с ${DEST_SNI}:443 не собрался — доменом-маской он быть не может.
@@ -983,8 +996,12 @@ B=$(printf '%s\n' "$R" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' \
     | grep -vE 'BEGIN|END' | tr -d '\n' | wc -c); B=${B:-0}
 O=0; printf '%s' "$R" | grep -qi "OCSP Response Data" && O=1600
 T=$((B*3/4+O+10+N*6))
-if [[ "$T" -ge 7000 ]]; then
-  echo "$(date -Is) $H: Certificate ~${T} б при лимите 8192 — смени домен: xm sni-scan" > "$FLAG"
+# Порог — по версии Xray на момент проверки (буфер REALITY: 8192 б, с v26.9.8 — 17 KiB).
+V=$(xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+W=7000; L=8192
+[[ -n "$V" && "$(printf '%s\n%s\n' "$V" 26.9.8 | sort -V | head -1)" == "26.9.8" ]] && { W=16384; L=17408; }
+if [[ "$T" -ge "$W" ]]; then
+  echo "$(date -Is) $H: Certificate ~${T} б при лимите ${L} — смени домен: xm sni-scan" > "$FLAG"
 else
   rm -f "$FLAG"
 fi
@@ -1131,7 +1148,12 @@ jq -n \
       domainStrategy: "IPIfNonMatch",
       # geoip:cn/ir здесь нет: `ip` в routing — адрес назначения, а не
       # источника, и правило применяется уже после аутентификации.
+      # geoip:ru — наоборот, именно назначение: российский сервис, обязанный
+      # с 15.04.2026 искать VPN, увидел бы адрес сервера (xm.sh, RU_RULE).
+      # По адресу, а не geosite:category-ru: там вся зона .ru, включая
+      # заблокированные в РФ сайты, ради которых VPN и нужен.
       rules: [
+        { type: "field", ip: ["geoip:ru"], outboundTag: "block", ruleTag: "xm-ru" },
         { type: "field", ip: ["geoip:private"], outboundTag: "block" },
         { type: "field", protocol: ["bittorrent"], outboundTag: "block" }
       ]
