@@ -76,6 +76,11 @@ te-st.org.
 
 Проверено по исходникам тегов, если не сказано иное.
 
+- **Стабильный (Latest) — v26.3.27**: всё после него, v26.5.3…v26.9.30, выходит как
+  pre-release. `install-release.sh` (setup.sh, `xm update`) без `--beta` ставит Latest — то есть
+  по умолчанию сервер на v26.3.27, и пороги, умолчания и проверки ниже, помеченные версией
+  новее, на нём не действуют. — github.com/XTLS/Xray-core/releases (2026-10-06).
+
 - **v25.7.26** — пресет chrome шлёт X25519MLKEM768. — стенд владельца, коммит e6955c8.
 - **v25.9.5** — VLESS Encryption (ML-KEM-768) в стабильном релизе. — XTLS PR #5067.
 - **v26.3.27** — firefox/safari с X25519MLKEM768 (раньше это Firefox 120 и Safari 16);
@@ -90,7 +95,7 @@ te-st.org.
 - **v26.9.8** — REALITY 8cdf7bf: ClientHello без X25519MLKEM768 перед X25519 уходит в fallback
   (у клиента таймаут, в логе «processed invalid connection»); `minClientVer` по умолчанию снят;
   буфер записи target 8192 → 17 408 б (393f8de, предок 8cdf7bf).
-- **v26.9.30** — последний релиз на дату проверки; REALITY та же (8cdf7bf);
+- **v26.9.30** — последний pre-release на дату проверки; REALITY та же (8cdf7bf);
   `nonIPQuery`/`blockTypes` dns-outbound ещё принимаются, но устарели → `rules`, смешивать нельзя.
   В `main` после него (по 2026-10-05) — WireGuard, XDNS finalmask, Mux, gRPC; REALITY и XHTTP
   не тронуты. — git log v26.9.30..main.
@@ -124,6 +129,10 @@ te-st.org.
   ≥ v26.3.27. v2rayN (Windows, macOS), v2rayNG (Android), Happ (iOS, macOS) — при свежем ядре.
 - Не проходят до своих патчей: sing-box (Hiddify, NekoBox, Karing) — sing-box#4520,
   Karing#1952; mihomo — отказ уже с v26.7.11. Проверять конкретную версию клиента.
+- Hiddify 4.1.1 (2026-03-05, последний на 2026-10-06): ядро — свой форк sing-box, XHTTP с
+  4.0.5. Со стабильным сервером v26.3.27 по XHTTP работает (замер владельца, 2026-10). Пускает
+  ли его REALITY ≥ v26.9.8, не проверено: до проверки сервер на pre-release не переводить. —
+  github.com/hiddify/hiddify-app/releases; apkmirror, «What's new in Hiddify 4.0.5».
 - Пресеты edge, ios, android, randomized и подобные — без X25519MLKEM768 или не браузерные:
   REALITY ≥ v26.9.8 их не пускает.
 - Ядро клиента v26.9.8+ несёт открытую #6797: при зависающих хендшейках клиент плодит
