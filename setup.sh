@@ -107,12 +107,26 @@ _fetch_server_ip() {
 }
 
 # =============================================================================
-# Оценка размера TLS Certificate у dest. В ряде версий Xray буфер приёма
-# Certificate ~8192 б: большая цепочка или OCSP-staple рвут REALITY-хендшейк
-# молча, хотя curl к сайту отвечает 200. Печатает байты или -1 (недоступен).
+# Оценка размера TLS Certificate у dest. Запись Certificate длиннее буфера
+# REALITY рвёт хендшейк молча, хотя curl к сайту отвечает 200. Буфер — по
+# исходнику REALITY (tls.go): до Xray v26.9.8 — 8192 б, с v26.9.8 — 17 KiB;
+# подробно — _cert_limits в xm.sh. Маска подбирается до установки Xray, а
+# install-release.sh без --beta ставит стабильный релиз (Latest), и все версии
+# с 17 KiB — pre-release. Поэтому до шага 5 пороги — 8192/7000: соседа на 8–16
+# КБ шаг 7 на стабильном ядре всё равно отверг бы, уже после установки Xray.
+# После установки (шаг 7) — по факту. Печатает байты или -1 (недоступен).
 # =============================================================================
-REALITY_CERT_WARN=7000     # запас до лимита; между warn и limit — риск на части версий
-REALITY_CERT_LIMIT=8192    # захардкоженный буфер REALITY в ряде версий Xray-core
+REALITY_CERT_WARN=7000     # запас до лимита; между warn и limit — риск
+REALITY_CERT_LIMIT=8192    # буфер записи target у REALITY до v26.9.8
+_cert_limits() {
+  local v
+  v=$(xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -1) || v=""
+  if [[ -n "$v" && "$(printf '%s\n%s\n' "$v" 26.9.8 | sort -V | head -1)" == "26.9.8" ]]; then
+    REALITY_CERT_WARN=16384; REALITY_CERT_LIMIT=17408
+  else
+    REALITY_CERT_WARN=7000;  REALITY_CERT_LIMIT=8192
+  fi
+}
 
 # =============================================================================
 # DoH на сервере + перехват :53 из тоннеля: без dns-блока Xray резолвит
@@ -203,8 +217,10 @@ _sni_probe() {
   o=0; printf '%s' "$raw" | grep -qi "OCSP Response Data" && o=1600 || true
   total=$(( b*3/4 + o + 10 + n*6 ))
 
+  # С h2 сервер сразу шлёт двоичный SETTINGS — NUL из него bash выкидывает с
+  # предупреждением на каждый домен; нужны только текстовые строки сессии.
   h13=$(echo | timeout 8 openssl s_client -connect "${host}:443" -servername "$host" \
-        -tls1_3 -alpn h2 2>/dev/null) || h13=""
+        -tls1_3 -alpn h2 2>/dev/null | tr -d '\0') || h13=""
   tls13="нет"; alpn2="нет"; x25519="нет"
   printf '%s' "$h13" | grep -q  "TLSv1.3"                      && tls13="да"   || true
   printf '%s' "$h13" | grep -qi "ALPN protocol: h2"            && alpn2="да"   || true
@@ -278,6 +294,20 @@ _ip_in_cidr() {
   IFS=. read -r a b c d <<< "$base"; basen=$(( (a << 24) | (b << 16) | (c << 8) | d ))
   mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
   (( (ipn & mask) == (basen & mask) ))
+}
+
+# Маски, которые Xray с v26.7.28 сам помечает как повышающие шанс блокировки IP
+# (XTLS/Xray-core PR #6508): зоны .ru/.ir/.cn и apple/icloud/microsoft в имени.
+# Национальную зону на зарубежном адресе цензор сверяет дёшево, и соседство по
+# ASN от этого не спасает. Стабильный Xray список может ещё не знать — отсюда
+# копия. Печатает причину; код 1 — имя не помечено.
+_mask_risky_name() {
+  local n="${1,,}"
+  case "$n" in
+    *.ru|*.ir|*.cn)               echo "зона .${n##*.}" ;;
+    *apple*|*icloud*|*microsoft*) echo "apple/icloud/microsoft в имени" ;;
+    *) return 1 ;;
+  esac
 }
 
 # _rts_candidates <cidr> <свой-ip> [лимит] → имена доменов по одному в строке.
@@ -420,11 +450,10 @@ fi
 # =============================================================================
 header "Параметры"
 
-# www.microsoft.com исключён навсегда: cert+OCSP ~9 КБ при буфере REALITY
-# ~8192 б — хендшейк рвётся молча. Имён Apple тоже нет: с v26.3.23 Xray сам
-# предупреждает, что apple/icloud в роли маски (с v26.7.28 — ещё microsoft и
-# зоны .ru/.ir/.cn) повышают шанс блокировки IP. Порядок не важен, ниже живой
-# замер.
+# Имён Apple и Microsoft нет: с v26.3.23 Xray сам предупреждает, что
+# apple/icloud в роли маски (с v26.7.28 — ещё microsoft и зоны .ru/.ir/.cn)
+# повышают шанс блокировки IP. У www.microsoft.com вдобавок cert+OCSP ~9 КБ —
+# больше буфера REALITY до Xray v26.9.8. Порядок не важен, ниже живой замер.
 SNI_POOL=(www.cloudflare.com dl.google.com cdn.jsdelivr.net)
 DEST_SNI="$SNI_ARG"
 declare -a SNI_OK=()
@@ -479,6 +508,7 @@ if [[ -z "$DEST_SNI" ]]; then
   printf "  %-22s %8s %6s %5s %7s %7s  %s\n" "домен" "cert,б" "OCSP" "h2" "TLS1.3" "RTT,мс" "вердикт"
 
   declare -a SNI_OK_LOCAL=()
+  SNI_FLAGGED=0
   for h in "${SNI_POOL[@]}"; do
     IS_LOCAL=0
     for l in ${SNI_LOCAL[@]+"${SNI_LOCAL[@]}"}; do [[ "$l" == "$h" ]] && { IS_LOCAL=1; break; }; done
@@ -496,6 +526,11 @@ if [[ -z "$DEST_SNI" ]]; then
     # RTT платится на каждом входящем: REALITY ходит к dest всегда.
     [[ "$P_RTT" -gt 150 && "$V" == "ГОДИТСЯ" ]] && { V="МЕДЛЕННЫЙ"; C="$YELLOW"; }
     [[ -n "$P_REDIR" && "$V" == "ГОДИТСЯ" ]] && { V="РЕДИРЕКТ→$P_REDIR"; C="$YELLOW"; }
+    # Соседа из списка риска Xray не берём даже первым: мисматча ASN он не даёт,
+    # но сам повод блокировать IP.
+    if [[ "$V" == "ГОДИТСЯ" ]] && P_FLAG=$(_mask_risky_name "$h"); then
+      V="РИСК IP ($P_FLAG)"; C="$YELLOW"; SNI_FLAGGED=$((SNI_FLAGGED + 1))
+    fi
     VP="$V"; [[ "$IS_LOCAL" -eq 1 ]] && VP="$V · СВОЙ ASN"
     printf "  %-22s %8s %6s %5s %7s %7s  ${C}%s${NC}\n" \
       "$h" "$P_CERT" "$([[ ${P_OCSP:-0} -gt 0 ]] && echo да || echo нет)" \
@@ -506,6 +541,8 @@ if [[ -z "$DEST_SNI" ]]; then
     fi
   done
   echo ""
+  [[ "$SNI_FLAGGED" -gt 0 ]] \
+    && info "РИСК IP — имя из списка, который Xray с v26.7.28 помечает сам: такие маски не выбираются" || true
 
   # Сосед по своей сети выигрывает у любого CDN: запас до лимита REALITY —
   # вопрос пары килобайт, а мисматч ASN проверяется одним сравнением. Внутри
@@ -688,7 +725,9 @@ HTTP_CODE=$(curl -svo /dev/null "https://${DEST_SNI}" \
   || warn "dest ${DEST_SNI} отвечает HTTP $HTTP_CODE — проверь, что домен живой"
 
 # Решает TLS: не собрался хендшейк — REALITY форвардит зонды в никуда, и сервер
-# виден как прокси первым же сканом. Размер сертификата — второй барьер.
+# виден как прокси первым же сканом. Размер сертификата — второй барьер, и
+# теперь по порогу той версии Xray, что встала на шаге 5.
+_cert_limits
 CERT_EST=$(_check_cert_size "$DEST_SNI")
 if [[ "$CERT_EST" == "-1" ]]; then
   error "TLS-хендшейк с ${DEST_SNI}:443 не собрался — доменом-маской он быть не может.
@@ -810,9 +849,11 @@ chown -R www-data:www-data /var/www/fallback
 # --- :80 → 301 -----------------------------------------------------------
 # Заголовок Server снимаем с живого домена-маски: server_tokens off убирает
 # только версию, слово nginx остаётся, и :80 выдаёт себя одним curl -I.
+# Эталон — :80 домена, с ним сравнивают сканер и тест B7; https — только если
+# :80 не ответил (у :443 бывает свой сервер со своим Server).
 # Каждый шаг гасится явно: под pipefail пустой grep уронил бы установку.
 DEST_SRV=""
-for scheme in https http; do
+for scheme in http https; do
   DEST_SRV=$( { curl -sI --max-time 8 "${scheme}://${DEST_SNI}/" 2>/dev/null || true; } \
              | { grep -im1 '^server:' || true; } | tr -d '\r' \
              | sed 's/^[Ss]erver:[[:space:]]*//') || DEST_SRV=""
@@ -983,8 +1024,12 @@ B=$(printf '%s\n' "$R" | sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' \
     | grep -vE 'BEGIN|END' | tr -d '\n' | wc -c); B=${B:-0}
 O=0; printf '%s' "$R" | grep -qi "OCSP Response Data" && O=1600
 T=$((B*3/4+O+10+N*6))
-if [[ "$T" -ge 7000 ]]; then
-  echo "$(date -Is) $H: Certificate ~${T} б при лимите 8192 — смени домен: xm sni-scan" > "$FLAG"
+# Порог — по версии Xray на момент проверки (буфер REALITY: 8192 б, с v26.9.8 — 17 KiB).
+V=$(xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+W=7000; L=8192
+[[ -n "$V" && "$(printf '%s\n%s\n' "$V" 26.9.8 | sort -V | head -1)" == "26.9.8" ]] && { W=16384; L=17408; }
+if [[ "$T" -ge "$W" ]]; then
+  echo "$(date -Is) $H: Certificate ~${T} б при лимите ${L} — смени домен: xm sni-scan" > "$FLAG"
 else
   rm -f "$FLAG"
 fi
@@ -1131,7 +1176,12 @@ jq -n \
       domainStrategy: "IPIfNonMatch",
       # geoip:cn/ir здесь нет: `ip` в routing — адрес назначения, а не
       # источника, и правило применяется уже после аутентификации.
+      # geoip:ru — наоборот, именно назначение: российский сервис, обязанный
+      # с 15.04.2026 искать VPN, увидел бы адрес сервера (xm.sh, RU_RULE).
+      # По адресу, а не geosite:category-ru: там вся зона .ru, включая
+      # заблокированные в РФ сайты, ради которых VPN и нужен.
       rules: [
+        { type: "field", ip: ["geoip:ru"], outboundTag: "block", ruleTag: "xm-ru" },
         { type: "field", ip: ["geoip:private"], outboundTag: "block" },
         { type: "field", protocol: ["bittorrent"], outboundTag: "block" }
       ]

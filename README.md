@@ -47,6 +47,8 @@ xm help          # остальные команды
 [Happ](https://apps.apple.com/app/happ-proxy-utility/id6504287215) (iOS, macOS).
 sing-box (Hiddify, NekoBox) не подходит: его REALITY-клиент шлёт ClientHello без
 X25519MLKEM768, а Xray с v26.9.8 такой не принимает.
+Российские адреса в клиенте — напрямую (`geoip:ru` → direct): через тоннель сервер их не
+пропускает, чтобы российские сервисы не видели его адрес (`xm harden --ru`).
 
 ## Файлы
 

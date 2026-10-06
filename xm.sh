@@ -21,7 +21,9 @@ XM_BIN="/usr/local/bin/xm"
 # каждый раз вспоминать, куда именно был сделан clone.
 XM_SRC_FILE="/usr/local/etc/xray/xm-source"
 
-# Пороги размера TLS Certificate для совместимости с REALITY (см. setup.sh)
+# Пороги размера TLS Certificate для совместимости с REALITY. Зависят от версии
+# Xray на сервере и выставляются _cert_limits; здесь — на случай, когда версия
+# не определилась.
 REALITY_CERT_WARN=7000
 REALITY_CERT_LIMIT=8192
 
@@ -206,6 +208,22 @@ _xray_ver() { xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' 
 # _ver_ge <a> <b> — версия a не младше b.
 _ver_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$2" ]]; }
 
+# Пороги размера Certificate у dest — из исходника REALITY той версии, что на
+# сервере. Буфер записи target (tls.go, size) до Xray v26.9.8 — 8192 б, с
+# v26.9.8 — 17 KiB (XTLS/REALITY 393f8de, входит в 8cdf7bf): запись длиннее
+# буфера рвёт хендшейк. 17 KiB больше любой записи TLS (2^14 + 256), поэтому
+# предупреждение — с 16384: такой Certificate в одну запись уже не влезает, и
+# как его порежет dest, заранее не сказать. Версия не определилась — старые
+# пороги: лишний отказ дешевле маски, на которой хендшейк рвётся молча.
+_cert_limits() {
+  local v; v=$(_xray_ver)
+  if [[ -n "$v" ]] && _ver_ge "$v" "26.9.8"; then
+    REALITY_CERT_WARN=16384; REALITY_CERT_LIMIT=17408
+  else
+    REALITY_CERT_WARN=7000;  REALITY_CERT_LIMIT=8192
+  fi
+}
+
 # Предупреждения REALITY, которые Xray печатает при разборе конфига: с v26.3.23
 # он сам называет маски и порты, повышающие шанс блокировки IP. Список берём у
 # него, а не копируем сюда: XTLS расширяет его от релиза к релизу, и копия
@@ -218,6 +236,25 @@ _xray_reality_warnings() {
   out=$(xray -test -config "$CONFIG" 2>&1)
   grep -q "Configuration OK" <<< "$out" || return 1
   grep -F '[Warning]' <<< "$out" | grep -oE 'REALITY: .*' | sort -u
+}
+
+# Маски, которые Xray с v26.7.28 сам помечает при разборе конфига как
+# повышающие шанс блокировки IP (infra/conf/transport_security.go, XTLS/Xray-core
+# PR #6508): зоны .ru/.ir/.cn и имена с apple/icloud/microsoft. Имя из
+# национальной зоны на зарубежном адресе — мисматч, который цензор своей страны
+# проверяет дёшево, и такие IP блокируют пачками; соседство по ASN от этого не
+# спасает. Стабильный релиз список может ещё не знать: на сентябрь 2026 это
+# v26.3.27 — только apple/icloud, всё новее выходит как pre-release. Поэтому
+# здесь нижняя граница, а не замена _xray_reality_warnings: то, что XTLS
+# добавит позже, придёт оттуда.
+# Печатает причину; код 1 — имя не помечено.
+_mask_risky_name() {
+  local n="${1,,}"
+  case "$n" in
+    *.ru|*.ir|*.cn)               echo "зона .${n##*.}" ;;
+    *apple*|*icloud*|*microsoft*) echo "apple/icloud/microsoft в имени" ;;
+    *) return 1 ;;
+  esac
 }
 
 # Бэкап config.json. Каталог 700, файл 600: внутри приватный ключ REALITY,
@@ -647,7 +684,7 @@ _harden_patch() {
 _harden_unpatch() {
   jq '  del(.dns)
       | .outbounds = [ .outbounds[]? | select(.protocol != "dns") ]
-      | .routing.rules = [ .routing.rules[]? | select(.outboundTag != "dns-out") ]
+      | .routing.rules = [ .routing.rules[]? | select(.outboundTag != "dns-out" and .ruleTag? != "xm-ru") ]
   ' "$CONFIG"
 }
 
@@ -697,6 +734,134 @@ _nonip_try() {
      && xray -test -config "$tmp" 2>&1 | grep -q "Configuration OK"; then rc=0; fi
   rm -f "$tmp"
   return $rc
+}
+
+# ─── Российские адреса из тоннеля ────────────────────────────────────────────
+#
+# С 15.04.2026 крупные российские сервисы обязаны выявлять VPN у пользователей и
+# помогать РКН находить VPN, о которых он ещё не знает (методика Минцифры). Всё,
+# что клиент отправит такому сервису через тоннель, приходит туда с адреса этого
+# сервера — и адрес попадает в списки, а бан IP правкой конфига уже не лечится.
+# Российские адреса клиент обязан вести напрямую (раздельная маршрутизация);
+# правило здесь — страховка на случай, когда он этого не делает: приложение без
+# раздельной маршрутизации, чужое приложение через открытый локальный SOCKS.
+#
+# По адресу (geoip:ru), а не по домену: geosite:category-ru включает всю зону
+# .ru, а с ней и заблокированные в РФ сайты на .ru, живущие за рубежом, — ради
+# них VPN и нужен. Домен до адреса доводит routing.domainStrategy IPIfNonMatch
+# (резолвинг идёт нашим же DoH). Ответ — blackhole: соединение закрывается
+# сразу, клиент не ждёт таймаута. Правило опознаётся по ruleTag, а не по месту.
+RU_RULE='{"type":"field","ip":["geoip:ru"],"outboundTag":"block","ruleTag":"xm-ru"}'
+# Адрес для проверки routing: Яндекс.DNS, в geoip:ru обеих баз (XTLS и
+# Loyalsoldier). Наружу проверка не ходит — см. _ru_probe.
+RU_PROBE_IP="77.88.8.8"
+
+_ru_on() {
+  jq -e '[.routing.rules[]? | select(.ruleTag? == "xm-ru")] | length > 0' "$CONFIG" >/dev/null 2>&1
+}
+
+# _ru_patch on|off → конфиг на stdout. Правило встаёт сразу за перехватом :53:
+# запрос о российском имени должен получить ответ — клиенту нужен адрес, чтобы
+# пойти напрямую, — а правило ниже чужих маршрутов «direct» их бы не перекрыло.
+_ru_patch() {
+  jq --arg m "$1" --argjson r "$RU_RULE" '
+    .routing.rules = ([ .routing.rules[]? | select(.ruleTag? != "xm-ru") ]
+      | if $m != "on" then .
+        else (first(range(length) as $i | select(.[$i].outboundTag? == "dns-out") | $i) // -1) as $d
+             | .[:$d + 1] + [$r] + .[$d + 1:]
+        end)
+  ' "$CONFIG"
+}
+
+# Куда routing этого конфига отправит TCP-соединение на $1:$2: block | pass | ERR.
+# Отдельный экземпляр Xray с теми же routing, dns, outbounds и geodata, только
+# freedom перенаправлен (redirect) на локальный приёмник: пропущенное соединение
+# приходит в приёмник, а не уходит к адресу. Иначе проверка того, что адрес
+# сервера не достаётся российскому сервису, сама бы его туда и отправила.
+_ru_probe() {
+  local cfg sp kp pid r
+  cfg=$(mktemp /tmp/xm-route.XXXXXX.json) || { echo ERR; return 0; }
+  sp=$(( 20000 + RANDOM % 10000 )); kp=$(( 30000 + RANDOM % 10000 ))
+  if ! jq --argjson sp "$sp" --arg kp "127.0.0.1:$kp" '{
+        log: { loglevel: "none" },
+        dns: (.dns // {}),
+        inbounds: [ { listen: "127.0.0.1", port: $sp, protocol: "socks" } ],
+        outbounds: [ .outbounds[] | if .protocol == "freedom"
+                       then .settings = ((.settings // {}) + { redirect: $kp }) else . end ],
+        routing: (.routing // {})
+      }' "$CONFIG" > "$cfg" 2>/dev/null; then
+    rm -f "$cfg"; echo ERR; return 0
+  fi
+  xray run -c "$cfg" >/dev/null 2>&1 &
+  pid=$!
+  r=$(python3 - "$sp" "$kp" "$1" "$2" <<'PY' 2>/dev/null
+import socket, struct, sys, time
+sp, kp, host, port = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+try:
+    sink = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sink.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sink.bind(("127.0.0.1", kp)); sink.listen(4); sink.settimeout(2)
+    # Xray читает geoip.dat при старте — ждём сокет, а не фиксированную паузу.
+    s, end = None, time.time() + 8
+    while s is None:
+        try:
+            s = socket.create_connection(("127.0.0.1", sp), 3)
+        except OSError:
+            if time.time() > end:
+                raise
+            time.sleep(0.2)
+    s.settimeout(3)
+    s.sendall(b"\x05\x01\x00")
+    if s.recv(2) != b"\x05\x00":
+        print("ERR"); sys.exit()
+    s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(host) + struct.pack(">H", port))
+    rep = s.recv(10)
+    if len(rep) < 2 or rep[1] != 0:
+        print("block"); sys.exit()
+    try:
+        s.sendall(b"\x16\x03\x01\x00\x00")
+    except Exception:
+        pass
+    try:
+        sink.accept()[0].close(); print("pass")
+    except socket.timeout:
+        print("block")
+except Exception:
+    print("ERR")
+PY
+)
+  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  rm -f "$cfg"
+  echo "${r:-ERR}"
+}
+
+# Вердикт для harden и diag-dpi: правило в конфиге, routing доводит до него
+# домены, и routing этого конфига закрывает российский адрес, пропуская
+# контрольный. Печатает через переданные функции (ok/warn или ok/dwarn).
+# Код 1 — правила нет или оно не действует; не подтвердилось — 0 со строкой info.
+# _ru_report <ok-функция> <warn-функция>
+_ru_report() {
+  local okf="$1" wf="$2" ds ctl rr
+  if ! _ru_on; then
+    "$wf" "Российские адреса выходят из тоннеля с IP сервера: сервисы, обязанные с 15.04.2026 выявлять VPN, видят его и помогают РКН. Клиенту — раздельная маршрутизация (geoip:ru напрямую), серверу — страховка: ${BOLD}sudo xm harden --ru on${NC}"
+    return 1
+  fi
+  ds=$(jq -r '.routing.domainStrategy // "AsIs"' "$CONFIG" 2>/dev/null)
+  case "$ds" in
+    IPIfNonMatch|IPOnDemand) ;;
+    *) "$wf" "routing.domainStrategy=${ds}: правило по адресу не видит соединений, пришедших доменом (а со sniffing это почти все). Нужен IPIfNonMatch: ${BOLD}sudo xm edit${NC}" ;;
+  esac
+  ctl=$(_ru_probe 1.1.1.1 443)
+  rr=$(_ru_probe "$RU_PROBE_IP" 443)
+  if [[ "$ctl" != "pass" ]]; then
+    info "Проверка routing не отработала (контрольный адрес: ${ctl}) — правило geoip:ru в конфиге есть, эффект не подтверждён"
+  elif [[ "$rr" == "block" ]]; then
+    "$okf" "Российские адреса из тоннеля не выпускаются (geoip:ru → block; проверено routing этого конфига, без обращения к адресу)"
+  else
+    "$wf" "Правило geoip:ru в конфиге есть, но соединение на российский адрес routing пропускает — его перехватывает правило выше или в geoip.dat нет ru. Смотри: ${BOLD}sudo xm edit${NC}, ${BOLD}sudo xm update-geo${NC}"
+    return 1
+  fi
+  return 0
 }
 
 # Переключение поведения nginx-fallback на чужой SNI.
@@ -806,8 +971,12 @@ _ngx_http80_fix() {
 
   # 2. Server: значение берём с ЖИВОГО домена-маски, не выдумываем. Если строка
   # уже есть, но домен сменился — обновляем, иначе останется имя чужого сайта.
+  # Эталон — его :80, как у сканера и у теста B7 в diag-dpi: :443 домена может
+  # обслуживать другой сервер со своим Server, и тогда заголовок, снятый с
+  # https, B7 признавал чужим, а повторный harden — уже верным. https — только
+  # если :80 у домена не ответил.
   if grep -rqs "headers_more" /usr/lib/nginx/modules/ /etc/nginx/modules-enabled/ 2>/dev/null; then
-    for scheme in https http; do
+    for scheme in http https; do
       srv=$(curl -sI --max-time 8 "${scheme}://${sni}/" 2>/dev/null \
             | grep -im1 '^server:' | tr -d '\r' | sed 's/^[Ss]erver:[[:space:]]*//')
       [[ -n "$srv" ]] && break
@@ -1822,7 +1991,7 @@ _apply() {
 }
 
 # Оценка размера TLS Certificate у SNI. Большая цепочка/OCSP staple переполняют
-# захардкоженный буфер REALITY (~8192 б) и рвут хендшейк, хотя curl отвечает 200.
+# буфер записи target у REALITY (_cert_limits) и рвут хендшейк, хотя curl отвечает 200.
 # Печатает верхнюю оценку размера записи в байтах, либо "-1" если сайт недоступен.
 _check_cert_size() {
   local host="$1"
@@ -1856,6 +2025,7 @@ _check_cert_size() {
 # Вердикт по домену через ok/warn/fail. 0 = годится/предупреждение, 1 = нет/недоступен
 _sni_cert_gate() {
   local host="$1" est
+  _cert_limits
   info "Проверка размера TLS-сертификата $host (совместимость с REALITY)..."
   est=$(_check_cert_size "$host")
   if [[ "$est" == "-1" ]]; then
@@ -1863,7 +2033,7 @@ _sni_cert_gate() {
   elif [[ "$est" -ge "$REALITY_CERT_LIMIT" ]]; then
     fail "Оценка Certificate ${est} б ≥ лимита REALITY (${REALITY_CERT_LIMIT} б) — REALITY-хендшейк будет рваться. Домен НЕ подходит."; return 1
   elif [[ "$est" -ge "$REALITY_CERT_WARN" ]]; then
-    warn "Оценка Certificate ${est} б — близко к лимиту (${REALITY_CERT_LIMIT} б). Риск на части версий Xray."; return 0
+    warn "Оценка Certificate ${est} б — близко к лимиту (${REALITY_CERT_LIMIT} б): оценка верхняя, но запаса нет. Проверка после смены: sudo xm selftest"; return 0
   else
     ok "Размер Certificate ~${est} б — с запасом ниже лимита REALITY (${REALITY_CERT_LIMIT} б)"; return 0
   fi
@@ -2114,6 +2284,15 @@ set-sni)
       read -rp "Домен рискованный/недоступен. Всё равно применить? [y/N]: " C
       [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено, ничего не изменено."; exit 1; }
     fi
+    # Список риска самого Xray спрашиваем ДО смены, а не только печатаем после:
+    # после неё все выданные URI уже мертвы, и «возьми другую» стоило бы второго
+    # перевыпуска. Установленный Xray может этот список ещё не знать.
+    NEW_FLAG=""
+    if NEW_FLAG=$(_mask_risky_name "$NEW_SNI"); then
+      warn "Xray с v26.7.28 помечает такую маску (${NEW_FLAG}) как повышающую шанс блокировки IP — установленная версия может об этом ещё молчать"
+      read -rp "Всё равно применить? [y/N]: " C
+      [[ "$C" =~ ^[Yy]$ ]] || { info "Отменено, ничего не изменено."; exit 1; }
+    fi
 
     # Бэкапы для отката: config.json + nginx-conf
     STAMP=$(date +%Y%m%d_%H%M%S)
@@ -2192,9 +2371,12 @@ set-sni)
       if systemctl is-active --quiet xray; then
         ok "Xray перезапущен с новым SNI"
         # Маску Xray принимает и из своего списка риска — только предупреждает.
-        while IFS= read -r l; do
-          warn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: sudo xm sni-scan"
-        done < <(_xray_reality_warnings | grep 'Choosing')
+        # Уже спрошенное выше по нижней границе списка второй раз не печатаем.
+        if [[ -z "$NEW_FLAG" ]]; then
+          while IFS= read -r l; do
+            warn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: sudo xm sni-scan"
+          done < <(_xray_reality_warnings | grep 'Choosing')
+        fi
       else
         fail "Xray не поднялся — откат config"
         cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
@@ -3139,8 +3321,17 @@ info)
     echo -e "${BOLD}NTP дрейф:${NC}"
     if [[ -f /var/lib/xray-sni-watch.flag ]]; then
       echo ""
-      warn "Watchdog домена-маски:"
-      sed 's/^/    /' /var/lib/xray-sni-watch.flag
+      # Скрипт ставит setup.sh, и на серверах, установленных до Xray v26.9.8,
+      # в нём старый порог 7000/8192 — self-update его не трогает. Размер из
+      # флага сверяем с порогом этой версии, чтобы не гнать менять годную маску.
+      _cert_limits
+      SW_T=$(grep -oE 'Certificate ~[0-9]+' /var/lib/xray-sni-watch.flag | grep -oE '[0-9]+$' | head -1)
+      if [[ -n "$SW_T" && "$SW_T" -lt "$REALITY_CERT_WARN" ]]; then
+        info "Watchdog домена-маски держит флаг по старому порогу своего скрипта: Certificate ~${SW_T} б, а у Xray $(_xray_ver) лимит ${REALITY_CERT_LIMIT} б — маска годится, флаг не про неё"
+      else
+        warn "Watchdog домена-маски:"
+        sed 's/^/    /' /var/lib/xray-sni-watch.flag
+      fi
     fi
     chronyc tracking 2>/dev/null | grep "System time" | sed 's/^/  /' || echo "  ?"
     ;;
@@ -3410,6 +3601,7 @@ for svc in xray nginx fail2ban chrony; do
 dpi|diag-dpi)
     [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm diag-dpi${NC}"; exit 1; }
     QUICK=false; [[ "${2:-}" == "--quick" ]] && QUICK=true
+    _cert_limits
 
     echo -e "\n${BOLD}${CYAN}[ Устойчивость к DPI и активному зондированию ]${NC}\n"
 
@@ -3484,24 +3676,32 @@ dpi|diag-dpi)
     # о файрволе не знает и ругается и на закрытый порт. Остальное печатаем его
     # же словами: о предупреждении, которого мы не знаем, судить не нам.
     echo -e "\n  ${BOLD}A3. Домен-маска глазами самого Xray${NC}"
-    XR_VER=$(_xray_ver)
+    XR_VER=$(_xray_ver); XR_ALL=""; XR_WARN=""; XR_READ=0; XR_CHOOSING=0
     if [[ -n "$XR_VER" ]] && ! _ver_ge "$XR_VER" "26.3.23"; then
       info "Xray $XR_VER таких предупреждений ещё не печатает (появились в v26.3.23). Обновить: ${BOLD}sudo xm update${NC}"
     elif ! XR_ALL=$(_xray_reality_warnings); then
       dwarn "xray -test не проходит — что Xray думает о маске, не прочитать. Смотри: ${BOLD}sudo xm test${NC}"
     else
+      XR_READ=1
       XR_WARN=$(grep -v 'non-443' <<< "$XR_ALL")
-      if [[ -z "$XR_WARN" ]]; then
-        ok "Xray не предупреждает ни о маске, ни о других параметрах REALITY"
-      else
-        while IFS= read -r l; do
-          if [[ "$l" == *Choosing* ]]; then
-            dwarn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: ${BOLD}sudo xm sni-scan --local${NC} или ${BOLD}sudo xm sni-scan${NC}"
-          else
-            dwarn "Xray предупреждает: «${l#REALITY: }»"
-          fi
-        done <<< "$XR_WARN"
-      fi
+      while IFS= read -r l; do
+        [[ -z "$l" ]] && continue
+        if [[ "$l" == *Choosing* ]]; then
+          XR_CHOOSING=1
+          dwarn "Xray помечает маску как повышающую шанс блокировки IP: «${l#REALITY: }». Другая: ${BOLD}sudo xm sni-scan --local${NC} или ${BOLD}sudo xm sni-scan${NC}"
+        else
+          dwarn "Xray предупреждает: «${l#REALITY: }»"
+        fi
+      done <<< "$XR_WARN"
+    fi
+    # Молчание установленной сборки — не вердикт: её список масок может быть
+    # старше актуального (см. _mask_risky_name).
+    if [[ "$XR_CHOOSING" -eq 0 ]] && XR_FLAG=$(_mask_risky_name "$SNI"); then
+      dwarn "Маску $SNI (${XR_FLAG}) Xray с v26.7.28 помечает как повышающую шанс блокировки IP, установленный ${XR_VER:-Xray} об этом ещё молчит. Другая: ${BOLD}sudo xm sni-scan --local${NC} или ${BOLD}sudo xm sni-scan${NC}"
+    elif [[ "$XR_READ" -eq 1 && -z "$XR_WARN" ]]; then
+      [[ -n "$XR_ALL" ]] \
+        && ok "О маске Xray не предупреждает. Его предупреждение о порте ≠443 — в B8: там оно с учётом UFW, которого Xray не видит" \
+        || ok "Xray не предупреждает ни о маске, ни о других параметрах REALITY"
     fi
 
 # ══ B. Активное зондирование ═════════════════════════════════════════════════
@@ -3729,7 +3929,7 @@ dpi|diag-dpi)
     elif [[ "$CERT_EST" -ge "$REALITY_CERT_WARN" ]]; then
       dwarn "Certificate у $SNI ~${CERT_EST} б — близко к лимиту ${REALITY_CERT_LIMIT}"
     else
-      ok "Certificate у $SNI ~${CERT_EST} б — с запасом ниже лимита REALITY"
+      ok "Certificate у $SNI ~${CERT_EST} б — с запасом ниже лимита REALITY (${REALITY_CERT_LIMIT} б у Xray ${XR_VER:-?})"
     fi
 
     # ML-DSA-65: post-quantum подпись REALITY. Защищает от MITM тем, у кого
@@ -4018,6 +4218,38 @@ dpi|diag-dpi)
       || dwarn "policy.handshake: ${HS_D} с — мало: в это окно входит и резолвинг dest, и TLS до CDN. Исправит: ${BOLD}sudo xm tune${NC}"
     _tune_on || dwarn "sysctl-профиль не применён — дефолтные буферы 208 КБ и нет MTU probing (мобильные клиенты виснут). Исправит: ${BOLD}sudo xm tune${NC}"
 
+    # G5 — соединений с одного адреса на публичный порт. XHTTP с xmux держит на
+    # клиента 1–3 TCP (maxConnections 3 по умолчанию с Xray v26.7.28); десятки с
+    # одного адреса — это TCP/Vision (хендшейк на каждое соединение) или шторм:
+    # ядро клиента v26.9.8+ (сборки Go 1.27, XTLS/Xray-core#6797) при зависших
+    # хендшейках открывает по соединению на сессию. Для ТСПУ это и есть «много
+    # параллельных TLS к серверу»: заморозка, новые хендшейки, снова заморозка —
+    # у клиента это выглядит как «VPN отваливается на минуты». Сюда попадают и
+    # соединения, застрявшие до ClientHello: при заморозке TCP проходит, а TLS
+    # нет. Адреса не печатаются — только числа.
+    echo ""
+    read -r C_MAX C_PEERS < <(ss -Htn state established "( sport = :${PORT} )" 2>/dev/null \
+      | awk '{ a = $4; sub(/:[0-9]+$/, "", a); if (!(a in n)) d++; n[a]++; if (n[a] > m) m = n[a] }
+             END { print m + 0, d + 0 }')
+    if [[ "${C_MAX:-0}" -gt 30 ]]; then
+      dwarn "Соединений на :${PORT} с одного адреса сейчас: ${C_MAX} (адресов ${C_PEERS}). XHTTP держит 1–3 на клиента — столько даёт TCP/Vision или шторм ядра клиента v26.9.8+ при зависших хендшейках (XTLS/Xray-core#6797). Для ТСПУ это «много параллельных TLS» — заморозка"
+      _front_enabled && [[ -n "$(_front_routes)" ]] \
+        && info "  За фронтом есть соседняя служба — её клиенты считаются здесь же; чей адрес, видно в: sudo ss -tn state established '( sport = :${PORT} )'"
+    else
+      ok "Соединений на :${PORT} с одного адреса сейчас: до ${C_MAX:-0} (адресов ${C_PEERS:-0}) — шторма в этот момент нет"
+    fi
+    # Шторм длится минуты, снимок его почти всегда пропустит. След остаётся,
+    # если клиент упёрся в лимит фронта на адрес (limit_conn front_conn): nginx
+    # пишет каждый отказ в front_error.log.
+    FEL=/var/log/nginx/front_error.log
+    if _front_enabled && [[ -s "$FEL" ]]; then
+      FEL_CUT=$(date -d '24 hours ago' '+%Y/%m/%d %H:%M:%S' 2>/dev/null) || FEL_CUT=""
+      LC_N=$(awk -v cut="$FEL_CUT" '(cut == "" || ($1 " " $2) >= cut) && /limiting connections by zone "front_conn"/' "$FEL" 2>/dev/null | wc -l)
+      [[ "${LC_N:-0}" -gt 0 ]] \
+        && dwarn "За сутки ${LC_N} отказов по лимиту фронта на адрес ($(grep -oE 'limit_conn front_conn [0-9]+' "$FRONT_NGX" 2>/dev/null | grep -oE '[0-9]+$' || echo '?') соединений) — у клиента был шторм соединений. Проверь версию ядра Xray в приложении (v26.9.8+ несёт XTLS/Xray-core#6797) и не идёт ли он через TCP/Vision" \
+        || ok "За сутки лимит фронта на адрес не срабатывал — штормов до сотен соединений не было"
+    fi
+
 # ══ F. Поведение и логи ══════════════════════════════════════════════════════
     sep
     echo -e "${BOLD}F. Поведение и логи${NC}"
@@ -4037,6 +4269,14 @@ dpi|diag-dpi)
     PROBES=$(wc -l < /var/log/nginx/reality_fallback.log 2>/dev/null || echo 0)
     info "Зондов с чужим SNI в логе: $PROBES (свои клиенты сюда не пишутся)"
 
+# ══ H. Адрес сервера и российские сервисы ════════════════════════════════════
+# Не зонд и не утечка DNS, а путь к бану IP: всё, что клиент ведёт через тоннель
+# в российский сервис, приходит туда с адреса сервера (см. _ru_probe). Проверка
+# не обращается к российскому адресу — смотрит, куда его отправит routing.
+    sep
+    echo -e "${BOLD}H. Российские адреса через тоннель${NC}"
+    _ru_report ok dwarn || true
+
 # ══ Итог ═════════════════════════════════════════════════════════════════════
     sep
     if [[ "$DPI_CRIT" -eq 0 && "$DPI_WARN" -eq 0 ]]; then
@@ -4045,7 +4285,7 @@ dpi|diag-dpi)
       echo -e "  ${RED}${BOLD}Критично: $DPI_CRIT${NC}   ${YELLOW}${BOLD}Предупреждений: $DPI_WARN${NC}"
       echo ""
       echo -e "  Что делать по порядку:"
-      echo -e "    ${BOLD}sudo xm harden${NC}        DoH + перехват :53 + mimic-fallback + строгий DoT на стабе"
+      echo -e "    ${BOLD}sudo xm harden${NC}        DoH + перехват :53 + mimic-fallback + строгий DoT + geoip:ru"
       echo -e "    ${BOLD}sudo xm tune${NC}          сетевой стек, таймаут хендшейка, watchdog (блок G)"
       echo -e "    ${BOLD}sudo xm selftest${NC}      если что-то из живых тестов не прошло"
       echo -e "    ${BOLD}sudo xm sni-scan${NC}      если ругается на сертификат домена-маски"
@@ -4270,16 +4510,14 @@ sni-scan)
     # этого адреса никого не удивит. Узкий пул = узкий выбор — на четырёх
     # именах под ML-DSA могло не подойти ни одно, и менять было бы не на что.
     #
-    # www.microsoft.com в пул не входит: cert+OCSP ≈ 9085 б против буфера
-    # REALITY ~8192 б (замерено, см. setup.sh), то есть вердикт «НЕ ГОДИТСЯ»
-    # известен заранее. Держать его здесь значило тратить SNI_PROBES
-    # хендшейков с таймаутом на кандидата, который не может победить.
-    #
-    # Имён Apple нет по той же логике: с v26.3.23 Xray сам предупреждает, что
+    # Имён Apple и Microsoft в пуле нет: с v26.3.23 Xray сам предупреждает, что
     # apple/icloud в роли маски (с v26.7.28 — ещё microsoft и зоны .ru/.ir/.cn)
     # повышают шанс блокировки IP. Выигрыш на замере такого не оправдывает, а
-    # заданную руками маску из этого списка покажет diag-dpi, блок A3.
+    # заданную руками маску из этого списка покажет diag-dpi, блок A3. У
+    # www.microsoft.com вдобавок cert+OCSP ≈ 9085 б — до Xray v26.9.8 больше
+    # буфера REALITY (8192 б, см. _cert_limits).
     POOL=(dl.google.com cdn.jsdelivr.net www.cloudflare.com)
+    _cert_limits
 
     # --local [CIDR] — искать соседей в своей сети вместо глобального пула.
     # Любой домен отсюда мисматча ASN не даёт вовсе, тогда как весь пул выше
@@ -4365,10 +4603,13 @@ sni-scan)
       POOL=("$CUR" "${POOL[@]}")
     fi
     info "$SNI_PROBES хендшейков на домен, ${#POOL[@]} доменов — одна-три минуты"
+    SCAN_XV=$(_xray_ver)
+    info "Лимит Certificate у REALITY Xray ${SCAN_XV:-?}: ${REALITY_CERT_LIMIT} б, «РИСК» — от ${REALITY_CERT_WARN} б"
     sep
     printf "  %-24s %8s %4s %7s %6s  %s\n" "домен" "cert,б" "h2" "RTT,мс" "проб" "вердикт"
     BEST=""; BEST_RTT=999999; BEST_EST=0; BEST_FAIL=999
     BEST_PQ=""; BEST_PQ_RTT=999999; BEST_PQ_EST=0; BEST_PQ_FAIL=999
+    FLAG_N=0
     for h in "${POOL[@]}"; do
       EST=$(_check_cert_size "$h")
       if [[ "$EST" == "-1" ]]; then
@@ -4392,8 +4633,11 @@ sni-scan)
       OK_N=0; RTT_SUM=0; H2=нет; T13=нет
       for _ in $(seq 1 "$SNI_PROBES"); do
         T0=$(date +%s%N)
+        # С h2 сервер сразу шлёт двоичный кадр SETTINGS, и s_client печатает его
+        # в stdout. NUL из подстановки bash выкидывает сам, но с предупреждением
+        # на каждую такую пробу; нужны только текстовые строки сессии.
         HS=$(echo | timeout "$SNI_PROBE_TIMEOUT" openssl s_client -connect "$HIP:443" -servername "$h" \
-             -tls1_3 -alpn h2 2>/dev/null)
+             -tls1_3 -alpn h2 2>/dev/null | tr -d '\0')
         T1=$(date +%s%N)
         [[ -z "$HS" ]] && continue
         OK_N=$((OK_N + 1)); RTT_SUM=$(( RTT_SUM + (T1 - T0) / 1000000 ))
@@ -4415,6 +4659,12 @@ sni-scan)
         V="ГОДИТСЯ +PQ"; PQ=1
       fi
       [[ "$H2" != "да" || "$T13" != "да" ]] && { V="НЕТ h2/TLS1.3"; C="$RED"; ELIG=0; PQ=0; }
+      # Годный по замеру домен из списка риска самого Xray (см. _mask_risky_name)
+      # в таблице остаётся — это данные, — но в выбор не идёт: зона .ru на
+      # зарубежном адресе стоит IP, а не пары миллисекунд.
+      if [[ "$ELIG" -eq 1 ]] && FLAG=$(_mask_risky_name "$h"); then
+        V="РИСК IP ($FLAG)"; C="$YELLOW"; ELIG=0; PQ=0; FLAG_N=$((FLAG_N + 1))
+      fi
       FAIL_N=$(( SNI_PROBES - OK_N ))
       [[ "$FAIL_N" -gt 0 ]] && { V="$V, РВЁТ"; C="$YELLOW"; }
 
@@ -4458,11 +4708,16 @@ sni-scan)
       ok "Лучший кандидат: ${BOLD}$BEST${NC} (~${BEST_EST} б, RTT ${BEST_RTT} мс, потерь ${BEST_FAIL}/${SNI_PROBES})"
       info "Сертификата от ${REALITY_CERT_PQ_MIN} б, в запись которого влезает подпись ML-DSA, нет ни у кого — xm pq останется недоступен"
       [[ "$BEST" != "$CUR" ]] && echo -e "  Применить: ${BOLD}sudo xm set-sni $BEST${NC}"
+    elif [[ "$FLAG_N" -gt 0 ]]; then
+      fail "Замер прошли только кандидаты из списка риска Xray — рекомендовать некого"
+      [[ "$LOCAL_MODE" -eq 1 ]] && info "Останься на глобальной маске: ${BOLD}sudo xm sni-scan${NC}"
     elif [[ "$LOCAL_MODE" -eq 1 ]]; then
       fail "Ни один сосед не прошёл замер — возьми диапазон шире (весь анонс хостера) или оставь глобальный домен"
     else
       fail "Ни один кандидат не прошёл — расширь POOL в xm.sh"
     fi
+    [[ "$FLAG_N" -gt 0 ]] \
+      && info "РИСК IP — имя из списка, который Xray с v26.7.28 помечает сам (зоны .ru/.ir/.cn, apple/icloud/microsoft). Национальную зону на зарубежном адресе цензор сверяет дёшево, такие IP блокируют пачками. Установленный Xray может этого ещё не знать"
     if [[ "$LOCAL_MODE" -eq 1 ]]; then
       info "Смысл соседа — в отсутствии мисматча ASN, а не в RTT. Но малонагруженный сайт, к которому наш адрес стучится круглосуточно, — своя аномалия: выбирай тот, что похож на живой сервис."
     else
@@ -4953,7 +5208,7 @@ access)
 harden)
     [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm harden${NC}"; exit 1; }
     MODE="${2:-apply}"
-    echo -e "\n${BOLD}${CYAN}[ Хардening: DNS-over-HTTPS + перехват :53 + mimic-fallback ]${NC}\n"
+    echo -e "\n${BOLD}${CYAN}[ Хардening: DNS-over-HTTPS + перехват :53 + mimic-fallback + российские адреса ]${NC}\n"
 
     sep
     echo -e "${BOLD}Текущее состояние${NC}"
@@ -4988,9 +5243,62 @@ harden)
         *)      warn "Запросы не-A/AAAA: ${NONIP_CUR} — значение не из известных; что принимает эта сборка: ${BOLD}sudo xm harden --nonip${NC}" ;;
       esac
     fi
+    _ru_on && ok "Российские адреса из тоннеля: закрыты (geoip:ru → block)" \
+           || warn "Российские адреса из тоннеля: выходят с IP сервера — его видят сервисы, обязанные искать VPN"
 
     if [[ "$MODE" == "--check" ]]; then
+      # Строка выше — по конфигу; здесь — что с российским адресом делает routing.
+      _ru_on && { _ru_report ok warn || true; }
       sep; info "Режим --check: ничего не изменено. Применить: ${BOLD}sudo xm harden${NC}"; exit 0
+    fi
+
+    # Точечная ручка, как --nonip: включить или снять одно правило, не трогая
+    # DoH, перехват :53, DoT и mimic. Снятое возвращает следующий sudo xm harden.
+    if [[ "$MODE" == "--ru" ]]; then
+      RU_NEW="${3:-}"
+      sep
+      echo -e "${BOLD}Российские адреса из тоннеля${NC}"
+      if [[ -z "$RU_NEW" ]]; then
+        _ru_on && { _ru_report ok warn || true; }
+        echo ""
+        echo -e "  ${BOLD}sudo xm harden --ru on${NC}   соединения на адреса из geoip:ru закрывать сразу ${GREEN}(рабочий режим)${NC}"
+        echo -e "  ${BOLD}sudo xm harden --ru off${NC}  выпускать — российский сервис увидит IP этого сервера"
+        echo ""
+        info "Это страховка, а не замена настройки клиента: российские адреса клиент ведёт напрямую."
+        info "Без этого через тоннель они не откроются вовсе — так и задумано: лучше отказ, чем адрес сервера в отчёте сервиса."
+        exit 0
+      fi
+      [[ "$RU_NEW" == "on" || "$RU_NEW" == "off" ]] || { fail "Значение: on или off"; exit 1; }
+      if { [[ "$RU_NEW" == "on" ]] && _ru_on; } || { [[ "$RU_NEW" == "off" ]] && ! _ru_on; }; then
+        ok "Уже ${RU_NEW} — ничего не меняю"
+        [[ "$RU_NEW" == "on" ]] && { _ru_report ok warn || true; }
+        exit 0
+      fi
+      RBAK=$(_backup_config before_ru); ok "Бэкап: $RBAK"
+      if ! _ru_patch "$RU_NEW" | _atomic_write_config; then
+        fail "jq-патч не сработал — конфиг не тронут"; exit 1
+      fi
+      if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+        fail "Конфиг с правилом не прошёл xray -test (нет geoip.dat? ${BOLD}sudo xm update-geo${NC}) — откат"
+        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+      fi
+      if [[ "$RU_NEW" == "on" ]] && ! _ru_report ok warn; then
+        fail "Правило не подействовало — откат"
+        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+      fi
+      systemctl restart xray; sleep 2
+      if ! systemctl is-active --quiet xray; then
+        fail "Xray не поднялся — откат"
+        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        systemctl restart xray; exit 1
+      fi
+      if [[ "$RU_NEW" == "on" ]]; then
+        ok "geoip:ru → block, Xray перезапущен"
+      else
+        ok "Правило снято, Xray перезапущен"
+        warn "Российские адреса снова выходят с IP сервера. Вернуть: ${BOLD}sudo xm harden --ru on${NC} (или любой sudo xm harden)"
+      fi
+      exit 0
     fi
 
     # Наш профиль DoT поверх уже настроенного резолвера. Отдельной командой,
@@ -5101,7 +5409,7 @@ harden)
       echo -e "${BOLD}Откат${NC}"
       ok "Бэкап: $(_backup_config before_unharden)"
       if _harden_unpatch | _atomic_write_config && xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
-        systemctl restart xray; ok "dns-блок, dns-out и перехват :53 убраны, Xray перезапущен"
+        systemctl restart xray; ok "dns-блок, dns-out, перехват :53 и правило geoip:ru убраны, Xray перезапущен"
       else
         fail "Откат конфига не удался — восстанови вручную: xm restore"; exit 1
       fi
@@ -5114,6 +5422,7 @@ harden)
         ok "nginx-fallback: resolver вернулся на 1.1.1.1 8.8.8.8"
       fi
       warn "DNS снова резолвится открытым текстом — и системный, и nginx"
+      warn "Российские адреса снова выходят из тоннеля с IP сервера"
       exit 0
     fi
 
@@ -5237,6 +5546,20 @@ harden)
       "")     warn "Поле nonIPQuery эта сборка не приняла — режим запросов не-A/AAAA остался дефолтным для неё. Что она умеет: ${BOLD}sudo xm harden --nonip${NC}" ;;
     esac
 
+    # Российские адреса — тем же перезапуском, но отдельной проверкой: если
+    # правило не примется (нет geoip.dat), DNS-часть остаётся, а не откатывается.
+    RU_PREV=$(cat "$CONFIG")
+    if _ru_on; then
+      ok "routing: geoip:ru → block уже стоит"
+    elif _ru_patch on | _atomic_write_config \
+         && xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
+      ok "routing: geoip:ru → block — российские адреса из тоннеля закрываются сразу"
+    else
+      printf '%s\n' "$RU_PREV" | _atomic_write_config
+      warn "Правило geoip:ru не принято (нет geoip.dat? ${BOLD}sudo xm update-geo${NC}) — российские адреса выходят с IP сервера"
+    fi
+    unset RU_PREV
+
     systemctl restart xray; sleep 2
     if ! systemctl is-active --quiet xray; then
       fail "Xray не поднялся с новым конфигом — откат"
@@ -5263,6 +5586,7 @@ harden)
       _tunnel_down
       warn "Локальный клиент не поднялся — живую проверку пропускаю (проверь: sudo xm selftest)"
     fi
+    _ru_report ok warn || true
 
     # ── 6. nginx mimic ──────────────────────────────────────────────────────
     sep
@@ -5299,6 +5623,9 @@ harden)
     echo -e "  ${YELLOW}Если приложение (мессенджер, Android) начнёт капризничать с DNS —${NC}"
     echo -e "  ${YELLOW}проверь nonIPQuery точечно: ${BOLD}sudo xm harden --nonip${NC}${YELLOW}. Полный откат${NC}"
     echo -e "  ${YELLOW}(--off) для этого не нужен: он заодно снимает DoH, DoT и mimic.${NC}"
+    echo -e "  ${YELLOW}Российский сайт или приложение не открывается при включённом VPN — клиент${NC}"
+    echo -e "  ${YELLOW}ведёт его через тоннель: нужна раздельная маршрутизация (geoip:ru напрямую).${NC}"
+    echo -e "  ${YELLOW}Снять только это правило: ${BOLD}sudo xm harden --ru off${NC}"
     ;;
 
 pq)
@@ -5788,8 +6115,8 @@ neighbors)
     echo -e "            ${GREEN}set-sni <домен>${NC}          домен-маска в config+nginx, с откатом"
     echo -e "            ${GREEN}set-port <порт> [--tcp]${NC}  порт inbound (443 предпочтителен)"
     echo -e "            ${GREEN}add-tcp${NC}                  второй inbound XTLS-Vision/TCP"
-    echo -e "${BOLD}${GREEN}Анти-DPI${NC}    harden [--check|--off|--dot|--nonip reject|drop|skip|off]"
-    echo    "                                     DoH, строгий DoT, перехват :53, mimic"
+    echo -e "${BOLD}${GREEN}Анти-DPI${NC}    harden [--check|--off|--dot|--nonip reject|drop|skip|off|--ru on|off]"
+    echo    "                                     DoH, строгий DoT, перехват :53, mimic, geoip:ru из тоннеля"
     echo    "            tune [--check|--off]     сетевой стек, таймауты, watchdog"
     echo    "            watchdog on|off|now|status"
     echo    "            pq status|on|off         post-quantum подпись REALITY"
