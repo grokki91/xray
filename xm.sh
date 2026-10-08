@@ -3586,9 +3586,12 @@ for svc in xray nginx fail2ban chrony; do
       # error.log.1. Строка старше двух суток значит, что ротация не идёт, —
       # а при loglevel error здесь лежат имена доменов клиентов (app/dns пишет
       # имя, которое не разрешилось), и лежат дольше обещанного архива.
+      # В минимальных образах logrotate нет вовсе: тогда причина известна.
       LOG_FIRST=$(grep -m1 -oE '^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]{8}' "$LOG" 2>/dev/null)
       LOG_FIRST_S=$(date -d "${LOG_FIRST//\//-}" +%s 2>/dev/null) || LOG_FIRST_S=""
-      if [[ -n "$LOG_FIRST_S" && $(( $(date +%s) - LOG_FIRST_S )) -gt 172800 ]]; then
+      if ! command -v logrotate &>/dev/null; then
+        dwarn "logrotate не установлен — не ротируются ни лог Xray (имена доменов из ошибок DNS), ни логи nginx. Исправить: ${BOLD}sudo apt install -y logrotate${NC}"
+      elif [[ -n "$LOG_FIRST_S" && $(( $(date +%s) - LOG_FIRST_S )) -gt 172800 ]]; then
         dwarn "Лог не ротируется: первая строка от ${LOG_FIRST} ($(( ($(date +%s) - LOG_FIRST_S) / 86400 )) дн). В нём имена доменов клиентов из ошибок DNS — хранятся дольше политики. Причина: ${BOLD}sudo logrotate -d /etc/logrotate.d/xray${NC} и ${BOLD}systemctl status logrotate.timer${NC}"
       fi
     else

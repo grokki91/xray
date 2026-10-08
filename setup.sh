@@ -621,7 +621,10 @@ apt-get install -y --no-install-recommends \
   curl wget unzip uuid-runtime openssl ufw whois \
   nginx libnginx-mod-stream libnginx-mod-http-headers-more-filter \
   fail2ban jq python3 python3-cryptography \
-  chrony qrencode unattended-upgrades tcpdump
+  chrony qrencode unattended-upgrades tcpdump logrotate
+# logrotate — в минимальных образах его нет, и /etc/logrotate.d/xray (шаг 8)
+# не применяется ни к чему: лог Xray с именами доменов из ошибок DNS копится
+# без срока.
 # whois — ASN через whois.cymru.com (diag-dpi, подбор соседей).
 # python3-cryptography — _derive_pubkey в xm.sh (xm pubkey, xm diag).
 # libnginx-mod-stream — ssl_preread для REALITY-fallback.
