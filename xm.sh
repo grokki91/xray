@@ -3365,7 +3365,7 @@ diag)
 for svc in xray nginx fail2ban chrony; do
       systemctl is-active --quiet "$svc" && ok "$svc запущен" || { fail "$svc НЕ запущен"; ((ISSUES++)); }
     done
-    [[ -f /var/run/reboot-required ]] && warn "Требуется перезагрузка (обновлено ядро/libc) — перезагрузи в удобное время" || true
+    [[ -f /var/run/reboot-required ]] && dwarn "Требуется перезагрузка (обновлено ядро/libc) — перезагрузи в удобное время" || true
 
     echo -e "\n${BOLD}[ 2 ] Порты${NC}"; sep
     # Точное сопоставление порта: ":PORT([^0-9]|$)", иначе ":443" ловил бы ":4433"
@@ -3383,7 +3383,7 @@ for svc in xray nginx fail2ban chrony; do
     fi
     ss -tlnp | grep -qE ":80([^0-9]|$)" \
       && ok "Порт 80 (nginx) слушается" \
-      || warn "Порт 80 не слушается"
+      || dwarn "Порт 80 не слушается"
 
     SSH_P=$(_get_ssh_port)
     ss -tlnp | grep -qE ":${SSH_P}([^0-9]|$)" \
@@ -3431,7 +3431,7 @@ for svc in xray nginx fail2ban chrony; do
         fi
         info "Stratum: $(chronyc tracking 2>/dev/null | grep 'Stratum' | awk '{print $3}')"
       else
-        warn "chrony работает, tracking недоступен"
+        dwarn "chrony работает, tracking недоступен"
       fi
     else
       fail "chrony не запущен"; ((ISSUES++))
@@ -3467,16 +3467,16 @@ for svc in xray nginx fail2ban chrony; do
     if [[ "$DEST_CFG" == "127.0.0.1:10443" ]]; then
       ok "REALITY dest → 127.0.0.1:10443 (проходит через nginx)"
     else
-      warn "REALITY dest = $DEST_CFG (ожидался 127.0.0.1:10443)"
+      dwarn "REALITY dest = $DEST_CFG (ожидался 127.0.0.1:10443)"
     fi
     XVER_CFG=$(jq -r '.inbounds[0].streamSettings.realitySettings.xver // 0' "$CONFIG" 2>/dev/null)
     [[ "$XVER_CFG" == "2" ]] \
       && ok "xver=2 (PROXY protocol → реальный IP клиента в логах)" \
-      || warn "xver=$XVER_CFG (ожидался 2 — иначе nginx видит только 127.0.0.1)"
+      || dwarn "xver=$XVER_CFG (ожидался 2 — иначе nginx видит только 127.0.0.1)"
     if grep -rq "limit_conn" /etc/nginx/stream-enabled/ 2>/dev/null; then
       ok "limit_conn настроен в stream-fallback"
     else
-      warn "limit_conn не найден в stream-fallback"
+      dwarn "limit_conn не найден в stream-fallback"
     fi
     # Без реального IP клиента limit_conn считает всех как 127.0.0.1 → лимит
     # действует на весь сервер и отстреливает своих же (status=503).
@@ -3499,7 +3499,7 @@ for svc in xray nginx fail2ban chrony; do
     info "эталон serverNames[0] (XHTTP): ${SNI_REF:-<пусто>}"
 
     if [[ -z "$SNI_HOST" ]]; then
-      warn "xhttpSettings.host пуст — URI возьмёт serverNames[0], но лучше задать явно: xm set-sni $SNI_REF"
+      dwarn "xhttpSettings.host пуст — URI возьмёт serverNames[0], но лучше задать явно: xm set-sni $SNI_REF"
     elif [[ "$SNI_HOST" == "$SNI_REF" ]]; then
       ok "xhttpSettings.host == serverNames[0] (клиент шлёт правильный SNI)"
     else
@@ -3507,7 +3507,7 @@ for svc in xray nginx fail2ban chrony; do
     fi
 
     if [[ -z "$NGINX_SNI" ]]; then
-      warn "не удалось прочитать SNI из nginx-map ($NGINX_CONF)"
+      dwarn "не удалось прочитать SNI из nginx-map ($NGINX_CONF)"
     elif [[ "$NGINX_SNI" == "$SNI_REF" ]]; then
       ok "nginx map SNI == serverNames[0] (fallback идёт на нужный сайт)"
     else
@@ -3527,7 +3527,7 @@ for svc in xray nginx fail2ban chrony; do
     if fail2ban-client status sshd &>/dev/null; then
       ok "SSH jail активен"
       BANNED=$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | awk -F: '{print $2}' | xargs)
-      [[ -n "$BANNED" ]] && warn "Забанены: $BANNED" || info "Банов нет"
+      [[ -n "$BANNED" ]] && info "Забанены (штатная работа jail): $BANNED" || info "Банов нет"
     else
       fail "fail2ban SSH jail не активен"; ((ISSUES++))
     fi
@@ -3570,11 +3570,29 @@ for svc in xray nginx fail2ban chrony; do
     echo -e "\n${BOLD}[ 10 ] Лог Xray${NC}"; sep
     if [[ -f "$LOG" ]] && [[ -s "$LOG" ]]; then
       info "Строк в логе: $(wc -l < "$LOG")"
-      if tail -5 "$LOG" | grep -qi "failed\|error\|panic\|rejected"; then
-        warn "Последние ошибки:"
-        tail -5 "$LOG" | sed 's/^/    /'
+      # Вердикт — по суткам: хвост лога без дат выдавал ошибки двухнедельной
+      # давности за текущие. Дата Xray «ГГГГ/ММ/ДД ЧЧ:ММ:СС» сравнивается строкой.
+      LOG_CUT=$(date -d '24 hours ago' '+%Y/%m/%d %H:%M:%S' 2>/dev/null) || LOG_CUT=""
+      LOG_ERR=$(awk -v cut="$LOG_CUT" '(cut == "" || ($1 " " $2) >= cut) && tolower($0) ~ /failed|error|panic|rejected/' "$LOG" 2>/dev/null)
+      if [[ -n "$LOG_ERR" ]]; then
+        dwarn "Ошибок за сутки: $(wc -l <<< "$LOG_ERR"). Последние:"
+        tail -5 <<< "$LOG_ERR" | sed 's/^/    /'
       else
-        ok "Критических ошибок в последних строках нет"
+        ok "За сутки ошибок нет"
+        LOG_LAST=$(grep -iE "failed|error|panic|rejected" "$LOG" 2>/dev/null | tail -1 | grep -oE '^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]{8}')
+        [[ -n "$LOG_LAST" ]] && info "  Последняя ошибка в файле: $LOG_LAST — история, не текущее состояние"
+      fi
+      # Ротация: logrotate из setup.sh каждые сутки уносит непустой лог в
+      # error.log.1. Строка старше двух суток значит, что ротация не идёт, —
+      # а при loglevel error здесь лежат имена доменов клиентов (app/dns пишет
+      # имя, которое не разрешилось), и лежат дольше обещанного архива.
+      # В минимальных образах logrotate нет вовсе: тогда причина известна.
+      LOG_FIRST=$(grep -m1 -oE '^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9:]{8}' "$LOG" 2>/dev/null)
+      LOG_FIRST_S=$(date -d "${LOG_FIRST//\//-}" +%s 2>/dev/null) || LOG_FIRST_S=""
+      if ! command -v logrotate &>/dev/null; then
+        dwarn "logrotate не установлен — не ротируются ни лог Xray (имена доменов из ошибок DNS), ни логи nginx. Исправить: ${BOLD}sudo apt install -y logrotate${NC}"
+      elif [[ -n "$LOG_FIRST_S" && $(( $(date +%s) - LOG_FIRST_S )) -gt 172800 ]]; then
+        dwarn "Лог не ротируется: первая строка от ${LOG_FIRST} ($(( ($(date +%s) - LOG_FIRST_S) / 86400 )) дн). В нём имена доменов клиентов из ошибок DNS — хранятся дольше политики. Причина: ${BOLD}sudo logrotate -d /etc/logrotate.d/xray${NC} и ${BOLD}systemctl status logrotate.timer${NC}"
       fi
     else
       ok "Лог пуст — ошибок нет"
@@ -3584,15 +3602,19 @@ for svc in xray nginx fail2ban chrony; do
     if command -v qrencode &>/dev/null; then
       ok "qrencode доступен ($(qrencode --version 2>&1 | head -1))"
     else
-      warn "qrencode не установлен — xm qr работать не будет"
+      dwarn "qrencode не установлен — xm qr работать не будет"
       warn "Установи: apt install qrencode"
     fi
 
     echo -e "\n${BOLD}${CYAN}══════════════════════════════════════════${NC}"
-    if [[ $ISSUES -eq 0 ]]; then
+    # [!] доходят до итога: «Проблем не обнаружено» под тремя
+    # предупреждениями противоречило собственному выводу.
+    if [[ $ISSUES -eq 0 && $DPI_WARN -eq 0 ]]; then
       echo -e "${GREEN}${BOLD}  ✅ Всё в порядке. Проблем не обнаружено.${NC}"
+    elif [[ $ISSUES -eq 0 ]]; then
+      echo -e "${YELLOW}${BOLD}  ⚠ Критичного нет. Предупреждений: $DPI_WARN — см. [!] выше${NC}"
     else
-      echo -e "${RED}${BOLD}  ❌ Обнаружено проблем: $ISSUES${NC}"
+      echo -e "${RED}${BOLD}  ❌ Обнаружено проблем: $ISSUES${NC}  ${YELLOW}предупреждений: $DPI_WARN${NC}"
       echo -e "${YELLOW}  Исправь проблемы выше и запусти xm diag снова${NC}"
     fi
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
@@ -4228,11 +4250,38 @@ dpi|diag-dpi)
     # соединения, застрявшие до ClientHello: при заморозке TCP проходит, а TLS
     # нет. Адреса не печатаются — только числа.
     echo ""
-    read -r C_MAX C_PEERS < <(ss -Htn state established "( sport = :${PORT} )" 2>/dev/null \
-      | awk '{ a = $4; sub(/:[0-9]+$/, "", a); if (!(a in n)) d++; n[a]++; if (n[a] > m) m = n[a] }
-             END { print m + 0, d + 0 }')
+    read -r C_MAX C_PEERS C_TOP < <(ss -Htn state established "( sport = :${PORT} )" 2>/dev/null \
+      | awk '{ a = $4; sub(/:[0-9]+$/, "", a); if (!(a in n)) d++; n[a]++; if (n[a] > m) { m = n[a]; t = a } }
+             END { print m + 0, d + 0, t }')
     if [[ "${C_MAX:-0}" -gt 30 ]]; then
-      dwarn "Соединений на :${PORT} с одного адреса сейчас: ${C_MAX} (адресов ${C_PEERS}). XHTTP держит 1–3 на клиента — столько даёт TCP/Vision или шторм ядра клиента v26.9.8+ при зависших хендшейках (XTLS/Xray-core#6797). Для ТСПУ это «много параллельных TLS» — заморозка"
+      # Сотня соединений с адреса — это и шторм своего клиента, и сканер,
+      # который держит соединения на маске. Различает их fallback: REALITY
+      # закрывает соединение к target, как только клиент прошёл проверку
+      # (target.Close() до возврата conn в XTLS/REALITY tls.go), так что у
+      # своего клиента на :10443 не висит ничего, а у зонда висит всё.
+      # Адрес держим в переменной и не печатаем — только числа.
+      C_A=${C_TOP#[}; C_A=${C_A%]}; C_A=${C_A#::ffff:}
+      C_FB=$(ss -Htn state established '( dport = :10443 )' 2>/dev/null | wc -l)
+      C_PROBE=$(awk -v a="$C_A" '$1 == a' /var/log/nginx/reality_fallback.log 2>/dev/null | wc -l)
+      # bytes_received ss печатает строкой ниже сокета и опускает, пока он 0.
+      read -r C_Z C_H C_D < <(ss -Htni state established "( sport = :${PORT} )" 2>/dev/null \
+        | awk -v t="$C_TOP" '
+            /^[^ \t]/ { a = $4; sub(/:[0-9]+$/, "", a); cur = (a == t); next }
+            cur { b = 0; if (match($0, /bytes_received:[0-9]+/)) b = substr($0, RSTART + 15, RLENGTH - 15) + 0
+                  if (b == 0) z++; else if (b < 4096) h++; else d++; cur = 0 }
+            END { print z + 0, h + 0, d + 0 }')
+      dwarn "Соединений на :${PORT} с одного адреса сейчас: ${C_MAX} (адресов ${C_PEERS})"
+      info "  По байтам от него: ни одного — ${C_Z}, до 4 КБ (хендшейк, самое большее первый запрос) — ${C_H}, с данными — ${C_D}"
+      info "  Сейчас в REALITY-fallback (на маску): ${C_FB}. Свой клиент после хендшейка там не висит"
+      if ip -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }' | grep -qxF "$C_A"; then
+        info "  Это адрес самого VPS — соединения не клиентские. Владелец: sudo ss -tnp state established '( sport = :${PORT} )'"
+      elif [[ "${C_FB:-0}" -ge $(( C_MAX / 2 )) || "${C_PROBE:-0}" -gt 0 ]]; then
+        info "  Похоже на зонд, а не на клиента: соединения не прошли REALITY и висят на маске (этот адрес в журнале чужого SNI: ${C_PROBE}). Для ТСПУ это не наш признак — так же сканируют и настоящий CDN; лимит на адрес держит limit_conn в stream-fallback"
+      elif [[ $(( C_Z + C_H )) -gt "${C_D:-0}" ]]; then
+        info "  Большинство не передало ничего, кроме хендшейка: TCP прошёл, дальше тишина — так выглядит заморозка ТСПУ или шторм ядра клиента v26.9.8+ при зависших хендшейках (XTLS/Xray-core#6797). Проверь версию ядра в приложении клиента"
+      else
+        info "  Клиент с данными держит десятки соединений — это TCP/Vision (хендшейк на каждое) или шторм ядра v26.9.8+ (XTLS/Xray-core#6797). XHTTP держит 1–3. Для ТСПУ это «много параллельных TLS» — заморозка"
+      fi
       _front_enabled && [[ -n "$(_front_routes)" ]] \
         && info "  За фронтом есть соседняя служба — её клиенты считаются здесь же; чей адрес, видно в: sudo ss -tn state established '( sport = :${PORT} )'"
     else
