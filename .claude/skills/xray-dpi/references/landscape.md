@@ -110,6 +110,9 @@ te-st.org.
 - Xray предупреждает при `xray -test`: порт ≠ 443; serverNames на .ru/.ir/.cn или со словами
   apple/icloud/microsoft («increase the likelihood of your server's IP being blocked»).
 - `mldsa65Seed` требует у target запись Certificate не меньше ~3.5 КБ.
+- Прошедший проверку клиент соединения к target не держит: REALITY закрывает его до того, как
+  вернуть соединение Xray; висит оно только у не прошедших (зонды). На этом `xm diag-dpi` G5
+  отличает сканер от шторма своего клиента. — XTLS/REALITY tls.go (3c98159, 2026-09-21).
 - `limitFallbackUpload/Download` — лимит скорости соединений, не прошедших аутентификацию:
   их REALITY отдаёт target, и без лимита сервер — бесплатный канал к сайту-маске. Но сам
   лимит — отпечаток, и документация XTLS его не рекомендует: только при маске на бесплатном
