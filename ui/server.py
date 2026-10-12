@@ -611,13 +611,15 @@ def main():
         signal.signal(sig, stop)
     threading.Thread(target=monitor, daemon=True).start()
 
+    # Ссылка — с портом панели: при тоннеле с тем же номером на ПК её открывают кликом из
+    # терминала, без правки порта руками.
     print("Панель xm слушает только 127.0.0.1:%d этого сервера." % args.port)
-    print("Токен в пути: /%s/" % P.token)
     print("")
-    print("Из окна на своём ПК (если тоннеля ещё нет):")
-    print("  ssh -L 8080:127.0.0.1:%d -p %s <пользователь>@<сервер>" % (args.port, args.ssh_port))
-    print("Потом в браузере (первое число после -L — порт на ПК):")
-    print("  http://127.0.0.1:8080/%s/" % P.token)
+    print("В браузере на ПК (Ctrl+клик в терминале):")
+    print("  http://127.0.0.1:%d/%s/" % (args.port, P.token))
+    print("")
+    print("Ссылка верна, если тоннель с тем же номером на ПК:")
+    print("  ssh -L %d:127.0.0.1:%d -p %s <пользователь>@<сервер>" % (args.port, args.port, args.ssh_port))
     print("")
     print("Остановить: Ctrl+C. Сама закроется через %d мин без действий." % args.idle, flush=True)
     try:
