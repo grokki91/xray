@@ -2234,6 +2234,199 @@ _print_qr_pair() {
   fi
 }
 
+# ─── Панель (xm ui) и статистика для неё ─────────────────────────────────────
+#
+# Панель — веб-интерфейс к этим же командам: Python 3 из стандартной библиотеки, слушает
+# только 127.0.0.1, живёт, пока открыт SSH-сеанс (xm ui), и обращается к серверу только
+# через `xm …`. Файлы лежат рядом с xm и ставятся тем же шагом (self-update, setup.sh):
+# версия панели не расходится с версией xm, из которого она вызывает команды.
+# Графикам нужны счётчики Xray: xm stats on включает их и таймер замеров (ui/stats.py).
+UI_DIR="/usr/local/lib/xm/ui"
+UI_PORT_FILE="/usr/local/etc/xray/ui-port"
+UI_PORT_DEFAULT=8088
+STATS_DIR="/var/lib/xm/stats"
+STATS_SVC="/etc/systemd/system/xm-stats.service"
+STATS_TIMER="/etc/systemd/system/xm-stats.timer"
+# По тегу опознаётся свой блок api: чужой, заведённый руками, xm не перезаписывает и не удаляет.
+STATS_TAG="xm-stats"
+
+# Файлы панели из чекаута → $UI_DIR. Каталог меняется целиком (rename): запущенная
+# панель держит свои файлы в памяти. Код возврата: 0 — установлено, 2 — в чекауте нет
+# ui/ (старая ветка), 1 — отказ.
+_ui_install() {
+  local src="$1/ui" new="${UI_DIR}.new" old="${UI_DIR}.old" f
+  [[ -d "$src" ]] || return 2
+  command -v python3 >/dev/null 2>&1 \
+    || { warn "python3 не установлен — панель недоступна: sudo apt install -y python3"; return 1; }
+  for f in server.py stats.py; do
+    python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$src/$f" 2>/dev/null \
+      || { fail "ui/$f не проходит проверку синтаксиса — панель НЕ обновляю"; return 1; }
+  done
+  rm -rf "$new" "$old"
+  mkdir -p "$(dirname "$UI_DIR")" && install -d -m 755 "$new" || return 1
+  for f in server.py stats.py index.html app.js app.css icon.svg; do
+    install -m 644 "$src/$f" "$new/$f" || { rm -rf "$new"; fail "Не скопировать ui/$f"; return 1; }
+  done
+  [[ -d "$UI_DIR" ]] && mv "$UI_DIR" "$old"
+  mv "$new" "$UI_DIR" || { [[ -d "$old" ]] && mv "$old" "$UI_DIR"; return 1; }
+  rm -rf "$old"
+}
+
+# true/false по коду возврата детектора. «Не определилось» здесь невозможно: детекторы
+# возвращают только 0/1, а чем они меряют — следствием или конфигом — решено в них самих.
+_jb() { if "$@" >/dev/null 2>&1; then echo true; else echo false; fi; }
+
+# Состояние сервера одним JSON — вход панели. Формат человекочитаемого вывода не API,
+# поэтому у панели свой, а признаки берутся теми же детекторами, что у diag и harden.
+_info_json() {
+  local ts since=0 ip tcp_port=""
+  ts=$(systemctl show xray -p ActiveEnterTimestamp --value 2>/dev/null)
+  [[ -n "$ts" ]] && since=$(date -d "$ts" +%s 2>/dev/null || echo 0)
+  ip=$(_get_field "SERVER IP")
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || ip=""
+  _has_tcp_inbound && tcp_port=$(jq -r '.inbounds[1].port' "$CONFIG" 2>/dev/null)
+  jq -n \
+    --arg host "$(hostname)" --arg ip "$ip" --arg ssh "$(_get_ssh_port)" \
+    --arg xver "$(_xray_ver)" --argjson xact "$(_jb systemctl is-active --quiet xray)" \
+    --arg since "$since" \
+    --argjson nginx "$(_jb systemctl is-active --quiet nginx)" \
+    --argjson f2b "$(_jb systemctl is-active --quiet fail2ban)" \
+    --argjson chrony "$(_jb systemctl is-active --quiet chrony)" \
+    --argjson wd "$(_jb systemctl is-active --quiet xray-watchdog.timer)" \
+    --arg pub "$(_front_public_port)" --arg tcp_port "$tcp_port" --arg fp "$(_get_fp)" \
+    --argjson tcp "$(_jb _has_tcp_inbound)" \
+    --argjson doh "$(_jb _dns_doh_on)" --argjson hijack "$(_jb _dns_hijack_on)" \
+    --argjson dot "$(_jb _resolved_dot_on)" --argjson mimic "$(_jb _ngx_mimic_on)" \
+    --argjson ru "$(_jb _ru_on)" --argjson tune "$(_jb _tune_on)" \
+    --argjson front "$(_jb _front_enabled)" --argjson pq "$(_jb _pq_on)" \
+    --argjson ufw "$(_jb _ufw_active)" \
+    --slurpfile cfg "$CONFIG" \
+    '$cfg[0] as $c | {
+      hostname: $host, server_ip: $ip, ssh_port: ($ssh | tonumber? // null),
+      xray: {version: $xver, active: $xact, since: ($since | tonumber)},
+      services: {nginx: $nginx, fail2ban: $f2b, chrony: $chrony, watchdog: $wd},
+      config: {
+        transport: ($c.inbounds[0].streamSettings.network // null),
+        port: ($c.inbounds[0].port // null), public_port: ($pub | tonumber? // null),
+        sni: ($c.inbounds[0].streamSettings.realitySettings.serverNames[0] // null),
+        fp: $fp, tcp: $tcp, tcp_port: ($tcp_port | tonumber? // null),
+        clients: ($c.inbounds[0].settings.clients | length),
+        doh: $doh, hijack53: $hijack, dot: $dot, mimic: $mimic, ru_block: $ru,
+        tune: $tune, front: $front, pq: $pq, ufw: $ufw,
+        access_log: (($c.log.access // "none") != "none"),
+        reality_debug: (($c.inbounds[0].streamSettings.realitySettings.show // false) == true),
+        loglevel: ($c.log.loglevel // null)
+      }
+    }'
+}
+
+# Клиенты одним JSON — вход панели: UUID, имя, email (ключ статистики) и готовые URI.
+_clients_json() {
+  local out="[]" line c_uuid c_name c_mail c_ux c_ut
+  while IFS= read -r line; do
+    c_uuid=$(jq -r '.id' <<<"$line")
+    c_name=$(jq -r '.comment // ""' <<<"$line")
+    c_mail=$(jq -r '.email // ""' <<<"$line")
+    c_ux=$(_make_uri_xhttp "$c_uuid" "$c_name" 2>/dev/null) || c_ux=""
+    c_ut=""
+    if _has_tcp_inbound; then c_ut=$(_make_uri_tcp "$c_uuid" "$c_name" 2>/dev/null) || c_ut=""; fi
+    out=$(jq -c --arg u "$c_uuid" --arg n "$c_name" --arg e "$c_mail" --arg x "$c_ux" --arg t "$c_ut" \
+      '. + [{uuid: $u, name: $n, email: $e, uri: $x, uri_tcp: $t}]' <<<"$out")
+  done < <(jq -c '.inbounds[0].settings.clients[]' "$CONFIG")
+  echo "$out"
+}
+
+# Адрес API статистики из конфига; пусто — не включена.
+_stats_api() { jq -r '.api.listen // empty' "$CONFIG" 2>/dev/null; }
+
+# Отвечает ли API по факту: запрос без сброса счётчиков.
+_stats_api_up() { xray api statsquery --server="$1" -pattern "user>>>" -t 3 >/dev/null 2>&1; }
+
+# Свободный порт на петле для API: 10085 — привычный для Xray, дальше по порядку.
+_stats_free_port() {
+  local p
+  for p in $(seq 10085 10095); do
+    ss -tlnH 2>/dev/null | awk -v p=":$p" '$4 ~ p"$" {f=1} END {exit !f}' || { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# _stats_patch on <host:port> | off → конфиг на stdout.
+# on: счётчики по клиентам (statsUserUplink/Downlink на уровне 0), API только со
+# StatsService и email у каждого VLESS-клиента — по нему Xray ведёт счётчик. statsUserOnline
+# не включается: с ним Xray держит в памяти IP подключённых клиентов и отдаёт их через API,
+# который не требует аутентификации. HandlerService тоже нет: через него любой локальный
+# процесс добавил бы себе пользователя.
+# off: убирает только свой api (по тегу) и флаги счётчиков; email клиентов остаётся.
+_stats_patch() {
+  jq --arg m "$1" --arg api "${2:-}" --arg tag "$STATS_TAG" '
+    if $m == "on" then
+        .stats = (.stats // {})
+      | .api = {tag: $tag, listen: $api, services: ["StatsService"]}
+      | .policy.levels["0"] = ((.policy.levels["0"] // {}) + {statsUserUplink: true, statsUserDownlink: true})
+      | .inbounds |= map(if .protocol == "vless"
+          then .settings.clients |= map(if ((.email // "") | length) > 0 then .
+               else . + {email: (if ((.comment // "") | length) > 0 then .comment else .id end)} end)
+          else . end)
+    else
+        (if (.api.tag? // "") == $tag then del(.api) | del(.stats) else . end)
+      | del(.policy.levels["0"].statsUserUplink, .policy.levels["0"].statsUserDownlink)
+    end
+  ' "$CONFIG"
+}
+
+# Принимает ли ЭТА сборка Xray такой конфиг: проверка на копии, config.json не трогается.
+# В копии ключ REALITY — удаляется сразу.
+_stats_try() {
+  local tmp rc=1
+  tmp=$(mktemp /tmp/xm-stats.XXXXXX.json) || return 1
+  if _stats_patch "$@" > "$tmp" 2>/dev/null \
+     && xray -test -config "$tmp" 2>&1 | grep -q "Configuration OK"; then rc=0; fi
+  rm -f "$tmp"
+  return $rc
+}
+
+# Один замер счётчиков (его же зовёт таймер). Хранит ui/stats.py.
+_stats_collect() {
+  local api
+  api=$(_stats_api)
+  [[ -n "$api" ]] || { echo "stats: в config.json нет api.listen — sudo xm stats on" >&2; return 1; }
+  python3 "$UI_DIR/stats.py" collect --xray "$(command -v xray)" --api "$api" \
+    --port "$(_front_public_port)" --config "$CONFIG"
+}
+
+_stats_timer_install() {
+  cat > "$STATS_SVC" <<'STSVCEOF'
+[Unit]
+Description=xm stats collector (Xray counters for the panel)
+After=xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xm stats collect
+STSVCEOF
+  cat > "$STATS_TIMER" <<'STTIMEREOF'
+[Unit]
+Description=Run xm stats collector every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+STTIMEREOF
+  systemctl daemon-reload
+  systemctl enable --now xm-stats.timer >/dev/null 2>&1
+}
+
+_stats_timer_remove() {
+  systemctl disable --now xm-stats.timer >/dev/null 2>&1
+  rm -f "$STATS_SVC" "$STATS_TIMER"
+  systemctl daemon-reload
+}
+
 case "$1" in
 
 # ─── Сервис ──────────────────────────────────────────────────────────────────
@@ -2560,6 +2753,7 @@ pubkey)
 
 # ─── Клиенты ─────────────────────────────────────────────────────────────────
 clients)
+    [[ "${2:-}" == "--json" ]] && { _clients_json; exit 0; }
     echo -e "${BOLD}Клиенты (inbound 0 — XHTTP):${NC}"
     jq -r '.inbounds[0].settings.clients[] |
       "  UUID: \(.id)  |  \(.comment // "—")"' "$CONFIG"
@@ -2579,13 +2773,13 @@ add|add-client)
 
     if _has_tcp_inbound; then
       jq --arg uuid "$NEW_UUID" --arg comment "$COMMENT" \
-        '.inbounds[0].settings.clients += [{"id": $uuid, "comment": $comment}]
-         | .inbounds[1].settings.clients += [{"id": $uuid, "flow": "xtls-rprx-vision", "comment": $comment}]' \
+        '.inbounds[0].settings.clients += [{"id": $uuid, "comment": $comment, "email": $comment}]
+         | .inbounds[1].settings.clients += [{"id": $uuid, "flow": "xtls-rprx-vision", "comment": $comment, "email": $comment}]' \
         "$CONFIG" | _atomic_write_config
       echo -e "${GREEN}Добавлен в оба inbound${NC}"
     else
       jq --arg uuid "$NEW_UUID" --arg comment "$COMMENT" \
-        '.inbounds[0].settings.clients += [{"id": $uuid, "comment": $comment}]' \
+        '.inbounds[0].settings.clients += [{"id": $uuid, "comment": $comment, "email": $comment}]' \
         "$CONFIG" | _atomic_write_config
       echo -e "${GREEN}Клиент добавлен${NC}"
     fi
@@ -2597,11 +2791,15 @@ add|add-client)
     ;;
 
 del|del-client)
-    echo -e "${BOLD}Текущие клиенты:${NC}"
-    jq -r '.inbounds[0].settings.clients[] |
-      "  UUID: \(.id)  |  \(.comment // "—")"' "$CONFIG"
-    echo ""
-    read -rp "Введи UUID клиента для удаления: " TARGET_UUID
+    # UUID аргументом — для панели и скриптов; без него — список и вопрос, как раньше.
+    TARGET_UUID="${2:-}"
+    if [[ -z "$TARGET_UUID" ]]; then
+      echo -e "${BOLD}Текущие клиенты:${NC}"
+      jq -r '.inbounds[0].settings.clients[] |
+        "  UUID: \(.id)  |  \(.comment // "—")"' "$CONFIG"
+      echo ""
+      read -rp "Введи UUID клиента для удаления: " TARGET_UUID
+    fi
 
     FOUND=$(jq -r --arg uuid "$TARGET_UUID" \
       '.inbounds[0].settings.clients[] | select(.id == $uuid) | .id' "$CONFIG")
@@ -3295,6 +3493,7 @@ journal)
 
 # ─── Инфо ────────────────────────────────────────────────────────────────────
 info)
+    [[ "${2:-}" == "--json" ]] && { _info_json; exit 0; }
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════${NC}"
     echo -e "${BOLD}  Xray Info${NC}"
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════${NC}"
@@ -4326,6 +4525,51 @@ dpi|diag-dpi)
     echo -e "${BOLD}H. Российские адреса через тоннель${NC}"
     _ru_report ok dwarn || true
 
+# ══ I. Панель xm и статистика Xray ═══════════════════════════════════════════
+# Панель — единственный новый слушатель, и слушать он должен одну петлю; признак здесь —
+# сокет, а не код панели. Так же проверяется API статистики: у него нет аутентификации.
+    sep
+    echo -e "${BOLD}I. Панель xm и статистика Xray${NC}"
+    UI_PIDS=$(pgrep -f "$UI_DIR/server.py" 2>/dev/null)
+    if [[ -z "$UI_PIDS" ]]; then
+      ok "Панель xm не запущена — порта нет (запуск: sudo xm ui)"
+    else
+      # Все процессы, не первый: вторая копия на другом порту — тоже панель.
+      UI_LST=""
+      for UI_PID in $UI_PIDS; do
+        UI_LST+=$(ss -tlnpH 2>/dev/null | awk -v pid="pid=${UI_PID}," 'index($0, pid) {print $4}')$'\n'
+      done
+      UI_LST=$(grep -v '^$' <<<"$UI_LST")
+      if [[ -z "$UI_LST" ]]; then
+        info "Процесс панели есть (pid $(paste -sd' ' <<<"$UI_PIDS")), сокета пока не видно"
+      elif grep -qvE '^(127\.0\.0\.1|\[::1\]):' <<<"$UI_LST"; then
+        dfail "Панель слушает не только петлю: $(paste -sd' ' <<<"$UI_LST"). Снаружи это вход на управление сервером. Останови: sudo pkill -f $UI_DIR/server.py"
+      else
+        ok "Панель слушает только петлю ($(paste -sd' ' <<<"$UI_LST"))"
+      fi
+    fi
+    ST_API=$(_stats_api)
+    if [[ -z "$ST_API" ]]; then
+      ok "Статистика Xray выключена — локального API нет"
+    else
+      ST_AP=${ST_API##*:}
+      ST_LST=$(ss -tlnH 2>/dev/null | awk -v p=":${ST_AP}" '$4 ~ p"$" {print $4}')
+      case "$ST_API" in
+        127.0.0.1:*|localhost:*|\[::1\]:*) ok "API статистики Xray на $ST_API — петля" ;;
+        *) dfail "API статистики Xray на $ST_API — не петля: у API нет аутентификации. Исправить: sudo xm stats off && sudo xm stats on" ;;
+      esac
+      if [[ -n "$ST_LST" ]] && grep -qvE '^(127\.0\.0\.1|\[::1\]):' <<<"$ST_LST"; then
+        dfail "Сокет API статистики открыт не на петле: $(paste -sd' ' <<<"$ST_LST"). Счётчики читает любой, кто дотянется"
+      fi
+      jq -e '(.api.services // []) | map(ascii_downcase) | index("handlerservice")' "$CONFIG" >/dev/null 2>&1 \
+        && dfail "API разрешает HandlerService: любой локальный процесс добавит себе пользователя"
+      jq -e '[.. | .statsUserOnline? // empty] | any' "$CONFIG" >/dev/null 2>&1 \
+        && dwarn "statsUserOnline включён: Xray держит IP подключённых клиентов в памяти и отдаёт через API. Убери флаг из policy"
+      systemctl is-active --quiet xm-stats.timer \
+        && ok "Таймер замеров статистики работает" \
+        || dwarn "Статистика включена, а таймер замеров не работает — sudo xm stats on"
+    fi
+
 # ══ Итог ═════════════════════════════════════════════════════════════════════
     sep
     if [[ "$DPI_CRIT" -eq 0 && "$DPI_WARN" -eq 0 ]]; then
@@ -4341,6 +4585,9 @@ dpi|diag-dpi)
       echo -e "    ${BOLD}sudo xm diag${NC}          общее состояние сервера"
     fi
     echo ""
+    # Итоговые числа для панели (ui/server.py разбирает именно эту строку): в самом
+    # выводе формат менялся бы вместе с формулировками.
+    [[ -n "${XM_RESULT_LINE:-}" ]] && echo "XM-RESULT crit=$DPI_CRIT warn=$DPI_WARN"
     ;;
 
 diag-ntp)
@@ -5791,6 +6038,147 @@ pq)
     esac
     ;;
 
+# ─── Панель ──────────────────────────────────────────────────────────────────
+# Живёт, пока открыт сеанс, слушает только 127.0.0.1 (ui/server.py), порт запоминается.
+# К серверу — через SSH-тоннель: ssh -L <порт на ПК>:127.0.0.1:<порт панели> …
+ui)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm ui [--port N] [--idle МИН]${NC}"; exit 1; }
+    UI_P=""; UI_IDLE=30; UI_SAVE=false
+    shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --port) shift; UI_P="${1:-}"; UI_SAVE=true ;;
+        --idle) shift; UI_IDLE="${1:-}" ;;
+        *) echo -e "${RED}Неизвестный аргумент: $1${NC}"; echo "  xm ui [--port N] [--idle МИН]"; exit 1 ;;
+      esac
+      shift
+    done
+    [[ -z "$UI_P" ]] && UI_P=$(head -1 "$UI_PORT_FILE" 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$UI_P" ]] && UI_P="$UI_PORT_DEFAULT"
+    if ! [[ "$UI_P" =~ ^[0-9]+$ ]] || (( UI_P < 1024 || UI_P > 65535 )); then
+      fail "Порт панели — число от 1024 до 65535, получено: $UI_P"; exit 1
+    fi
+    if ! [[ "$UI_IDLE" =~ ^[0-9]+$ ]] || (( UI_IDLE < 1 )); then
+      fail "--idle — целое число минут, получено: $UI_IDLE"; exit 1
+    fi
+    command -v python3 >/dev/null 2>&1 || { fail "python3 не установлен: sudo apt install -y python3"; exit 1; }
+    python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' \
+      || { fail "Нужен Python 3.8 или новее, на сервере: $(python3 --version 2>&1)"; exit 1; }
+    [[ -f "$UI_DIR/server.py" ]] \
+      || { fail "Файлов панели нет в $UI_DIR"; echo -e "  Поставить: ${BOLD}sudo xm self-update${NC}"; exit 1; }
+    command -v qrencode >/dev/null 2>&1 \
+      || warn "qrencode не установлен — QR в панели не будет, ссылки работают: sudo apt install -y qrencode"
+    if ss -tlnH 2>/dev/null | awk -v p=":$UI_P" '$4 ~ p"$" {f=1} END {exit !f}'; then
+      fail "Порт $UI_P уже занят: ${BOLD}ss -tlnp | grep :$UI_P${NC}  (другой: sudo xm ui --port <N>)"; exit 1
+    fi
+    if $UI_SAVE; then
+      echo "$UI_P" > "$UI_PORT_FILE" && chmod 644 "$UI_PORT_FILE"
+    fi
+    UI_XM="$XM_BIN"; [[ -x "$UI_XM" ]] || UI_XM=$(readlink -f "$0")
+    exec python3 "$UI_DIR/server.py" --port "$UI_P" --idle "$UI_IDLE" --xm "$UI_XM" \
+      --config "$CONFIG" --xray-log "$LOG" --journal "$JOURNAL_FILE" --ssh-port "$(_get_ssh_port)" \
+      --nginx-log "$(_front_enabled && echo "$FRONT_LOG" || echo /var/log/nginx/reality_fallback.log)"
+    ;;
+
+# Счётчики Xray для графиков панели. Включает и таймер замеров; выключает — со стиранием.
+stats)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm stats on|off|status${NC}"; exit 1; }
+    case "${2:-status}" in
+    on)
+      command -v python3 >/dev/null 2>&1 || { fail "python3 не установлен: sudo apt install -y python3"; exit 1; }
+      [[ -f "$UI_DIR/stats.py" ]] \
+        || { fail "Нет $UI_DIR/stats.py"; echo -e "  Поставить: ${BOLD}sudo xm self-update${NC}"; exit 1; }
+      ST_TAG=$(jq -r '.api.tag // empty' "$CONFIG" 2>/dev/null)
+      if [[ -n "$ST_TAG" && "$ST_TAG" != "$STATS_TAG" ]]; then
+        fail "В config.json уже есть свой блок api (tag=$ST_TAG) — xm его не перезаписывает"
+        info "Добавь в него StatsService и listen на 127.0.0.1 сам, либо убери блок и повтори"
+        exit 1
+      fi
+      ST_API=$(_stats_api)
+      if [[ -z "$ST_API" ]]; then
+        ST_PORT=$(_stats_free_port) || { fail "На 127.0.0.1 заняты все порты 10085–10095"; exit 1; }
+        ST_API="127.0.0.1:$ST_PORT"
+      fi
+      if ! _stats_try on "$ST_API"; then
+        fail "Эта сборка Xray ($(_xray_ver)) не приняла конфиг со статистикой — config.json не тронут"
+        info "Проверить самому: ${BOLD}sudo xm update --check${NC}"
+        exit 1
+      fi
+      # Уже включено — конфиг не переписываем и Xray не перезапускаем: рестарт рвёт клиентам соединения.
+      if [[ "$(jq -S . "$CONFIG")" == "$(_stats_patch on "$ST_API" | jq -S .)" ]] && _stats_api_up "$ST_API"; then
+        ok "Статистика уже включена, API на $ST_API отвечает — конфиг не тронут"
+      else
+        ST_BAK=$(_backup_config stats)
+        echo -e "${GREEN}Бэкап: $ST_BAK${NC}"
+        warn "Xray перезапустится: подключённые клиенты переподключатся за пару секунд"
+        _stats_patch on "$ST_API" | _atomic_write_config || { fail "Не удалось записать config.json"; exit 1; }
+        if ! _apply; then
+          cat "$ST_BAK" | _atomic_write_config && _apply >/dev/null
+          fail "Xray не принял конфиг — возвращён прежний ($ST_BAK)"; exit 1
+        fi
+        # Следствие, а не статус юнита: API отвечает на запрос.
+        ST_UP=false
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          _stats_api_up "$ST_API" && { ST_UP=true; break; }
+          sleep 1
+        done
+        if ! $ST_UP; then
+          cat "$ST_BAK" | _atomic_write_config && _apply >/dev/null
+          fail "API Xray не ответил на $ST_API за 10 с — конфиг возвращён ($ST_BAK)"
+          info "Смотри: journalctl -u xray -n 30"
+          exit 1
+        fi
+        ok "Xray считает трафик по клиентам, API на $ST_API (только loopback)"
+      fi
+      _stats_timer_install && ok "Замер раз в 5 минут (xm-stats.timer)" || warn "Таймер замеров не включился: systemctl status xm-stats.timer"
+      _stats_collect || true
+      info "Хранится: трафик всех клиентов за 5 минут, по клиентам — суммы за сутки и время последнего трафика, число соединений на публичном порту. Адресов нет. Срок — 31 день"
+      info "Отключить и стереть данные: ${BOLD}sudo xm stats off${NC}"
+      ;;
+    off)
+      _stats_timer_remove
+      if _stats_try off; then
+        ST_BAK=$(_backup_config stats-off)
+        ST_OWN=$(jq -r --arg t "$STATS_TAG" '(.api.tag? // "") == $t' "$CONFIG" 2>/dev/null)
+        if _stats_patch off | _atomic_write_config && _apply; then
+          [[ "$ST_OWN" == "true" ]] && ok "Счётчики и API статистики выключены" \
+            || ok "Счётчики выключены; чужой блок api (tag=$(jq -r '.api.tag // "—"' "$CONFIG")) оставлен как есть"
+        else
+          fail "Не удалось применить конфиг; прежний — $ST_BAK"
+        fi
+      else
+        warn "Конфиг без статистики эта сборка Xray не приняла — config.json не тронут"
+      fi
+      rm -rf "$STATS_DIR" && ok "Данные статистики удалены"
+      ;;
+    status)
+      echo -e "\n${BOLD}${CYAN}[ Статистика для панели ]${NC}\n"
+      ST_API=$(_stats_api)
+      if [[ -z "$ST_API" ]]; then
+        info "Выключена. Включить: ${BOLD}sudo xm stats on${NC}"; exit 0
+      fi
+      case "$ST_API" in
+        127.0.0.1:*|localhost:*|\[::1\]:*) ok "API Xray: $ST_API — петля" ;;
+        *) fail "API Xray на $ST_API — не петля: счётчики читает любой, кто дотянется. Исправить: sudo xm stats off && sudo xm stats on" ;;
+      esac
+      _stats_api_up "$ST_API" && ok "API отвечает" \
+        || fail "API не отвечает на $ST_API — проверь: systemctl status xray; повторно: sudo xm stats on"
+      systemctl is-active --quiet xm-stats.timer && ok "Таймер замеров работает" \
+        || warn "Таймер замеров не работает — sudo xm stats on"
+      if [[ -s "$STATS_DIR/samples.jsonl" ]]; then
+        ST_LAST=$(tail -n 1 "$STATS_DIR/samples.jsonl" | jq -r '.t // empty' 2>/dev/null)
+        [[ "$ST_LAST" =~ ^[0-9]+$ ]] && info "Последний замер: $(date -d "@$ST_LAST" '+%F %T') ($(( ($(date +%s) - ST_LAST) / 60 )) мин назад); замеров: $(wc -l < "$STATS_DIR/samples.jsonl"), данные: $(du -sh "$STATS_DIR" | cut -f1)"
+      else
+        info "Замеров пока нет — первый в течение 5 минут после включения"
+      fi
+      jq -e '[.. | .statsUserOnline? // empty] | any' "$CONFIG" >/dev/null 2>&1 \
+        && warn "statsUserOnline включён: Xray держит в памяти IP подключённых клиентов и отдаёт их через API без аутентификации. Убери флаг из policy"
+      ;;
+    collect) _stats_collect; exit $? ;;
+    *) echo -e "${RED}xm stats [on|off|status]${NC}"; exit 1 ;;
+    esac
+    ;;
+
 # ─── Обновление самого xm из git-чекаута ─────────────────────────────────────
 # Заменяет ручной цикл «nano xm.sh → сохранил → скопировал». Источник правды —
 # репозиторий, локальные правки на сервере не переживают обновление (и это
@@ -5972,6 +6360,14 @@ self-update)
     # возвращали «?». Коммит чекаута — признак, который действительно есть и
     # по которому установленное однозначно сопоставляется с репозиторием.
     ok "Установлен $XM_BIN (из $BR@$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null))"
+    # Панель — тем же шагом: её файлы вызывают команды xm и должны быть той же версии.
+    # Живая панель держит свои файлы в памяти; новая версия — со следующего sudo xm ui.
+    _ui_install "$REPO"
+    case $? in
+      0) ok "Панель установлена в $UI_DIR (запуск: sudo xm ui)" ;;
+      2) info "В этой ветке панели нет (каталога ui/ нет)" ;;
+      *) warn "Панель не обновлена (прежняя версия, если была, осталась) — остальное работает" ;;
+    esac
 
     mkdir -p "$(dirname "$XM_SRC_FILE")"
     echo "$REPO" > "$XM_SRC_FILE"; chmod 644 "$XM_SRC_FILE"
@@ -6157,7 +6553,7 @@ neighbors)
 *)
     echo -e "${BOLD}${CYAN}xm — менеджер Xray${NC}   sudo xm <команда>"
     echo ""
-    echo -e "${BOLD}Клиенты${NC}     add [имя] · del · clients"
+    echo -e "${BOLD}Клиенты${NC}     add [имя] · del [uuid] · clients [--json]"
     echo    "            uri [имя|--tcp|--all] · qr [имя] [--tcp|--both|--all]"
     echo -e "${BOLD}Сервис${NC}      start · stop · restart · status · log · log-live · log-clear"
     echo -e "${BOLD}Конфиг${NC}      edit · test · apply · backup · restore · backups"
@@ -6176,7 +6572,9 @@ neighbors)
     echo    "            reality-debug on|off · diag-ntp|diag-ports|diag-tls|diag-fw|diag-log"
     echo -e "${BOLD}Обновление${NC}  ${GREEN}self-update [--check|--force|--from <url>]${NC}  xm из репозитория"
     echo    "            update [--check] · update-geo · autoupd on|off|now|log|status"
-    echo -e "${BOLD}Прочее${NC}      info · paths · uuid · pubkey · journal [show|add \"текст\"]"
+    echo -e "${BOLD}${GREEN}Панель${NC}      ${GREEN}ui [--port N] [--idle МИН]${NC}   веб-интерфейс на 127.0.0.1, доступ только через SSH-тоннель"
+    echo    "            stats on|off|status           графики: счётчики Xray раз в 5 минут (меняет config.json)"
+    echo -e "${BOLD}Прочее${NC}      info [--json] · paths · uuid · pubkey · journal [show|add \"текст\"]"
     echo    "            nginx-status|nginx-log|nginx-reload|nginx-probes"
     echo    "            ban-list · ban-ssh-stat · unban <ip> · log-access"
     ;;

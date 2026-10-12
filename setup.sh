@@ -1304,6 +1304,18 @@ else
   warn "Скопируй xm.sh вручную: sudo cp xm.sh /usr/local/bin/xm && sudo chmod +x /usr/local/bin/xm"
 fi
 
+# Панель (sudo xm ui): веб-интерфейс на 127.0.0.1, доступ только через SSH-тоннель.
+# Файлы ставятся рядом с xm; дальше их обновляет xm self-update, тем же шагом.
+XM_UI_SRC="$(cd "$(dirname "$0")" && pwd)/ui"
+XM_UI_DIR="/usr/local/lib/xm/ui"
+if [[ -d "$XM_UI_SRC" ]]; then
+  install -d -m 755 "$XM_UI_DIR" \
+    && install -m 644 "$XM_UI_SRC"/server.py "$XM_UI_SRC"/stats.py "$XM_UI_SRC"/index.html \
+         "$XM_UI_SRC"/app.js "$XM_UI_SRC"/app.css "$XM_UI_SRC"/icon.svg "$XM_UI_DIR"/ \
+    && success "Панель установлена: sudo xm ui" \
+    || warn "Файлы панели не установились — позже: sudo xm self-update"
+fi
+
 # Источник правды — репозиторий, а не копия на VPS: отсюда xm self-update
 # тянет коммиты и переустанавливает бинарь.
 XM_REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
