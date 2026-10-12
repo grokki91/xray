@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Панель xm</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap top-row">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">xm</span>
+      <div>
+        <div class="srv"><span id="srv">сервер</span><span class="mono" id="ip"></span></div>
+        <div class="sess">
+          <svg viewBox="0 0 12 12" aria-hidden="true"><rect class="lock-body" x="2" y="5.5" width="8" height="5.5" rx="1.2"/><path class="lock-shackle" d="M3.8 5.5V4a2.2 2.2 0 0 1 4.4 0v1.5"/></svg>
+          <span>Только через SSH-тоннель</span><span aria-hidden="true">·</span><span>закроется через <span id="idle">—</span> без действий</span>
+        </div>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span class="pill" id="xray-pill" hidden></span>
+      <button class="btn" id="stop" type="button">Завершить сессию</button>
+    </div>
+  </div>
+  <nav class="wrap tabs" role="tablist" aria-label="Разделы панели">
+    <button class="tab" type="button" role="tab" id="t-overview" aria-controls="p-overview" aria-selected="true">Обзор</button>
+    <button class="tab" type="button" role="tab" id="t-clients" aria-controls="p-clients" aria-selected="false">Клиенты</button>
+    <button class="tab" type="button" role="tab" id="t-charts" aria-controls="p-charts" aria-selected="false">Графики</button>
+    <button class="tab" type="button" role="tab" id="t-logs" aria-controls="p-logs" aria-selected="false">Логи</button>
+  </nav>
+</header>
+
+<main class="wrap">
+
+  <!-- Обзор -->
+  <section class="panel" id="p-overview" role="tabpanel" aria-labelledby="t-overview">
+    <div class="card alert" id="ov-err" role="alert" hidden></div>
+
+    <div class="tiles">
+      <div class="card">
+        <div class="t-label">Трафик за сутки</div>
+        <div class="t-value" id="tile-traffic">—</div>
+        <div class="t-sub" id="tile-traffic-sub"></div>
+      </div>
+      <div class="card">
+        <div class="t-label">Соединений на публичном порту</div>
+        <div class="t-value" id="tile-conns">—</div>
+        <div class="t-sub">Своих клиентов и зондов вместе, сейчас</div>
+      </div>
+      <div class="card">
+        <div class="t-label">Нагрузка VPS (load average, 1 мин)</div>
+        <div class="t-value" id="tile-load">—</div>
+        <div class="t-sub" id="tile-load-sub"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Службы</h2>
+      <ul class="svc" id="svc"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Проверки</h2>
+      <div class="checks">
+        <div class="check">
+          <div>
+            <div class="name">selftest</div>
+            <div class="what">живой хендшейк через сервер</div>
+            <div class="meta" id="meta-selftest"><span class="st off" aria-hidden="true">–</span><span>не запускалась в этой сессии</span></div>
+          </div>
+          <button class="btn" type="button" data-run="selftest">Запустить</button>
+        </div>
+        <div class="check">
+          <div>
+            <div class="name">diag-dpi --quick</div>
+            <div class="what">маска, зонды, DNS, стабильность</div>
+            <div class="meta" id="meta-diag-dpi"><span class="st off" aria-hidden="true">–</span><span>не запускалась в этой сессии</span></div>
+          </div>
+          <button class="btn" type="button" data-run="diag-dpi">Запустить</button>
+        </div>
+      </div>
+      <div class="term-head" id="term-head" hidden>
+        <span class="mono" id="term-cmd"></span>
+        <span class="row"><span id="term-state"></span><button class="btn small" type="button" id="term-cancel" hidden>Прервать</button></span>
+      </div>
+      <div class="term" id="term" role="log" hidden></div>
+    </div>
+
+    <div class="card">
+      <h2>Конфигурация</h2>
+      <dl class="kv" id="cfg"></dl>
+    </div>
+  </section>
+
+  <!-- Клиенты -->
+  <section class="panel" id="p-clients" role="tabpanel" aria-labelledby="t-clients" hidden>
+    <div class="card alert" id="cl-err" role="alert" hidden></div>
+    <div class="toolbar">
+      <h2>Клиенты <span class="count" id="ccount"></span></h2>
+      <button class="btn primary" type="button" id="add-open">Добавить клиента</button>
+    </div>
+
+    <form class="card addform" id="add-form" hidden>
+      <div class="field">
+        <label for="new-name">Имя клиента</label>
+        <input type="text" id="new-name" autocomplete="off" maxlength="32" placeholder="например, телефон-аня">
+      </div>
+      <p class="hint">Xray перезапустится: подключённые устройства переподключатся за пару секунд.</p>
+      <p class="err" id="add-err" role="alert"></p>
+      <div class="row">
+        <button class="btn primary" type="submit" id="add-go">Создать и показать QR</button>
+        <button class="btn" type="button" id="add-cancel">Отмена</button>
+      </div>
+    </form>
+
+    <div class="split">
+      <div class="card tablecard">
+        <div class="scroll">
+          <table id="ctable">
+            <thead><tr><th>Клиент</th><th class="uuid">UUID</th><th class="r" data-st>Сегодня</th><th class="r m30" data-st>30 дней</th><th data-st>Последний трафик</th></tr></thead>
+            <tbody id="ctbody"></tbody>
+          </table>
+        </div>
+        <p class="hint" id="cl-stats-hint" hidden>Трафик по клиентам не считается. На сервере: <code>sudo xm stats on</code></p>
+      </div>
+
+      <aside class="card detail" id="detail" aria-live="polite" hidden>
+        <div class="dhead">
+          <h3 id="d-name"></h3>
+          <div class="mono" id="d-uuid"></div>
+        </div>
+        <div class="seg" role="group" aria-label="Транспорт ссылки">
+          <button type="button" id="k-xhttp" aria-pressed="true">XHTTP</button>
+          <button type="button" id="k-tcp" aria-pressed="false">TCP · Vision</button>
+        </div>
+        <div class="qrbox" id="qrbox"></div>
+        <p class="hint">Отсканируйте камерой из v2rayNG или Happ либо скопируйте ссылку и импортируйте из буфера.</p>
+        <div class="uri" id="d-uri"></div>
+        <div class="row"><button class="btn" type="button" id="copy">Копировать ссылку</button></div>
+        <div class="danger-zone">
+          <button class="btn quiet-danger" type="button" id="del-open">Удалить клиента…</button>
+          <div class="field" id="del-box" hidden>
+            <label for="del-confirm" id="del-label"></label>
+            <div class="row">
+              <input type="text" id="del-confirm" class="grow" autocomplete="off">
+              <button class="btn danger" type="button" id="del-do" disabled>Удалить</button>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </section>
+
+  <!-- Графики -->
+  <section class="panel" id="p-charts" role="tabpanel" aria-labelledby="t-charts" hidden>
+    <div class="card alert" id="ch-err" role="alert" hidden></div>
+    <div class="card" id="ch-off" hidden>
+      <h2 id="ch-off-title">Графики не включены</h2>
+      <p class="sub" id="ch-off-text"></p>
+      <pre class="cmd" id="ch-off-cmd">sudo xm stats on</pre>
+    </div>
+
+    <div class="panel" id="ch-body">
+      <div class="seg" role="group" aria-label="Период">
+        <button type="button" data-range="24h" aria-pressed="true">Сутки</button>
+        <button type="button" data-range="7d" aria-pressed="false">7 дней</button>
+        <button type="button" data-range="30d" aria-pressed="false">30 дней</button>
+      </div>
+
+      <div class="card">
+        <div class="chead">
+          <div><h2>Трафик клиентов</h2><p class="sub" id="traffic-sub"></p></div>
+          <button class="btn small" type="button" data-table="tv-traffic" aria-pressed="false">Таблица</button>
+        </div>
+        <div class="legend"><span><i class="k s1"></i>↓ к клиентам</span><span><i class="k s2"></i>↑ от клиентов</span></div>
+        <div class="plot" id="plot-traffic" tabindex="0" aria-label="График трафика: стрелки влево и вправо двигают метку времени"></div>
+        <div class="tview" id="tv-traffic" hidden></div>
+      </div>
+
+      <div class="card">
+        <div class="chead">
+          <div><h2>Трафик по клиентам</h2><p class="sub" id="clients-sub"></p></div>
+          <button class="btn small" type="button" data-table="tv-clients" aria-pressed="false">Таблица</button>
+        </div>
+        <div class="bars" id="bars-clients"></div>
+        <div class="tview" id="tv-clients" hidden></div>
+      </div>
+
+      <div class="card">
+        <div class="chead">
+          <div><h2>Соединения на публичном порту</h2><p class="sub">Свои клиенты и зонды вместе; на интервал — максимум из замеров раз в 5 минут</p></div>
+          <button class="btn small" type="button" data-table="tv-conns" aria-pressed="false">Таблица</button>
+        </div>
+        <div class="plot" id="plot-conns" tabindex="0" aria-label="График соединений: стрелки влево и вправо двигают метку времени"></div>
+        <div class="tview" id="tv-conns" hidden></div>
+      </div>
+
+      <p class="foot">На сервере хранятся только счётчики: трафик всех клиентов за каждые 5 минут, по клиентам — суммы за сутки и время последнего трафика. Ни адресов клиентов, ни адресов назначения. Срок хранения — 31 день. Время — серверное.</p>
+    </div>
+  </section>
+
+  <!-- Логи -->
+  <section class="panel" id="p-logs" role="tabpanel" aria-labelledby="t-logs" hidden>
+    <div class="seg" role="group" aria-label="Источник" id="lsrc">
+      <button type="button" data-src="xray" aria-pressed="true">Xray</button>
+      <button type="button" data-src="nginx" aria-pressed="false">Зонды (nginx)</button>
+      <button type="button" data-src="watchdog" aria-pressed="false">watchdog</button>
+      <button type="button" data-src="f2b" aria-pressed="false">fail2ban</button>
+      <button type="button" data-src="journal" aria-pressed="false">Журнал</button>
+    </div>
+    <div class="logbar">
+      <input type="search" id="lfilter" placeholder="Фильтр строк, например timeout" aria-label="Фильтр строк">
+      <label class="chk"><input type="checkbox" id="follow"> Следить</label>
+      <button class="btn" type="button" id="lreload">Обновить</button>
+    </div>
+    <div class="card">
+      <div class="lmeta"><span class="mono" id="lpath"></span><span id="lnote"></span></div>
+      <div class="term logview" id="logview" role="log"></div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast" role="status" hidden></div>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="box">
+    <h3 id="ov-title">Панель остановлена</h3>
+    <p>Порт на сервере закрыт, ссылка с токеном больше не действует. Чтобы открыть панель снова, на сервере:</p>
+    <pre class="cmd">sudo xm ui</pre>
+    <p class="hint">Токен каждый раз новый: открыть нужно ссылку, которую напечатает команда.</p>
+  </div>
+</div>
+
+</body>
+</html>
