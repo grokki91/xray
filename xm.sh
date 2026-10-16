@@ -1172,6 +1172,8 @@ _access_apply() {
 FRONT_STATE="/usr/local/etc/xray/front.conf"
 FRONT_NGX="/etc/nginx/stream-enabled/front.conf"
 FRONT_LOG="/var/log/nginx/front.log"
+# Сюда nginx пишет отказы limit_conn front_conn (error_log фронта): след шторма соединений.
+FRONT_ERR_LOG="/var/log/nginx/front_error.log"
 
 # Фронт включён = конфиг лежит там, откуда nginx его читает.
 _front_enabled() { [[ -f "$FRONT_NGX" ]]; }
@@ -1400,6 +1402,10 @@ SYSCTL_FILE="/etc/sysctl.d/99-xray-tune.conf"
 NGX_BACKLOG=8192
 WATCHDOG_SVC="/etc/systemd/system/xray-watchdog.service"
 WATCHDOG_TIMER="/etc/systemd/system/xray-watchdog.timer"
+# Для панели: итог последнего прогона и вмешательства за 7 дней (по строке JSON).
+# Сообщения — те же, что уходят в journald: без адресов клиентов.
+WATCHDOG_STATE="/var/lib/xm/watchdog.json"
+WATCHDOG_EVENTS="/var/lib/xm/watchdog-events.jsonl"
 
 _tune_on() { [[ -f "$SYSCTL_FILE" ]]; }
 
@@ -1784,6 +1790,25 @@ _wd_check() {
     rc=1
   fi
   return $rc
+}
+
+# Итог прогона — в файлы для панели. Вывод CLI не API, поэтому состояние пишется
+# отдельно: код возврата _wd_check и его сообщения как есть. Тихий прогон (всё
+# исправно) обновляет только время последней проверки.
+_wd_record() {
+  local rc="$1" out="$2" now
+  now=$(date +%s)
+  mkdir -p "$(dirname "$WATCHDOG_STATE")" 2>/dev/null || return 0
+  jq -nc --argjson t "$now" --argjson rc "$rc" --arg msg "$out" '{t: $t, rc: $rc, msg: $msg}' \
+    > "$WATCHDOG_STATE.tmp" 2>/dev/null && mv -f "$WATCHDOG_STATE.tmp" "$WATCHDOG_STATE"
+  [[ -n "$out" ]] || return 0
+  jq -nc --argjson t "$now" --argjson rc "$rc" --arg msg "$out" '{t: $t, rc: $rc, msg: $msg}' \
+    >> "$WATCHDOG_EVENTS" 2>/dev/null
+  # Срок — 7 дней, как у «xm watchdog»; чистится только при записи, а пишется редко.
+  jq -cnR --argjson cut "$(( now - 7 * 86400 ))" 'inputs | fromjson? | select(.t? >= $cut)' \
+    "$WATCHDOG_EVENTS" > "$WATCHDOG_EVENTS.tmp" 2>/dev/null \
+    && mv -f "$WATCHDOG_EVENTS.tmp" "$WATCHDOG_EVENTS"
+  return 0
 }
 
 # Юниты пишутся только при включении. Сообщения уходят в journald и НЕ содержат
@@ -2249,6 +2274,19 @@ STATS_SVC="/etc/systemd/system/xm-stats.service"
 STATS_TIMER="/etc/systemd/system/xm-stats.timer"
 # По тегу опознаётся свой блок api: чужой, заведённый руками, xm не перезаписывает и не удаляет.
 STATS_TAG="xm-stats"
+# Итоги последних selftest и diag-dpi — откуда бы их ни запустили (терминал, панель).
+CHECKS_DIR="/var/lib/xm/checks"
+
+# _check_save <имя> <json> — итог проверки для панели; сбой записи проверку не роняет.
+_check_save() {
+  mkdir -p "$CHECKS_DIR" 2>/dev/null || return 0
+  printf '%s\n' "$2" > "$CHECKS_DIR/$1.json.tmp" 2>/dev/null \
+    && mv -f "$CHECKS_DIR/$1.json.tmp" "$CHECKS_DIR/$1.json"
+  return 0
+}
+
+# Однострочный JSON из файла или null: файла нет, пуст или испорчен.
+_json_file() { local v; v=$(jq -c . "$1" 2>/dev/null | head -n 1); echo "${v:-null}"; }
 
 # Файлы панели из чекаута → $UI_DIR. Каталог меняется целиком (rename): запущенная
 # панель держит свои файлы в памяти. Код возврата: 0 — установлено, 2 — в чекауте нет
@@ -2300,11 +2338,16 @@ _info_json() {
     --argjson ru "$(_jb _ru_on)" --argjson tune "$(_jb _tune_on)" \
     --argjson front "$(_jb _front_enabled)" --argjson pq "$(_jb _pq_on)" \
     --argjson ufw "$(_jb _ufw_active)" \
+    --argjson wdlast "$(_json_file "$WATCHDOG_STATE")" --argjson wdev "$(_wd_events_json 86400)" \
+    --argjson ckst "$(_json_file "$CHECKS_DIR/selftest.json")" \
+    --argjson ckdpi "$(_json_file "$CHECKS_DIR/diag-dpi.json")" \
     --slurpfile cfg "$CONFIG" \
     '$cfg[0] as $c | {
       hostname: $host, server_ip: $ip, ssh_port: ($ssh | tonumber? // null),
       xray: {version: $xver, active: $xact, since: ($since | tonumber)},
       services: {nginx: $nginx, fail2ban: $f2b, chrony: $chrony, watchdog: $wd},
+      watchdog: {last: $wdlast, events: $wdev},
+      checks: {selftest: $ckst, diag_dpi: $ckdpi},
       config: {
         transport: ($c.inbounds[0].streamSettings.network // null),
         port: ($c.inbounds[0].port // null), public_port: ($pub | tonumber? // null),
@@ -2318,6 +2361,15 @@ _info_json() {
         loglevel: ($c.log.loglevel // null)
       }
     }'
+}
+
+# Вмешательства watchdog за последние N секунд: {n, last: [до 10 последних]}.
+_wd_events_json() {
+  local v
+  v=$(jq -cnR --argjson cut "$(( $(date +%s) - $1 ))" \
+    '[inputs | fromjson? | select(.t? >= $cut)] | {n: length, last: .[-10:]}' \
+    "$WATCHDOG_EVENTS" 2>/dev/null)
+  if [[ -n "$v" ]]; then echo "$v"; else echo '{"n":0,"last":[]}'; fi
 }
 
 # Клиенты одним JSON — вход панели: UUID, имя, email (ключ статистики) и готовые URI.
@@ -2392,7 +2444,8 @@ _stats_collect() {
   api=$(_stats_api)
   [[ -n "$api" ]] || { echo "stats: в config.json нет api.listen — sudo xm stats on" >&2; return 1; }
   python3 "$UI_DIR/stats.py" collect --xray "$(command -v xray)" --api "$api" \
-    --port "$(_front_public_port)" --config "$CONFIG"
+    --port "$(_front_public_port)" --config "$CONFIG" \
+    --front-log "$(_front_enabled && echo "$FRONT_ERR_LOG")"
 }
 
 _stats_timer_install() {
@@ -4489,7 +4542,7 @@ dpi|diag-dpi)
     # Шторм длится минуты, снимок его почти всегда пропустит. След остаётся,
     # если клиент упёрся в лимит фронта на адрес (limit_conn front_conn): nginx
     # пишет каждый отказ в front_error.log.
-    FEL=/var/log/nginx/front_error.log
+    FEL="$FRONT_ERR_LOG"
     if _front_enabled && [[ -s "$FEL" ]]; then
       FEL_CUT=$(date -d '24 hours ago' '+%Y/%m/%d %H:%M:%S' 2>/dev/null) || FEL_CUT=""
       LC_N=$(awk -v cut="$FEL_CUT" '(cut == "" || ($1 " " $2) >= cut) && /limiting connections by zone "front_conn"/' "$FEL" 2>/dev/null | wc -l)
@@ -4588,6 +4641,8 @@ dpi|diag-dpi)
     # Итоговые числа для панели (ui/server.py разбирает именно эту строку): в самом
     # выводе формат менялся бы вместе с формулировками.
     [[ -n "${XM_RESULT_LINE:-}" ]] && echo "XM-RESULT crit=$DPI_CRIT warn=$DPI_WARN"
+    _check_save diag-dpi "$(jq -nc --argjson t "$(date +%s)" --argjson crit "$DPI_CRIT" \
+      --argjson warn "$DPI_WARN" --argjson quick "$QUICK" '{t: $t, crit: $crit, warn: $warn, quick: $quick}')"
     ;;
 
 diag-ntp)
@@ -4790,14 +4845,16 @@ selftest)
     echo -e "${BOLD}${CYAN}[ Selftest: живой хендшейк через loopback ]${NC}"; sep
     if [[ "${2:-}" == "--tcp" ]]; then
       _has_tcp_inbound || { fail "TCP inbound отсутствует"; exit 1; }
-      _selftest tcp
+      _selftest tcp; ST_RC=$?; ST_MODE=tcp
     elif [[ "${2:-}" == "--all" ]]; then
-      _selftest xhttp; R1=$?
+      _selftest xhttp; ST_RC=$?; ST_MODE=all
       _has_tcp_inbound && { sep; _selftest tcp; }
-      exit $R1
     else
-      _selftest xhttp
+      _selftest xhttp; ST_RC=$?; ST_MODE=xhttp
     fi
+    _check_save selftest "$(jq -nc --argjson t "$(date +%s)" --argjson rc "$ST_RC" --arg mode "$ST_MODE" \
+      '{t: $t, rc: $rc, mode: $mode}')"
+    exit $ST_RC
     ;;
 
 # ─── Подбор домена-маски ─────────────────────────────────────────────────────
@@ -5111,8 +5168,11 @@ watchdog)
         # заполняться строками «всё хорошо» каждые две минуты.
         # `|| true` обязателен: _wd_check возвращает !=0, когда что-то чинил, а
         # для Type=oneshot это означало бы «юнит упал». Тогда каждое УСПЕШНОЕ
-        # вмешательство watchdog помечалось бы в systemd как сбой.
-        _wd_check || true ;;
+        # вмешательство watchdog помечалось бы в systemd как сбой. Поэтому код
+        # возврата не уходит наружу, а записывается для панели (_wd_record).
+        WD_OUT=$(_wd_check 2>&1); WD_RC=$?
+        [[ -n "$WD_OUT" ]] && echo "$WD_OUT"
+        _wd_record "$WD_RC" "$WD_OUT" ;;
       on)
         [[ $EUID -ne 0 ]] && { echo -e "${RED}sudo xm watchdog on${NC}"; exit 1; }
         _wd_install && ok "watchdog включён (каждые 2 мин)" ;;

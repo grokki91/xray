@@ -3,12 +3,14 @@
 
 Хранится ровно то, что нужно графикам, и ничего, что связывает трафик с адресами:
   samples.jsonl — по строке на замер: время, трафик всех клиентов за интервал, число
-                  соединений на публичном порту;
+                  соединений на публичном порту, число адресов и максимум соединений
+                  с одного адреса (сами адреса не сохраняются), отказы лимита фронта
+                  на адрес за интервал;
   clients.json  — по клиенту: суммы за сутки и время последнего трафика.
 Адреса клиентов и назначений Xray отдаёт только при statsUserOnline, он не включается.
 Срок хранения — KEEP_DAYS, дальше записи удаляются при очередном замере.
 
-  stats.py collect --xray PATH --api HOST:PORT --port N --config PATH
+  stats.py collect --xray PATH --api HOST:PORT --port N --config PATH [--front-log PATH]
 """
 import bisect
 import datetime
@@ -30,6 +32,13 @@ KEEP_DAYS = 31
 RANGES = {"24h": (96, 900), "7d": (168, 3600), "30d": (30, None)}
 
 _STAT_RE = re.compile(r"^user>>>(.+)>>>traffic>>>(uplink|downlink)$")
+
+# Больше стольких соединений с одного адреса — шторм или сканер: тот же порог, что у
+# xm diag-dpi (блок G5). XHTTP с xmux держит на клиента 1–3 TCP.
+STORM_PER_ADDR = 30
+# Отказ limit_conn фронта в его error_log; строка начинается с «ГГГГ/ММ/ДД ЧЧ:ММ:СС».
+_LC_MARK = b'limiting connections by zone "front_conn"'
+LC_READ_MAX = 8 * 1024 * 1024
 
 
 def _path(name):
@@ -92,9 +101,11 @@ def query_users(xray, api, timeout=5):
     return out
 
 
-def count_established(port):
-    """Соединения ESTABLISHED на локальном порту — по /proc/net/tcp*, без разбора вывода ss."""
-    n = 0
+def established(port):
+    """ESTABLISHED на локальном порту — по /proc/net/tcp*, без разбора вывода ss:
+    {conns, addrs, pmax} — соединений, разных адресов, максимум с одного адреса.
+    Адреса живут только в этом вызове: наружу уходят числа."""
+    per = {}
     for name in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
             with open(name, encoding="ascii") as f:
@@ -103,9 +114,34 @@ def count_established(port):
                     cols = line.split()
                     if len(cols) > 3 and cols[3] == "01" \
                             and int(cols[1].rsplit(":", 1)[1], 16) == port:
-                        n += 1
+                        addr = cols[2].rsplit(":", 1)[0]
+                        per[addr] = per.get(addr, 0) + 1
         except (OSError, ValueError, IndexError):
             continue
+    return {"conns": sum(per.values()), "addrs": len(per), "pmax": max(per.values(), default=0)}
+
+
+def front_refusals(path, since, until):
+    """Отказы limit_conn фронта на адрес в (since, until] по его error_log; None — лога нет.
+    Читается хвост файла: отказы за 5 минут в него помещаются и при шторме."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LC_READ_MAX))
+            data = f.read()
+    except OSError:
+        return None
+    n = 0
+    for line in data.split(b"\n"):
+        if _LC_MARK not in line:
+            continue
+        try:
+            ts = time.mktime(time.strptime(line[:19].decode("ascii"), "%Y/%m/%d %H:%M:%S"))
+        except (UnicodeDecodeError, ValueError, OverflowError):
+            continue
+        if since < ts <= until:
+            n += 1
     return n
 
 
@@ -148,6 +184,25 @@ def load_samples(since=0):
     return out
 
 
+def _last_sample_t():
+    """Время последнего замера по хвосту samples.jsonl; 0 — замеров нет."""
+    try:
+        with open(_path(SAMPLES), "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            lines = f.read().split(b"\n")
+    except OSError:
+        return 0
+    for line in reversed(lines):
+        try:
+            t = json.loads(line).get("t")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(t, int):
+            return t
+    return 0
+
+
 def _prune_samples(now):
     cutoff = now - KEEP_DAYS * 86400
     p = _path(SAMPLES)
@@ -162,7 +217,7 @@ def _prune_samples(now):
     _atomic_write(p, "\n".join(keep) + ("\n" if keep else ""))
 
 
-def collect(xray, api, port, config_path, now=None):
+def collect(xray, api, port, config_path, front_log="", now=None):
     """Один замер. Возвращает (код возврата, сообщение или "")."""
     now = int(now or time.time())
     os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
@@ -179,7 +234,15 @@ def collect(xray, api, port, config_path, now=None):
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
         problem = str(e)
 
-    sample = {"t": now, "conns": count_established(port)}
+    sample = {"t": now}
+    sample.update(established(port))
+    if front_log:
+        # Окно — с прошлого замера: таймер плавает, и фиксированные 5 минут теряли бы
+        # или считали дважды отказы на стыке. Первый замер — последние 5 минут.
+        prev = _last_sample_t()
+        lc = front_refusals(front_log, prev if 0 < prev < now else now - 300, now)
+        if lc is not None:
+            sample["lc"] = lc
     if users is not None:
         clients = _load_clients()
         today = _day(now)
@@ -223,13 +286,18 @@ def _edges(range_name, now):
 
 
 def series(range_name, now=None):
-    """Ряды для графиков: Мбит/с вверх и вниз, максимум соединений, байты для таблицы."""
+    """Ряды для графиков: Мбит/с вверх и вниз, максимум соединений и адресов, максимум
+    соединений с одного адреса, отказы лимита фронта, байты для таблицы."""
     now = int(now or time.time())
     edges = _edges(range_name, now)
     n = len(edges) - 1
     up = [None] * n
     down = [None] * n
     conns = [None] * n
+    addrs = [None] * n
+    pmax = [None] * n
+    lc = [None] * n
+    has_lc = False
     last = 0
     for s in load_samples(edges[0]):
         i = bisect.bisect_right(edges, s["t"]) - 1
@@ -239,8 +307,12 @@ def series(range_name, now=None):
         if "up" in s:
             up[i] = (up[i] or 0) + s["up"]
             down[i] = (down[i] or 0) + s["down"]
-        if isinstance(s.get("conns"), int):
-            conns[i] = max(conns[i] or 0, s["conns"])
+        for key, arr in (("conns", conns), ("addrs", addrs), ("pmax", pmax)):
+            if isinstance(s.get(key), int):
+                arr[i] = max(arr[i] or 0, s[key])
+        if isinstance(s.get("lc"), int):
+            lc[i] = (lc[i] or 0) + s["lc"]
+            has_lc = True
     # Последний интервал не закончился: делим на прошедшее время, иначе скорость занижена.
     span = [max(1, min(now, edges[i + 1]) - edges[i]) for i in range(n)]
 
@@ -257,6 +329,10 @@ def series(range_name, now=None):
         "up_mbit": [mbit(b, sp) for b, sp in zip(up, span)],
         "down_mbit": [mbit(b, sp) for b, sp in zip(down, span)],
         "conns_max": conns,
+        "addrs_max": addrs,
+        "per_addr_max": pmax,
+        "front_refusals": lc if has_lc else None,
+        "storm_per_addr": STORM_PER_ADDR,
         "last_sample": last,
         "has_data": any(v is not None for v in up) or any(v is not None for v in conns),
     }
@@ -273,6 +349,14 @@ def traffic_since(seconds, now=None):
             up += s["up"]
             down += s["down"]
     return [up, down] if seen else None
+
+
+def refusals_since(seconds, now=None):
+    """Отказы лимита фронта на адрес за последние seconds секунд; None — не считались
+    (фронт выключен или статистика не собирается)."""
+    now = int(now or time.time())
+    vals = [s["lc"] for s in load_samples(now - seconds) if isinstance(s.get("lc"), int)]
+    return sum(vals) if vals else None
 
 
 def clients_summary(now=None):
@@ -305,7 +389,8 @@ def main(argv):
     for key in it:
         args[key.lstrip("-")] = next(it, "")
     try:
-        rc, msg = collect(args["xray"], args["api"], int(args["port"]), args["config"])
+        rc, msg = collect(args["xray"], args["api"], int(args["port"]), args["config"],
+                          args.get("front-log", ""))
     except (KeyError, ValueError, OSError) as e:
         print("stats: " + str(e), file=sys.stderr)
         return 2

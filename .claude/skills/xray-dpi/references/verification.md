@@ -155,3 +155,14 @@ sudo systemd-run --unit=xm-probe --collect --property=RuntimeMaxSec=21600 \
   панели виден трафик клиента. `sudo xm stats off` возвращает конфиг (`jq '{stats,api}'
   /usr/local/etc/xray/config.json` — оба `null`) и стирает `/var/lib/xm/stats`;
 - Xray при `stats on` перезапускается: убедиться, что клиент на телефоне переподключился сам.
+- watchdog для панели: через 2–4 минуты после обновления `sudo cat /var/lib/xm/watchdog.json`
+  — свежее `t`, `rc` 0, пустой `msg`; в «Службах» — «путь исправен, проверка N мин назад».
+  Негативная проверка: `sudo systemctl stop nginx`, дождаться прогона — `watchdog-events.jsonl`
+  получил строку, в панели «вмешательств за сутки: 1» и строка события; nginx поднят самим watchdog;
+- итоги проверок: после `sudo xm selftest` и `sudo xm diag-dpi` из терминала в
+  `/var/lib/xm/checks/` лежат `selftest.json` и `diag-dpi.json`, панель в новой сессии
+  показывает их с возрастом, а не «ещё не запускалась»;
+- соединения: адресов и «с одного до» на «Обзоре» совпадают с G5 в `sudo xm diag-dpi`;
+  после `xm stats on` в `samples.jsonl` у замеров есть `addrs`, `pmax`, при фронте — `lc`.
+  Адресов в файлах нет: `sudo grep -cE '([0-9]{1,3}\.){3}[0-9]{1,3}' /var/lib/xm/stats/samples.jsonl` — 0;
+- IP в шапке скрыт до нажатия «показать IP», после перезагрузки страницы снова скрыт.

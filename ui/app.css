@@ -80,6 +80,8 @@ p { margin: 0; }
 .logo { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 8px; background: var(--accent); color: var(--accent-ink); font: 700 15px/1 var(--font-mono); flex: none; }
 .srv { font-weight: 650; font-size: 15px; }
 .srv .mono { font-weight: 500; font-size: 13px; color: var(--ink-2); margin-left: 8px; }
+.linkbtn { appearance: none; background: none; border: 0; padding: 0; margin-left: 8px; color: var(--accent); font: 500 12.5px/1 var(--font-ui); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+.linkbtn:hover { color: var(--ink); }
 .sess { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; color: var(--muted); font-size: 12.5px; }
 .sess svg { width: 12px; height: 12px; flex: none; }
 .sess .lock-body { fill: currentColor; }
@@ -125,11 +127,16 @@ pre.cmd { display: block; padding: 8px 10px; margin: 8px 0 0; white-space: pre-w
 .t-label { color: var(--ink-2); font-size: 12.5px; }
 .t-value { font-size: 28px; font-weight: 650; letter-spacing: -0.01em; margin-top: 2px; }
 .t-sub { color: var(--muted); font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
+.t-sub.bad { color: var(--warn-ink); }
 
 .svc { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px 24px; }
 .svc li { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .svc b { font-weight: 600; }
 .svc .d { color: var(--muted); font-size: 12.5px; }
+.wd-events { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line); }
+.wd-events h3 { font-size: 13px; font-weight: 600; }
+.wd-events ul { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 4px; font: 12.5px/1.5 var(--font-mono); overflow-wrap: anywhere; }
+.wd-events .tm { color: var(--muted); margin-right: 8px; }
 
 .checks { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
 .check { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-s); min-width: 0; }

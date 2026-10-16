@@ -17,7 +17,7 @@
     <div class="brand">
       <span class="logo" aria-hidden="true">xm</span>
       <div>
-        <div class="srv"><span id="srv">сервер</span><span class="mono" id="ip"></span></div>
+        <div class="srv"><span id="srv">сервер</span><span class="mono" id="ip" hidden></span><button class="linkbtn" type="button" id="ip-toggle" aria-pressed="false" hidden>показать IP</button></div>
         <div class="sess">
           <svg viewBox="0 0 12 12" aria-hidden="true"><rect class="lock-body" x="2" y="5.5" width="8" height="5.5" rx="1.2"/><path class="lock-shackle" d="M3.8 5.5V4a2.2 2.2 0 0 1 4.4 0v1.5"/></svg>
           <span>Только через SSH-тоннель</span><span aria-hidden="true">·</span><span>закроется через <span id="idle">—</span> без действий</span>
@@ -53,6 +53,7 @@
         <div class="t-label">Соединений на публичном порту</div>
         <div class="t-value" id="tile-conns">—</div>
         <div class="t-sub">Своих клиентов и зондов вместе, сейчас</div>
+        <div class="t-sub" id="tile-conns-sub"></div>
       </div>
       <div class="card">
         <div class="t-label">Нагрузка VPS (load average, 1 мин)</div>
@@ -64,6 +65,10 @@
     <div class="card">
       <h2>Службы</h2>
       <ul class="svc" id="svc"></ul>
+      <div class="wd-events" id="wd-events" hidden>
+        <h3>Watchdog за сутки</h3>
+        <ul id="wd-list"></ul>
+      </div>
     </div>
 
     <div class="card">
@@ -73,7 +78,7 @@
           <div>
             <div class="name">selftest</div>
             <div class="what">живой хендшейк через сервер</div>
-            <div class="meta" id="meta-selftest"><span class="st off" aria-hidden="true">–</span><span>не запускалась в этой сессии</span></div>
+            <div class="meta" id="meta-selftest"><span class="st off" aria-hidden="true">–</span><span>ещё не запускалась</span></div>
           </div>
           <button class="btn" type="button" data-run="selftest">Запустить</button>
         </div>
@@ -81,7 +86,7 @@
           <div>
             <div class="name">diag-dpi --quick</div>
             <div class="what">маска, зонды, DNS, стабильность</div>
-            <div class="meta" id="meta-diag-dpi"><span class="st off" aria-hidden="true">–</span><span>не запускалась в этой сессии</span></div>
+            <div class="meta" id="meta-diag-dpi"><span class="st off" aria-hidden="true">–</span><span>ещё не запускалась</span></div>
           </div>
           <button class="btn" type="button" data-run="diag-dpi">Запустить</button>
         </div>
@@ -198,11 +203,22 @@
           <div><h2>Соединения на публичном порту</h2><p class="sub">Свои клиенты и зонды вместе; на интервал — максимум из замеров раз в 5 минут</p></div>
           <button class="btn small" type="button" data-table="tv-conns" aria-pressed="false">Таблица</button>
         </div>
+        <div class="legend"><span><i class="k s1"></i>соединений</span><span><i class="k s2"></i>адресов</span></div>
         <div class="plot" id="plot-conns" tabindex="0" aria-label="График соединений: стрелки влево и вправо двигают метку времени"></div>
         <div class="tview" id="tv-conns" hidden></div>
       </div>
 
-      <p class="foot">На сервере хранятся только счётчики: трафик всех клиентов за каждые 5 минут, по клиентам — суммы за сутки и время последнего трафика. Ни адресов клиентов, ни адресов назначения. Срок хранения — 31 день. Время — серверное.</p>
+      <div class="card">
+        <div class="chead">
+          <div><h2>Соединений с одного адреса</h2><p class="sub" id="storm-sub"></p></div>
+          <button class="btn small" type="button" data-table="tv-storm" aria-pressed="false">Таблица</button>
+        </div>
+        <div class="legend"><span><i class="k s1"></i>с одного адреса</span><span id="storm-lc-key"><i class="k s2"></i>отказов лимита фронта</span></div>
+        <div class="plot" id="plot-storm" tabindex="0" aria-label="График соединений с одного адреса: стрелки влево и вправо двигают метку времени"></div>
+        <div class="tview" id="tv-storm" hidden></div>
+      </div>
+
+      <p class="foot">На сервере хранятся только счётчики: трафик всех клиентов за каждые 5 минут, по клиентам — суммы за сутки и время последнего трафика, по соединениям — только числа: сколько, со скольких адресов, максимум с одного. Ни адресов клиентов, ни адресов назначения. Срок хранения — 31 день. Время — серверное.</p>
     </div>
   </section>
 
