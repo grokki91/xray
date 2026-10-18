@@ -295,7 +295,11 @@ def api_overview(q, body):
         raise ApiError(500, "xm info --json не вернул JSON: " + (tail_text(err or out) or "пусто"))
     info["sys"] = system_numbers()
     pub = (info.get("config") or {}).get("public_port")
-    info["conns_now"] = stats.count_established(pub) if isinstance(pub, int) else None
+    est = stats.established(pub) if isinstance(pub, int) else None
+    info["conns_now"] = est["conns"] if est else None
+    info["peers_now"] = est
+    info["storm_per_addr"] = stats.STORM_PER_ADDR
+    info["front_refusals_24h"] = stats.refusals_since(86400)
     info["traffic_24h"] = stats.traffic_since(86400)
     info["stats"] = stats_state()
     info["now"] = int(time.time())

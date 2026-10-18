@@ -173,6 +173,7 @@
     const x = d.xray || {}, s = d.services || {}, c = d.config || {}, sys = d.sys || {}, st = d.stats || {};
     $('#srv').textContent = d.hostname || 'сервер';
     $('#ip').textContent = d.server_ip || '';
+    $('#ip-toggle').hidden = !d.server_ip;
     const pill = $('#xray-pill');
     pill.textContent = '';
     pill.append(stIcon(x.active ? 'good' : 'crit'), document.createTextNode(
@@ -184,6 +185,16 @@
     $('#tile-traffic-sub').textContent = t ? '↓' + NB + fmtBytes(t[1]) + ' к клиентам · ↑' + NB + fmtBytes(t[0]) + ' от клиентов'
       : (st.enabled ? 'Данных пока нет: первый замер в течение 5 минут' : 'Не считается. На сервере: sudo xm stats on');
     $('#tile-conns').textContent = d.conns_now == null ? '—' : f0.format(d.conns_now);
+    // Только числа: адреса до панели не доходят. Порог — тот же, что у diag-dpi (G5).
+    const pe = d.peers_now, lc = d.front_refusals_24h, lim = d.storm_per_addr;
+    const storm = !!pe && pe.pmax > lim;
+    const cparts = [];
+    if (pe) cparts.push('адресов ' + f0.format(pe.addrs) + ' · с одного до ' + f0.format(pe.pmax));
+    if (lc != null) cparts.push('отказов лимита фронта за сутки: ' + f0.format(lc));
+    if (storm) cparts.push('больше ' + lim + ' с одного адреса — шторм клиента или сканер, разбор: sudo xm diag-dpi');
+    else if (lc > 0) cparts.push('у клиента был шторм соединений, разбор: sudo xm diag-dpi');
+    $('#tile-conns-sub').textContent = cparts.join(' · ');
+    $('#tile-conns-sub').classList.toggle('bad', storm || lc > 0);
     $('#tile-load').textContent = sys.load1 == null ? '—' : f2.format(sys.load1);
     $('#tile-load-sub').textContent = ['ядер: ' + sys.ncpu,
       sys.mem_total_mb ? 'RAM ' + f0.format(sys.mem_used_mb) + ' из ' + f0.format(sys.mem_total_mb) + ' МБ' : null,
@@ -197,7 +208,29 @@
       : 'не запущен: sudo systemctl status xray');
     add(s.nginx ? 'good' : 'crit', 'nginx', s.nginx ? (c.front ? 'фронт делит публичный порт по SNI' : 'fallback отвечает зондам сайтом-маской')
       : 'не запущен: зонд получит обрыв вместо сайта');
-    add(s.watchdog ? 'good' : 'off', 'watchdog', s.watchdog ? 'проверяет сквозной путь каждые 2 минуты' : 'выключен: sudo xm tune');
+    const wd = d.watchdog || {}, wl = wd.last, ev = wd.events || { n: 0, last: [] };
+    let wk = 'good', wdesc;
+    if (!s.watchdog) { wk = 'off'; wdesc = 'выключен: sudo xm tune'; }
+    else if (!wl) wdesc = 'проверяет сквозной путь каждые 2 минуты · итога ещё нет';
+    else {
+      const age = d.now - wl.t, when = 'проверка ' + (age < 60 ? 'только что' : fmtDur(age) + ' назад');
+      const first = String(wl.msg || '').split('\n')[0];
+      // Таймер — раз в 2 минуты: три пропуска подряд значат, что проверка не идёт.
+      if (age > 360) { wk = 'warn'; wdesc = 'последняя ' + when + ' — таймер не срабатывает: systemctl status xray-watchdog.timer'; }
+      else if (wl.rc !== 0) { wk = 'crit'; wdesc = when + ': чинил путь — ' + first; }
+      else if (first) { wk = 'warn'; wdesc = when + ': ' + first; }
+      else if (ev.n) { wk = 'warn'; wdesc = 'путь исправен, ' + when + ' · вмешательств за сутки: ' + ev.n; }
+      else wdesc = 'путь исправен, ' + when + ' · за сутки без вмешательств';
+    }
+    add(wk, 'watchdog', wdesc);
+    const wlist = $('#wd-list');
+    wlist.textContent = '';
+    (ev.last || []).slice().reverse().forEach(e => wlist.append(h('li', null,
+      h('span', { class: 'tm', text: dm(sd(e.t)) + ', ' + hm(sd(e.t)) }),
+      document.createTextNode(String(e.msg || '').split('\n').join(' / ')))));
+    $('#wd-events h3').textContent = 'Watchdog за сутки: вмешательств ' + ev.n
+      + (ev.n > (ev.last || []).length ? ', последние ' + ev.last.length : '');
+    $('#wd-events').hidden = !(s.watchdog && ev.n);
     add(s.fail2ban ? 'good' : 'warn', 'fail2ban', s.fail2ban ? 'защита SSH' : 'не запущен');
     add(s.chrony ? 'good' : 'warn', 'chrony', s.chrony ? 'время синхронизировано' : 'не запущен: REALITY чувствителен к времени');
     if (st.enabled) add(st.collector ? 'good' : 'warn', 'Статистика', st.collector ? 'замер раз в 5 минут' : 'таймер не работает: sudo xm stats on');
@@ -225,7 +258,36 @@
     row('Access-лог Xray', c.access_log ? 'ВКЛЮЧЁН: пишет адреса клиентов' : 'выключен', { bad: !!c.access_log, hint: 'sudo xm log-access off' });
     row('Отладка REALITY', c.reality_debug ? 'ВКЛЮЧЕНА: пишет IP клиентов' : 'выключена', { bad: !!c.reality_debug, hint: 'sudo xm reality-debug off' });
     row('Статистика для панели', st.enabled ? 'включена' : 'выключена');
+
+    // Итоги проверок пишет сам xm — видны и запуски из терминала, и прошлых сессий.
+    const ck = d.checks || {};
+    if (!checking) {
+      savedMeta('selftest', ck.selftest, d.now);
+      savedMeta('diag-dpi', ck.diag_dpi, d.now);
+    }
   }
+  function savedMeta(kind, r, now) {
+    if (!r || typeof r.t !== 'number') return;
+    const age = now - r.t, old = age > 7 * 86400;
+    let level, text;
+    if (kind === 'selftest') {
+      level = r.rc === 0 ? 'good' : 'crit';
+      text = (r.rc === 0 ? 'прошёл' : 'не прошёл') + (r.mode && r.mode !== 'xhttp' ? ' (--' + r.mode + ')' : '');
+    } else {
+      level = r.crit > 0 ? 'crit' : (r.warn > 0 ? 'warn' : 'good');
+      text = 'критично ' + r.crit + ' · предупреждений ' + r.warn + (r.quick ? '' : ' · полная');
+    }
+    if (old && level === 'good') level = 'warn';
+    setMeta(kind, level, text + ' · ' + (age < 60 ? 'только что' : fmtDur(age) + ' назад')
+      + (old ? ' — давно, запусти заново' : ''));
+  }
+  // IP скрыт по умолчанию: панель попадает в скриншоты, а адрес связывает их с сервером.
+  $('#ip-toggle').addEventListener('click', e => {
+    const ip = $('#ip');
+    ip.hidden = !ip.hidden;
+    e.currentTarget.textContent = ip.hidden ? 'показать IP' : 'скрыть IP';
+    e.currentTarget.setAttribute('aria-pressed', ip.hidden ? 'false' : 'true');
+  });
 
   // ───────── проверки ─────────
   const CHECK_TITLE = { 'selftest': 'sudo xm selftest', 'diag-dpi': 'sudo xm diag-dpi --quick' };
@@ -255,8 +317,8 @@
     return line;
   }
 
-  let jobTimer = 0, jobKind = '';
-  function setBusy(on) { $$('[data-run]').forEach(b => { b.disabled = on; }); $('#term-cancel').hidden = !on; }
+  let jobTimer = 0, jobKind = '', checking = false;
+  function setBusy(on) { checking = on; $$('[data-run]').forEach(b => { b.disabled = on; }); $('#term-cancel').hidden = !on; }
   function setMeta(kind, level, text) {
     const meta = $('#meta-' + kind);
     meta.textContent = '';
@@ -676,7 +738,23 @@
     renderLine($('#plot-conns'), {
       label: 'Соединения на публичном порту', edges: d.edges, xticks: xt, time, int: true,
       tick: (v, full) => f0.format(v) + (full ? NB + 'соединений' : ''),
-      series: [{ name: 'максимум на интервал', cls: 's1', values: d.conns_max }],
+      series: [
+        { name: 'соединений, максимум', cls: 's1', values: d.conns_max },
+        { name: 'адресов, максимум', cls: 's2', values: d.addrs_max },
+      ],
+    });
+    const lim = d.storm_per_addr, lcs = d.front_refusals;
+    $('#storm-sub').textContent = 'Максимум с одного адреса на интервал. XHTTP держит на клиента 1–3 соединения; больше '
+      + lim + ' — шторм ядра клиента или сканер, разбор: sudo xm diag-dpi' + (lcs
+        ? ' · отказов лимита фронта ' + RANGE_WORD[range] + ': ' + f0.format(sum(lcs))
+        : ' · отказы лимита фронта считаются, только когда включён фронт (xm front)');
+    const storm = [{ name: 'с одного адреса, максимум', cls: 's1', values: d.per_addr_max }];
+    if (lcs) storm.push({ name: 'отказов лимита фронта', cls: 's2', values: lcs });
+    $('#storm-lc-key').hidden = !lcs;
+    renderLine($('#plot-storm'), {
+      label: 'Соединений с одного адреса', edges: d.edges, xticks: xt, time, int: true,
+      tick: (v, full) => f0.format(v) + (full ? NB + 'шт.' : ''),
+      series: storm,
     });
     const items = d.clients.map(c => ({ name: c.name, v: c.up + c.down }));
     $('#clients-sub').textContent = (range === '24h' ? 'Сегодня с 00:00 по времени сервера' : range === '7d' ? 'Последние 7 суток, считая сегодня' : 'Последние 30 суток, считая сегодня') + ', обе стороны вместе';
@@ -685,8 +763,11 @@
     if (!$('#tv-traffic').hidden) tableView($('#tv-traffic'), ['Интервал', '↓ к клиентам, Мбит/с', '↑ от клиентов, Мбит/с'],
       d.edges.map((_, i) => [time(i), d.down_mbit[i] == null ? '—' : fmtRate(d.down_mbit[i]), d.up_mbit[i] == null ? '—' : fmtRate(d.up_mbit[i])]).reverse());
     if (!$('#tv-clients').hidden) tableView($('#tv-clients'), ['Клиент', 'Трафик'], items.map(it => [it.name, fmtBytes(it.v)]));
-    if (!$('#tv-conns').hidden) tableView($('#tv-conns'), ['Интервал', 'Соединений, максимум'],
-      d.edges.map((_, i) => [time(i), d.conns_max[i] == null ? '—' : f0.format(d.conns_max[i])]).reverse());
+    const num = v => v == null ? '—' : f0.format(v);
+    if (!$('#tv-conns').hidden) tableView($('#tv-conns'), ['Интервал', 'Соединений, максимум', 'Адресов, максимум'],
+      d.edges.map((_, i) => [time(i), num(d.conns_max[i]), num(d.addrs_max[i])]).reverse());
+    if (!$('#tv-storm').hidden) tableView($('#tv-storm'), ['Интервал', 'С одного адреса, максимум'].concat(lcs ? ['Отказов лимита фронта'] : []),
+      d.edges.map((_, i) => [time(i), num(d.per_addr_max[i])].concat(lcs ? [num(lcs[i])] : [])).reverse());
   }
   $$('[data-range]').forEach(b => b.addEventListener('click', () => {
     range = b.dataset.range;
