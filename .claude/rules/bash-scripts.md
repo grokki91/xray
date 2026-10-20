@@ -31,7 +31,8 @@ paths:
 
 ## Перед коммитом
 
-- `bash -n setup.sh xm.sh`; эффект на живом VPS — по `references/verification.md` скилла xray-dpi.
+- `bash tests/check.sh`; уровень проверки и скрипт на VPS — `references/verification.md` скилла
+  xray-dpi, §0 и §2.
 - `xm help` отражает изменённые команды и флаги; README — только если меняется, как пользоваться.
 - Инструкции синхронизированы (AGENTS.md, «Инструкции меняются вместе с кодом»): порог,
   версия, умолчание в комментарии кода совпадают со строкой в `references/landscape.md`.

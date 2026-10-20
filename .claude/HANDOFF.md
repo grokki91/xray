@@ -140,7 +140,7 @@ NOERROR с пустым ответом (NODATA): клиент его кэшир�
 ветках на GitHub совпадений нет. **Остаётся:** `refs/pull/5/head` — два коммита несут реальный
 маршрутизируемый адрес в примере `xm unban` в README. Страницы закрытых PR хранят диффы и
 переживают force-push: убрать можно только тикетом в GitHub Support, назвав PR #5. Проверять
-шаблоном из `AGENTS.md` по `git rev-list refs/pull/N/head`, а не по рабочему дереву.
+шаблоном IP и UUID из `tests/check.sh` по `git rev-list refs/pull/N/head`, а не по рабочему дереву.
 
 Клон со старой историей (локальная машина, VPS) не сделает `git pull` («diverged»): после
 проверки `git status` — `git fetch origin main && git checkout main && git reset --hard origin/main`.
