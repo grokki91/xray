@@ -1623,7 +1623,9 @@ _tune_counters() {
   ld=$(nstat -az   TcpExtListenDrops   2>/dev/null | awk 'NR==2{print $2}')
   udperr=$(nstat -az UdpRcvbufErrors   2>/dev/null | awk 'NR==2{print $2}')
 
-  local cc; cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  local cc mtu
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  mtu=$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null)
 
   # ── Окно с прошлого замера считается ПЕРВЫМ, потому что вердикт даётся по
   # нему. Накопительное с загрузки отвечает на вопрос «случалось ли это
@@ -1649,14 +1651,14 @@ _tune_counters() {
     elif [[ "$d_age" -ge 300 && "$d_tx" -gt 0 ]]; then
       w_ok=1; w_label="за $(( d_age / 3600 )) ч $(( (d_age % 3600) / 60 )) мин"
     else
-      info "Точка отсчёта свежая ($(( d_age / 60 )) мин) — вердикт пока по накопительному"
+      info "Точка отсчёта свежая ($(( d_age / 60 )) мин) — для вердикта нужно окно от 5 мин"
     fi
   else
     _counters_snap_write
     info "Точка отсчёта поставлена — следующий запуск даст вердикт по окну"
   fi
 
-  local src cum_pct tx_rate=-1
+  local src cum_pct every tx_rate=-1
   if [[ -n "${retr:-}" && -n "${tx:-}" && "${tx:-0}" -gt 0 ]]; then
     cum_pct=$(awk -v r="$retr" -v t="$tx" 'BEGIN{printf "%.2f", r*100/t}')
   fi
@@ -1681,16 +1683,30 @@ _tune_counters() {
     info "  В абсолюте: $(( d_retr * 3600 / d_age )) ретрансмитов в час. Ровный фон при скачущем трафике = ответы сканерам, а не последняя миля"
     info "  Разделить одно от другого: ${BOLD}nstat -az TcpExtTCPSynRetrans TcpExtTCPFastRetrans TcpRetransSegs${NC} дважды с интервалом 5 мин"
   elif [[ -n "${pct:-}" ]]; then
-    if   awk -v p="$pct" 'BEGIN{exit !(p<1)}'; then ok    "Ретрансмиты ${src}: ${pct}% — норма"
-    elif awk -v p="$pct" 'BEGIN{exit !(p<3)}'; then dwarn "Ретрансмиты ${src}: ${pct}% — заметные потери на пути к клиентам"
-    elif [[ "$cc" == "bbr" ]]; then
-      # BBR уже стоит, а потери всё равно высокие — значит дело не в
-      # алгоритме. Обычно это либо реальные потери на последней миле у
-      # клиентов (мобильный интернет), либо PMTU blackhole: пакеты полного
-      # размера не проходят, ICMP Too Big режется, и ядро молча ретранслирует.
-      dfail "Ретрансмиты ${src}: ${pct}% при уже включённом BBR — алгоритм ни при чём. Проверь MTU probing ниже и учти, что часть потерь может быть на стороне клиентских сетей"
-    else
+    # Доля словами: «13.6%» без пояснения читается как цифра из отчёта, а «каждый
+    # 7-й пакет» — как масштаб проблемы. Нужна только ниже ok, то есть при pct >= 1.
+    every=$(awk -v p="$pct" 'BEGIN{printf "%d", (p > 0 ? 100/p + 0.5 : 0)}')
+    if   awk -v p="$pct" 'BEGIN{exit !(p<1)}'; then ok "Ретрансмиты ${src}: ${pct}% — норма"
+    elif [[ "$w_ok" -ne 1 ]]; then
+      # Окна нет: перезагрузка обнулила счётчики или точка отсчёта свежая. Итог с
+      # загрузки — «случалось ли когда-нибудь», а не «происходит ли сейчас», и
+      # красный вердикт по нему держал [✗] на сервере, где сейчас может быть чисто.
+      dwarn "Ретрансмиты ${src}: ${pct}% — судить рано, свежего замера нет. Повтори через 5+ мин: ${BOLD}sudo xm tune --check${NC}"
+      info "  Проще: каждый ${every}-й пакет отправлен повторно, но это итог с момента загрузки — со старыми сбоями и фоном от сканеров"
+    elif awk -v p="$pct" 'BEGIN{exit !(p<3)}'; then
+      dwarn "Ретрансмиты ${src}: ${pct}% — заметные потери на пути к клиентам"
+    elif [[ "$cc" != "bbr" ]]; then
       dfail "Ретрансмиты ${src}: ${pct}% при cc=${cc:-?} — на потерях CUBIC режет окно вдвое каждый раз. Включи BBR: ${BOLD}sudo xm tune${NC}"
+    elif [[ "$mtu" == "0" ]]; then
+      # PMTU blackhole: пакеты полного размера не проходят, ICMP Too Big режется,
+      # ядро молча ретранслирует. Чинит xm tune — значит, это [✗].
+      dfail "Ретрансмиты ${src}: ${pct}% при выключенном MTU probing — пакеты полного размера, похоже, не проходят (PMTU blackhole). Включи: ${BOLD}sudo xm tune${NC}"
+    else
+      # BBR и MTU probing уже стоят, закрывать на сервере нечем: остаются потери на
+      # последней миле у клиентов (мобильный интернет) и на участке от VPS.
+      # Критично только то, что владелец может исправить, — здесь предупреждение.
+      dwarn "Ретрансмиты ${src}: ${pct}% — каждый ${every}-й пакет шлётся повторно"
+      info "  Проще: пакеты теряются по дороге, из-за этого подвисает связь. BBR и MTU уже настроены — причина скорее в сети клиента или на пути до него"
     fi
     [[ "$w_ok" -eq 1 && -n "${cum_pct:-}" ]] \
       && info "  Накопительно с загрузки: ${cum_pct}% (${retr} из ${tx}) — история, не текущее состояние"
@@ -1728,7 +1744,7 @@ _tune_counters() {
   [[ "$w_ok" -eq 1 && "${udperr:-0}" -gt "$q_u" ]] \
     && info "  Накопительно с загрузки: ${udperr} — история, не текущее состояние"
   info "Congestion control: ${cc:-?}, qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null)"
-  info "MTU probing: $(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null) (нужен 1 — иначе мобильные клиенты виснут на PMTU blackhole)"
+  info "MTU probing: ${mtu:-?} (нужен 1 — иначе мобильные клиенты виснут на PMTU blackhole)"
 }
 
 # ─── Watchdog ────────────────────────────────────────────────────────────────
