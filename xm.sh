@@ -492,14 +492,16 @@ _doh_probe() {
 # как рассуждением. Теперь исключается конфигом.
 TUN_PORT=""; TUN_PID=""; TUN_CFG=""; TUN_LOG=""; TUN_SNI=""; TUN_SRVPORT=""
 
+# _tunnel_up [xhttp|tcp] [порт] [публичный ключ]: порт и ключ по умолчанию — из config.json.
+# Порт задаёт xm health (публичный, через фронт), ключ — его тестовый режим с неверным ключом.
 _tunnel_up() {
   local net="${1:-xhttp}" idx=0 fb="PUBLIC KEY" uuid port sni sid pub path_v mode
   [[ "$net" == "tcp" ]] && { idx=1; fb="PUBLIC KEY2"; }
   uuid=$(jq -r ".inbounds[$idx].settings.clients[0].id" "$CONFIG" 2>/dev/null)
-  port=$(jq -r ".inbounds[$idx].port" "$CONFIG" 2>/dev/null)
+  port=${2:-$(jq -r ".inbounds[$idx].port" "$CONFIG" 2>/dev/null)}
   sni=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.serverNames[0]" "$CONFIG" 2>/dev/null)
   sid=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.shortIds[0]" "$CONFIG" 2>/dev/null)
-  pub=$(_get_pubkey "$idx" "$fb")
+  pub=${3:-$(_get_pubkey "$idx" "$fb")}
   [[ -z "$pub" || ${#pub} -lt 30 ]] && return 1
 
   TUN_PORT=$(( 20000 + RANDOM % 10000 )); TUN_SNI="$sni"; TUN_SRVPORT="$port"
@@ -2274,13 +2276,13 @@ _ui_install() {
   [[ -d "$src" ]] || return 2
   command -v python3 >/dev/null 2>&1 \
     || { warn "python3 не установлен — панель недоступна: sudo apt install -y python3"; return 1; }
-  for f in server.py stats.py; do
+  for f in server.py stats.py health.py; do
     python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$src/$f" 2>/dev/null \
       || { fail "ui/$f не проходит проверку синтаксиса — панель НЕ обновляю"; return 1; }
   done
   rm -rf "$new" "$old"
   mkdir -p "$(dirname "$UI_DIR")" && install -d -m 755 "$new" || return 1
-  for f in server.py stats.py index.html app.js app.css icon.svg; do
+  for f in server.py stats.py health.py index.html app.js app.css icon.svg; do
     install -m 644 "$src/$f" "$new/$f" || { rm -rf "$new"; fail "Не скопировать ui/$f"; return 1; }
   done
   [[ -d "$UI_DIR" ]] && mv "$UI_DIR" "$old"
@@ -2441,6 +2443,105 @@ _stats_timer_remove() {
   systemctl disable --now xm-stats.timer >/dev/null 2>&1
   rm -f "$STATS_SVC" "$STATS_TIMER"
   systemctl daemon-reload
+}
+
+# Таймер замеров статистики работает: свой или xm-health, который забирает его замер в окно.
+_stats_timer_ok() {
+  systemctl is-active --quiet xm-stats.timer || { _health_enabled && systemctl is-active --quiet xm-health.timer; }
+}
+
+# ─── Журнал здоровья (xm health) ─────────────────────────────────────────────
+#
+# Отличает «не подключался / ПК выключен» от «заблокировали»: доступность считается по
+# попыткам, а не по времени, окно без попыток — «нет данных». Два таймера и ничего постоянно
+# работающего: раз в минуту — tcp_info соединений на публичном порту (ui/health.py sample),
+# раз в 5 минут — самопроверка, счётчики, логи, события и окно в windows.jsonl. Монитор только
+# читает: ничего не перезапускает, Xray от него не зависит. На диск — числа, классы и место
+# поломки; адреса клиентов — только в памяти одного прохода.
+HEALTH_DIR="/var/lib/xm/health"
+HEALTH_RUN="/run/xm-health"
+HEALTH_URL="https://www.google.com/generate_204"
+HEALTH_UNIT_DIR="/etc/systemd/system"
+HEALTH_LOADAVG="/proc/loadavg"; HEALTH_MEMINFO="/proc/meminfo"
+
+_health_enabled() { [[ -f "$HEALTH_UNIT_DIR/xm-health.timer" ]]; }
+
+# Самопроверка → JSON одной строкой: {"r":"ok|fail|skip", "at": где сломалось, "why": почему
+# пропущена, "ms"}. Настоящий VLESS+REALITY+XHTTP с самого сервера на публичный порт через петлю
+# и один запрос наружу. Пропуск — не сбой: под нагрузкой сам монитор не успел бы и обвинил сервер.
+# $1 = bad — тестовый режим: случайный публичный ключ вместо настоящего.
+_health_selfcheck() {
+  local bad="${1:-}" la mem port xport p sni pub="" t0 code direct
+  read -r la _ < "$HEALTH_LOADAVG"
+  mem=$(awk '$1 == "MemAvailable:" {print int($2 / 1024)}' "$HEALTH_MEMINFO")
+  awk -v l="$la" 'BEGIN {exit !(l > 1.5)}' && { echo '{"r":"skip","why":"load"}'; return; }
+  [[ "${mem:-0}" -lt 150 ]] && { echo '{"r":"skip","why":"mem"}'; return; }
+  port=$(_front_public_port)
+  xport=$(jq -r '.inbounds[0].port' "$CONFIG" 2>/dev/null)
+  systemctl is-active --quiet xray || { echo '{"r":"fail","at":"listen"}'; return; }
+  for p in $(printf '%s\n' "$port" "$xport" | sort -u); do
+    [[ "$p" =~ ^[0-9]+$ ]] && ss -tlnH "( sport = :$p )" 2>/dev/null | grep -q . \
+      || { echo '{"r":"fail","at":"listen"}'; return; }
+  done
+  sni=$(_get_nginx_sni)
+  [[ -z "$sni" ]] && sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG" 2>/dev/null)
+  timeout 5 getent hosts "$sni" >/dev/null 2>&1 || { echo '{"r":"fail","at":"dns"}'; return; }
+  [[ "$bad" == bad ]] && pub=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')
+  # Клиент самопроверки не поднялся (не хватило памяти юниту, нет ключа) — сервер тут ни при чём.
+  _tunnel_up xhttp "$port" "$pub" || { _tunnel_down; echo '{"r":"skip","why":"client"}'; return; }
+  t0=$(date +%s%N)
+  code=$(_tunnel_code "$HEALTH_URL")
+  # Один повтор: единичная потеря на петле не должна рисовать «сбой сервера» на 5 минут.
+  [[ "$code" == 204 ]] || { sleep 2; t0=$(date +%s%N); code=$(_tunnel_code "$HEALTH_URL"); }
+  _tunnel_down
+  if [[ "$code" == 204 ]]; then
+    echo "{\"r\":\"ok\",\"ms\":$(( ($(date +%s%N) - t0) / 1000000 ))}"; return
+  fi
+  # Тоннель не прошёл: выход в интернет или рукопожатие — разводит прямой запрос с сервера.
+  direct=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" 2>/dev/null) || true
+  [[ "$direct" == 204 ]] && echo '{"r":"fail","at":"handshake"}' || echo '{"r":"fail","at":"egress"}'
+}
+
+# Порт для поминутного опроса: юнит зовёт health.py напрямую, без разбора xm.
+_health_params() {
+  local port
+  port=$(_front_public_port)
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  install -d -m 700 "$HEALTH_DIR" && ( umask 077; echo "{\"port\":$port}" > "$HEALTH_DIR/params.json" )
+}
+
+_health_py() {
+  python3 "$UI_DIR/health.py" "$@" --config "$CONFIG" --xm "$XM_BIN" --xray "$(command -v xray || echo /usr/local/bin/xray)"
+}
+
+# Одно окно: $1 = dry — напечатать и ничего не записать, $2 = bad — неверный ключ в самопроверке.
+_health_run() {
+  local dry="${1:-}" bad="${2:-}" self
+  [[ "$dry" == dry ]] || _health_params || return 1
+  self=$(_health_selfcheck "$bad")
+  # Трафик своих клиентов — замер xm stats (его таймер при включённом health снят).
+  [[ "$dry" != dry && -n "$(_stats_api)" ]] && { _stats_collect >/dev/null 2>&1 || true; }
+  if [[ "$dry" == dry ]]; then _health_py window --self "$self" --dry
+  else _health_py window --self "$self"; fi
+}
+
+# Юниты: один и тот же текст при каждом on — повторный on ничего не дублирует.
+_health_units() {
+  local py lim
+  py=$(command -v python3)
+  lim='CPUWeight=10
+Nice=19
+IOSchedulingClass=idle
+MemoryMax=96M
+TimeoutStartSec=60'
+  printf '%s\n' "[Unit]" "Description=xm health: connections on the public port" "" "[Service]" \
+    "Type=oneshot" "ExecStart=$py $UI_DIR/health.py sample" "$lim" > "$1/xm-health-sample.service"
+  printf '%s\n' "[Unit]" "Description=xm health: poll connections every minute" "" "[Timer]" \
+    "OnCalendar=*-*-* *:*:00" "AccuracySec=5s" "" "[Install]" "WantedBy=timers.target" > "$1/xm-health-sample.timer"
+  printf '%s\n' "[Unit]" "Description=xm health: self-check and 5-minute window" "After=xray.service" "" \
+    "[Service]" "Type=oneshot" "ExecStart=$XM_BIN health run" "$lim" > "$1/xm-health.service"
+  printf '%s\n' "[Unit]" "Description=xm health: window every 5 minutes" "" "[Timer]" \
+    "OnCalendar=*:0/5:30" "AccuracySec=5s" "" "[Install]" "WantedBy=timers.target" > "$1/xm-health.timer"
 }
 
 case "$1" in
@@ -4581,7 +4682,7 @@ dpi|diag-dpi)
         && dfail "API разрешает HandlerService: любой локальный процесс добавит себе пользователя"
       jq -e '[.. | .statsUserOnline? // empty] | any' "$CONFIG" >/dev/null 2>&1 \
         && dwarn "statsUserOnline включён: Xray держит IP подключённых клиентов в памяти и отдаёт через API. Убери флаг из policy"
-      systemctl is-active --quiet xm-stats.timer \
+      _stats_timer_ok \
         && ok "Таймер замеров статистики работает" \
         || dwarn "Статистика включена, а таймер замеров не работает — sudo xm stats on"
     fi
@@ -6146,7 +6247,11 @@ stats)
         fi
         ok "Xray считает трафик по клиентам, API на $ST_API (только loopback)"
       fi
-      _stats_timer_install && ok "Замер раз в 5 минут (xm-stats.timer)" || warn "Таймер замеров не включился: systemctl status xm-stats.timer"
+      if _health_enabled; then
+        ok "Замер раз в 5 минут — в окне xm-health"
+      else
+        _stats_timer_install && ok "Замер раз в 5 минут (xm-stats.timer)" || warn "Таймер замеров не включился: systemctl status xm-stats.timer"
+      fi
       _stats_collect || true
       info "Хранится: трафик всех клиентов за 5 минут, по клиентам — суммы за сутки и время последнего трафика, число соединений на публичном порту. Адресов нет. Срок — 31 день"
       info "Отключить и стереть данные: ${BOLD}sudo xm stats off${NC}"
@@ -6179,7 +6284,7 @@ stats)
       esac
       _stats_api_up "$ST_API" && ok "API отвечает" \
         || fail "API не отвечает на $ST_API — проверь: systemctl status xray; повторно: sudo xm stats on"
-      systemctl is-active --quiet xm-stats.timer && ok "Таймер замеров работает" \
+      _stats_timer_ok && ok "Таймер замеров работает" \
         || warn "Таймер замеров не работает — sudo xm stats on"
       if [[ -s "$STATS_DIR/samples.jsonl" ]]; then
         ST_LAST=$(tail -n 1 "$STATS_DIR/samples.jsonl" | jq -r '.t // empty' 2>/dev/null)
@@ -6192,6 +6297,101 @@ stats)
       ;;
     collect) _stats_collect; exit $? ;;
     *) echo -e "${RED}xm stats [on|off|status]${NC}"; exit 1 ;;
+    esac
+    ;;
+
+# Журнал здоровья VPN: отчёт, включение, окно и опрос вручную.
+health)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm health [--json|on|off|status|run|sample]${NC}"; exit 1; }
+    if [[ ! -f "$UI_DIR/health.py" ]] || ! command -v python3 >/dev/null 2>&1; then
+      fail "Нет $UI_DIR/health.py или python3"; echo -e "  Поставить: ${BOLD}sudo xm self-update${NC}"; exit 1
+    fi
+    case "${2:-report}" in
+    on)
+      _health_params || { fail "Не определить публичный порт из config.json"; exit 1; }
+      _health_py init || { fail "Не записать точки отсчёта в $HEALTH_RUN"; exit 1; }
+      HL_NEW=$(mktemp -d)
+      _health_units "$HL_NEW"
+      HL_CH=false
+      for f in xm-health-sample.service xm-health-sample.timer xm-health.service xm-health.timer; do
+        cmp -s "$HL_NEW/$f" "$HEALTH_UNIT_DIR/$f" || { install -m 644 "$HL_NEW/$f" "$HEALTH_UNIT_DIR/$f"; HL_CH=true; }
+      done
+      rm -rf "$HL_NEW"
+      $HL_CH && systemctl daemon-reload
+      if systemctl enable --now xm-health-sample.timer xm-health.timer >/dev/null 2>&1; then
+        $HL_CH && ok "Монитор включён: соединения раз в минуту, окно раз в 5 минут" \
+               || ok "Монитор уже включён — юниты не менялись, данные не тронуты"
+      else
+        fail "Таймеры не включились: systemctl status xm-health.timer"; exit 1
+      fi
+      if [[ -f "$STATS_TIMER" ]]; then
+        _stats_timer_remove
+        ok "Замер трафика клиентов перешёл в окно xm-health (таймер xm-stats снят)"
+      fi
+      [[ -z "$(_stats_api)" ]] && warn "Трафик своих клиентов не виден — без него окна «нет данных», а не OK: ${BOLD}sudo xm stats on${NC} (один раз перезапустит Xray)"
+      info "Хранится: числа, классы соединений и место поломки, без адресов. Окна — 31 день, итоги суток — год"
+      info "Отчёт: ${BOLD}sudo xm health${NC} · состояние: ${BOLD}sudo xm health status${NC} · выключить и стереть: ${BOLD}sudo xm health off${NC}"
+      ;;
+    off)
+      systemctl disable --now xm-health.timer xm-health-sample.timer >/dev/null 2>&1
+      systemctl stop xm-health.service xm-health-sample.service >/dev/null 2>&1
+      rm -f "$HEALTH_UNIT_DIR"/xm-health.{service,timer} "$HEALTH_UNIT_DIR"/xm-health-sample.{service,timer}
+      systemctl daemon-reload
+      rm -rf "$HEALTH_DIR" "$HEALTH_RUN"
+      ok "Монитор выключен, юниты и данные удалены"
+      if [[ -n "$(_stats_api)" ]]; then
+        _stats_timer_install && ok "Замер трафика клиентов вернулся на xm-stats.timer"
+      fi
+      ;;
+    status)
+      echo -e "\n${BOLD}${CYAN}[ Журнал здоровья ]${NC}\n"
+      _health_enabled || { info "Выключен. Включить: ${BOLD}sudo xm health on${NC}"; exit 0; }
+      for t in xm-health-sample.timer xm-health.timer; do
+        systemctl is-active --quiet "$t" && ok "$t работает" || fail "$t не работает — sudo xm health on"
+      done
+      HL_LAST=$(tail -n 1 "$HEALTH_DIR/windows.jsonl" 2>/dev/null | jq -r '"\(.t) \(.vd)"' 2>/dev/null)
+      if [[ "$HL_LAST" =~ ^[0-9]+\  ]]; then
+        info "Последнее окно: $(date -d "@${HL_LAST%% *}" '+%F %H:%M') ($(( ($(date +%s) - ${HL_LAST%% *}) / 60 )) мин назад), вердикт ${HL_LAST#* }; окон: $(wc -l < "$HEALTH_DIR/windows.jsonl"), данные: $(du -sh "$HEALTH_DIR" | cut -f1)"
+      else
+        info "Окон пока нет — первое в течение 5 минут после включения"
+      fi
+      HL_ST=$(jq -r '.t // empty' "$HEALTH_RUN/conns.json" 2>/dev/null)
+      [[ "$HL_ST" =~ ^[0-9]+$ ]] && info "Последний опрос соединений: $(( $(date +%s) - HL_ST )) с назад"
+      [[ -z "$(_stats_api)" ]] && warn "Трафик своих клиентов не виден: ${BOLD}sudo xm stats on${NC}"
+      # Нагрузка — по строкам «Consumed …», которые systemd пишет в журнал после каждого запуска.
+      HL_LOAD=$(_health_py load 2>/dev/null)
+      if [[ -n "$HL_LOAD" ]]; then
+        read -r HL_N HL_CPU HL_PK < <(jq -r '[([.[].runs] | add), ([.[].cpu_ms] | add), ([.[].peak_mb] | max)] | @tsv' <<<"$HL_LOAD")
+        if [[ "${HL_N:-0}" -gt 0 ]]; then
+          info "Нагрузка за 24 ч: запусков ${HL_N}, CPU $(awk -v c="$HL_CPU" 'BEGIN {printf "%.3f", c / 864000}')% ядра, пик памяти ${HL_PK} МБ (бюджет: 0.3% и 96 МБ)"
+        else
+          info "Нагрузка: строк «Consumed» в журнале за сутки нет — journald их не сохранил или запусков ещё не было"
+        fi
+      fi
+      ;;
+    run)
+      HL_DRY=""; HL_BAD=""
+      for a in "${@:3}"; do
+        case "$a" in
+          --dry) HL_DRY=dry ;;
+          --bad-key) HL_BAD=bad; HL_DRY=dry ;;
+          *) echo -e "${RED}xm health run [--dry] [--bad-key]${NC}"; exit 1 ;;
+        esac
+      done
+      [[ -z "$HL_DRY" ]] && ! _health_enabled && { fail "Монитор выключен — окно не пишется. Включить: ${BOLD}sudo xm health on${NC} (без записи: --dry)"; exit 1; }
+      _health_run "$HL_DRY" "$HL_BAD"; exit $?
+      ;;
+    sample) _health_py sample "${@:3}"; exit $? ;;
+    report|--json)
+      if [[ ! -s "$HEALTH_DIR/windows.jsonl" ]]; then
+        if [[ "${2:-}" == --json ]]; then echo '{}'
+        elif _health_enabled; then info "Окон пока нет — первое в течение 5 минут"
+        else info "Монитор выключен: ${BOLD}sudo xm health on${NC}"; fi
+        exit 0
+      fi
+      if [[ "${2:-}" == --json ]]; then _health_py report --json; else _health_py report; fi
+      ;;
+    *) echo -e "${RED}xm health [--json|on|off|status|run [--dry|--bad-key]|sample]${NC}"; exit 1 ;;
     esac
     ;;
 
@@ -6590,6 +6790,9 @@ neighbors)
     echo    "            update [--check] · update-geo · autoupd on|off|now|log|status"
     echo -e "${BOLD}${GREEN}Панель${NC}      ${GREEN}ui [--port N] [--idle МИН]${NC}   веб-интерфейс на 127.0.0.1, доступ только через SSH-тоннель"
     echo    "            stats on|off|status           графики: счётчики Xray раз в 5 минут (меняет config.json)"
+    echo -e "${BOLD}${GREEN}Здоровье${NC}    ${GREEN}health [--json]${NC}   полоса за 24 ч, готовность сервера и сессии без заморозок за 7 дней"
+    echo    "            health on|off|status        самопроверка раз в 5 мин, соединения раз в минуту; off стирает данные"
+    echo    "            health run [--dry|--bad-key] · health sample [--port N --print --loopback]   окно и опрос вручную"
     echo -e "${BOLD}Прочее${NC}      info [--json] · paths · uuid · pubkey · journal [show|add \"текст\"]"
     echo    "            nginx-status|nginx-log|nginx-reload|nginx-probes"
     echo    "            ban-list · ban-ssh-stat · unban <ip> · log-access"

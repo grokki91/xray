@@ -197,9 +197,10 @@ def stats_state():
     except (OSError, ValueError):
         pass
     try:
-        r = subprocess.run(["systemctl", "is-active", "xm-stats.timer"], capture_output=True,
-                           text=True, timeout=5, env=SAFE_ENV)
-        timer = r.stdout.strip() == "active"
+        # Замер делает свой таймер или окно xm health, которое его забирает.
+        r = subprocess.run(["systemctl", "is-active", "xm-stats.timer", "xm-health.timer"],
+                           capture_output=True, text=True, timeout=5, env=SAFE_ENV)
+        timer = "active" in r.stdout.split()
     except (OSError, subprocess.TimeoutExpired):
         timer = False
     return {"enabled": bool(api), "collector": timer}
