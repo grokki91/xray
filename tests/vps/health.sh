@@ -17,7 +17,7 @@ vneed "Xray работает" systemctl is-active --quiet xray
 # ─── Факты: числа и версии, без адресов — по ним сверяется, что код угадал о сервере
 fact() { printf '  · %-28s %s\n' "$1" "$2"; }
 PUB=$(jq -r '.inbounds[0].port' "$CFG")
-[[ -f /etc/nginx/stream-enabled/front.conf ]] && PUB=$(awk -F= '$1=="PORT"{print $2}' /usr/local/etc/xray/front.conf 2>/dev/null || echo 443)
+[[ -f /etc/nginx/stream-enabled/front.conf ]] && { PUB=$(awk -F= '$1=="PORT"{print $2}' /usr/local/etc/xray/front.conf 2>/dev/null); PUB=${PUB:-443}; }
 echo "Факты:"
 fact "ОС / ядро" "$(lsb_release -ds 2>/dev/null) / $(uname -r)"
 fact "виртуализация" "$(systemd-detect-virt 2>/dev/null)"
@@ -112,7 +112,7 @@ scen() {
   vexpect "класс: $name" "$exp" xm health sample --port "$P" --print --loopback
   [[ $name == "10–32 КБ" ]] && vexpect "netlink = ss: bytes_acked зависших" \
     "$(ss -tinH "( sport = :$P )" | grep -oE 'bytes_acked:[0-9]+' | cut -d: -f2 | sort -n | paste -sd' ')" \
-    python3 -c "import sys; sys.path.insert(0, '${PY%/*}'); import health; print(' '.join(str(c['acked']) for c in sorted(health.connections($P, True), key=lambda c: c['acked'])))"
+    python3 -B -c "import sys; sys.path.insert(0, '${PY%/*}'); import health; print(' '.join(str(c['acked']) for c in sorted(health.connections($P, True), key=lambda c: c['acked'])))"
   emu_cleanup
   sleep 1
 }
@@ -158,7 +158,7 @@ vexpect "адресов на диске нет" "" bash -c "grep -rhoE '([0-9]{1
 vcheck  "отчёт" bash -c 'xm health | grep -q "Сервер готов"'
 vcheck  "отчёт --json" bash -c 'xm health --json | jq -e ".band | length == 96" >/dev/null'
 # Нагрузка: запуски с начала теста по «Consumed» systemd, на сутки — 1440 опросов и 288 окон
-LOADJS=$(python3 - "$T0" <<'EOF'
+LOADJS=$(python3 -B - "$T0" <<'EOF'
 import json, re, subprocess, sys
 sys.path.insert(0, "/usr/local/lib/xm/ui"); import health as h
 r = {}

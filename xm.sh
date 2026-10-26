@@ -2276,14 +2276,17 @@ _ui_install() {
   [[ -d "$src" ]] || return 2
   command -v python3 >/dev/null 2>&1 \
     || { warn "python3 не установлен — панель недоступна: sudo apt install -y python3"; return 1; }
-  for f in server.py stats.py health.py; do
-    python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$src/$f" 2>/dev/null \
-      || { fail "ui/$f не проходит проверку синтаксиса — панель НЕ обновляю"; return 1; }
+  for f in "$src"/*.py; do
+    python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$f" 2>/dev/null \
+      || { fail "ui/${f##*/} не проходит проверку синтаксиса — панель НЕ обновляю"; return 1; }
   done
   rm -rf "$new" "$old"
   mkdir -p "$(dirname "$UI_DIR")" && install -d -m 755 "$new" || return 1
-  for f in server.py stats.py health.py index.html app.js app.css icon.svg; do
-    install -m 644 "$src/$f" "$new/$f" || { rm -rf "$new"; fail "Не скопировать ui/$f"; return 1; }
+  # Все файлы каталога, а не список: self-update выполняет ещё старый xm, и файл, которого нет в
+  # его списке (health.py), не доехал бы до сервера, хотя xm уже новый. Подкаталоги (__pycache__) — мимо.
+  for f in "$src"/*; do
+    [[ -f "$f" ]] || continue
+    install -m 644 "$f" "$new/${f##*/}" || { rm -rf "$new"; fail "Не скопировать ui/${f##*/}"; return 1; }
   done
   [[ -d "$UI_DIR" ]] && mv "$UI_DIR" "$old"
   mv "$new" "$UI_DIR" || { [[ -d "$old" ]] && mv "$old" "$UI_DIR"; return 1; }
