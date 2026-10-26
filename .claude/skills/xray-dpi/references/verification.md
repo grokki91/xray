@@ -219,5 +219,6 @@ sudo systemd-run --unit=xm-probe --collect --property=RuntimeMaxSec=21600 \
 - Xray при `stats on` перезапускается: убедиться, что клиент на телефоне переподключился сам.
 - `xm health` — `tests/vps/health.sh`: классы соединений эмулируются iptables connbytes на
   тестовом порту петли, дроп — на входе (`INPUT -i lo`), иначе стек видит ошибку отправки, а не
-  потерю; поля netlink сверяются с `ss -ti`. Нагрузка за сутки — `sudo xm health status` через
-  сутки после включения (строки «Consumed» systemd).
+  потерю; поля netlink сверяются с `ss -ti`. Нагрузка — по cgroup юнитов (каждый запуск пишет
+  свой `cpu.stat` и `memory.peak`, окно хранит), за сутки — `sudo xm health status` через сутки
+  после включения; строки «Consumed» journald для коротких запусков не годятся (lessons.md).

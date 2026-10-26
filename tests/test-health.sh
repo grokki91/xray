@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Журнал здоровья (ui/health.py): классы соединений по tcp_info, счёт «один раз за жизнь» по
-# cookie, вердикт окна, логи со смещения с ротацией, трафик из замеров xm stats, дубли окон,
-# отсутствие адресов на диске, полоса отчёта. Сокеты ядра — заглушка connections() с полями
-# netlink в том виде, в каком их отдаёт ядро (сверку с ss держит tests/vps/health.sh); остальное —
-# настоящий код на временных каталогах.
+# cookie, шквал по новым соединениям с точкой отсчёта, вердикт окна и его пересчёт при чтении,
+# логи со смещения с ротацией, трафик из замеров xm stats без трафика самопроверки, расход юнитов
+# по cgroup, дубли окон, отсутствие адресов на диске и окна в журнале, полоса отчёта. Сокеты ядра —
+# заглушка connections() с полями netlink в том виде, в каком их отдаёт ядро (сверку с ss держит
+# tests/vps/health.sh), файлы cgroup — во временном каталоге; остальное — настоящий код.
 root=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd)
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
-export XM_HEALTH_DIR="$T/data" XM_HEALTH_RUN="$T/run" XM_STATS_SAMPLES="$T/samples.jsonl" PYTHONDONTWRITEBYTECODE=1
+export XM_HEALTH_DIR="$T/data" XM_HEALTH_RUN="$T/run" XM_STATS_SAMPLES="$T/samples.jsonl" XM_STATS_DIR="$T/stats" PYTHONDONTWRITEBYTECODE=1
 out=$(python3 - "$root/ui" "$T" <<'PY' 2>&1
 import json, os, sys, time
 sys.path.insert(0, sys.argv[1]); T = sys.argv[2]
 import health as h
+import stats
 
 fails = []
 def want(name, got, exp):
@@ -43,10 +45,12 @@ stalled = [sock("a%d" % i, "192.0.2.%d" % i, 300, 15360, 10, 4) for i in range(3
 cur = stalled + [sock("n1", "198.51.100.7", 300, 90000)]
 h.cmd_sample({}); h.cmd_sample({})
 w1 = h._close_conns(False)
-want("окно 1: заморозки", (w1["f16"], w1["norm"], w1["new"], w1["smp"], w1["cmax"]), (3, 1, 4, 2, 4))
+want("окно 1: заморозки; первый опрос — точка отсчёта, не новые", (w1["f16"], w1["norm"], w1["new"], w1["smp"], w1["cmax"]),
+     (3, 1, 0, 2, 4))
+cur.append(sock("n2", "198.51.100.8", 300, 90000))
 h.cmd_sample({})
 w2 = h._close_conns(False)
-want("окно 2: те же зависшие не считаются снова", (w2["f16"], w2["norm"], w2["new"]), (0, 1, 0))
+want("окно 2: те же зависшие не считаются снова, новое — новое", (w2["f16"], w2["norm"], w2["new"]), (0, 2, 1))
 cur = []
 h.cmd_sample({})
 w3 = h._close_conns(False)
@@ -57,11 +61,23 @@ cur = [sock("z1", "192.0.2.50", 300, 1, 5, 3)]
 h.cmd_sample({}); cur = []; h.cmd_sample({})
 want("закрылось до конца окна — учтено", h._close_conns(False)["post"], 1)
 want("без опросов — нет данных о соединениях", h._close_conns(False), None)
-# Шквал: 31 соединение с одного адреса
-cur = [sock("s%d" % i, "203.0.113.9", 300, 2000) for i in range(31)]
+# Шквал — новые соединения с адреса между опросами; долгие одновременные — не шквал
+cur = [sock("l%d" % i, "198.51.100.20", 300, 90000) for i in range(55)]
+h.cmd_sample({}); h._close_conns(False)                # открылись окном раньше
+cur += [sock("s%d" % i, "203.0.113.9", 300, 2000) for i in range(31)]
 h.cmd_sample({})
-want("шквал: максимум с адреса", h._close_conns(False)["pmax"], 31)
+w = h._close_conns(False)
+want("шквал: новых с адреса за опрос, одновременных с адреса", (w["pnew"], w["pmax"], w["new"]), (31, 55, 31))
+h.cmd_sample({})
+want("долгие соединения без новых: шквала нет", (h._close_conns(False)["pnew"]), 0)
 cur = []
+h.cmd_sample({}); h._close_conns(False)
+os.unlink(os.path.join(h.RUN_DIR, "conns.json"))       # перезагрузка: /run пуст
+cur = [sock("r%d" % i, "198.51.100.30", 300, 90000) for i in range(40)]
+h.cmd_sample({})
+want("после перезагрузки первый опрос — точка отсчёта", (h._close_conns(False)["pnew"]), 0)
+cur = []
+h.cmd_sample({}); h._close_conns(False)
 
 # ── Вердикт окна — первая подходящая строка
 V = h.verdict
@@ -72,7 +88,8 @@ want("заморозка без трафика — подозрение", V({"se
 want("2 зависших — не заморозка", V({"self": {"r": "ok"}, "c": {"f16": 2}, "tr": tr}), "ok")
 want("pre и late — не заморозка", V({"self": {"r": "ok"}, "c": {"pre": 9, "late": 9}, "tr": tr}), "ok")
 want("ретрансмиты 3% при 50 сегм/с", V({"self": {"r": "ok"}, "tcp": {"pct": 3.0}, "tr": tr}), "degraded")
-want("шквал — деградация", V({"self": {"r": "ok"}, "c": {"pmax": 31}, "tr": None}), "degraded")
+want("шквал — деградация", V({"self": {"r": "ok"}, "c": {"pnew": 31}, "tr": None}), "degraded")
+want("55 одновременных с адреса без новых — не деградация", V({"self": {"r": "ok"}, "c": {"pmax": 55, "pnew": 0}, "tr": tr}), "ok")
 want("тишина — нет данных, не сбой", V({"self": {"r": "ok"}, "c": {}, "tr": None}), "nodata")
 want("трафик самопроверки — не трафик клиентов", V({"self": {"r": "ok"}, "tr": 9000}), "nodata")
 want("пропущенная самопроверка — не сбой", V({"self": {"r": "skip", "why": "load"}, "tr": tr}), "ok")
@@ -111,12 +128,24 @@ with open(os.environ["XM_STATS_SAMPLES"], "w") as f:
 want("трафик за (100, 300]", h._traffic(100, 300), 110020)
 want("замеров нет — None, не 0", h._traffic(400, 500), None)
 
-# ── Окно целиком: запись, дубль в том же слоте, адресов на диске нет
+# ── Окно целиком: запись, дубль в том же слоте, расход юнитов, адресов на диске нет
 h._facts = lambda a: {"boot": "b1", "xray": "i1", "nginx": "n1", "cfg_xray": "c", "cfg_nginx": "g", "xbin": "1", "ver_xm": "m"}
 h._xray_version = lambda x: "26.3.27"
 h.FALLBACK_LOG = h.FRONT_LOG = os.path.join(T, "none.log")
+# cgroup v2: чей запуск — по /proc/self/cgroup, расход — cpu.stat и memory.peak своего юнита
+h.PROC_CGROUP, h.CG_ROOTS = os.path.join(T, "self-cgroup"), (os.path.join(T, "nocg"), os.path.join(T, "cg"))
+def unit(name, usec, peak):
+    open(h.PROC_CGROUP, "w").write("0::/system.slice/%s\n" % name)
+    d = os.path.join(T, "cg", "system.slice", name)
+    os.makedirs(d, exist_ok=True)
+    open(os.path.join(d, "cpu.stat"), "w").write("usage_usec %d\nuser_usec 1\nsystem_usec 1\n" % usec)
+    open(os.path.join(d, "memory.peak"), "w").write("%d\n" % peak)
 cur = [sock("p1", "192.0.2.77", 300, 1, 5, 3)]
-h.cmd_sample({})
+unit("xm-health-sample.service", 25000, 12 << 20)
+h.cmd_sample({}); h.cmd_sample({})
+open(h.PROC_CGROUP, "w").write("0::/user.slice/user-1000.slice/session-1.scope\n")
+h.cmd_sample({})                                         # вручную из SSH — не расход юнита
+unit("xm-health.service", 400000, 40 << 20)
 import io, contextlib
 buf, err = io.StringIO(), io.StringIO()
 with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
@@ -125,6 +154,18 @@ with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
 ws = h.load_windows()
 want("второй run в том же слоте не пишет дубль", (len(ws), "уже записано" in err.getvalue()), (1, True))
 want("окно: post и вердикт", (ws[0]["c"]["post"], ws[0]["vd"]), (1, "nodata"))
+want("окно из юнита не печатается (stdout юнита — журнал)", buf.getvalue(), "")
+want("расход опросов — в окне", ws[0].get("ld"), {"s": [2, 50, 12288]})
+want("свои запуски окна — в следующее", json.load(open(os.path.join(h.RUN_DIR, "load.json"))), {"w": [2, 800, 40960]})
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    h.cmd_load({})
+ld = json.loads(buf.getvalue())
+want("нагрузка: запуски, CPU, пик, часы окон", (ld["s"]["runs"], ld["s"]["cpu_ms"], ld["w"]["runs"], ld["w"]["peak_kb"], ld["hours"]),
+     (2, 50, 2, 40960, 0.08))
+os.unlink(os.path.join(T, "cg", "system.slice", "xm-health.service", "memory.peak"))
+want("ядро без memory.peak — пик неизвестен, CPU есть", h._unit_usage("w"), [400, None])
+open(h.PROC_CGROUP, "w").write("0::/user.slice/user-1000.slice/session-1.scope\n")
 blob = ""
 for d_ in (h.DATA_DIR, h.RUN_DIR):
     for n in os.listdir(d_):
@@ -153,6 +194,63 @@ want("полоса: ✓ и ✗ без серых", sorted(set(states)), ["bad", 
 want("сервер готов: 9 из 12 самопроверок", (r["d7"]["self_ok"], r["d7"]["self_runs"]), (9, 12))
 want("сессии: 3 из 6 окон с трафиком", (r["d7"]["traffic_ok"], r["d7"]["traffic_windows"]), (3, 6))
 want("одна причина: рукопожатие, 3 окна", [(x["why"], x["n"]) for x in r["incidents"]], [("сбой сервера: рукопожатие", 3)])
+# Вердикт пересчитывается при чтении: окна, записанные по прежнему правилу шквала, — не деградация
+with open(os.path.join(h.DATA_DIR, "windows.jsonl"), "a") as f:
+    f.write(json.dumps({"t": now // 300 * 300 + 300, "vd": "degraded", "self": {"r": "ok"},
+                        "c": {"pmax": 55, "new": 0}, "tr": tr}) + "\n")
+    f.write(json.dumps({"t": now // 300 * 300 + 600, "vd": "ok", "self": {"r": "ok"},
+                        "c": {"pmax": 3, "pnew": 40}, "tr": tr}) + "\n")
+ws = h.load_windows()
+want("прежнее «degraded» по одновременным — пересчитано", ws[-2]["vd"], "ok")
+want("шквал — деградация с причиной", h._incidents(ws[-1:])[0]["why"], "деградация: шквал новых соединений")
+
+# ── Смена суток: итоги в days.jsonl, окна старше 31 дня прочь — потоком, без файла в памяти
+import tracemalloc
+day0 = now // 86400 * 86400 + 43200
+big = os.path.join(h.DATA_DIR, "windows.jsonl")
+with open(big, "w") as f:
+    for i in range(33 * 288, 0, -1):
+        f.write(h._dump({"t": day0 - i * 300, "self": {"r": "ok"}, "c": {"norm": 120, "late": 1, "pmax": 55, "cmax": 140},
+                         "tcp": {"out": 123456, "retr": 1234, "rate": 411, "pct": 1.0}, "tr": tr, "vd": "ok"}) + "\n")
+    f.write("{broken\n")
+os.chmod(big, 0o600)
+open(os.path.join(h.DATA_DIR, "days.jsonl"), "w").write(json.dumps({"d": h._day(day0 - 86400), "n": -1}) + "\n")
+tracemalloc.start()
+h._rollup(day0, day0 - 86400)
+peak = tracemalloc.get_traced_memory()[1]
+tracemalloc.stop()
+ws = h.load_windows()
+days = [json.loads(x) for x in open(os.path.join(h.DATA_DIR, "days.jsonl"))]
+want("окна старше 31 дня удалены, битая строка — тоже", (ws[0]["t"] >= day0 - 31 * 86400, sum(1 for _ in open(big))), (True, len(ws)))
+want("итоги: есть сутки не трогаются, новых — по окнам", ([d["n"] for d in days if d["d"] == h._day(day0 - 86400)],
+     all(d["n"] > 0 and d["ok"] == d["n"] for d in days if d["d"] != h._day(day0 - 86400))), ([-1], True))
+want("права файла окон — 600", oct(os.stat(big).st_mode & 0o777), "0o600")
+want("пик памяти смены суток на 33 днях окон < 4 МБ", peak < 4 << 20, True)
+os.unlink(big); os.unlink(os.path.join(h.DATA_DIR, "days.jsonl"))
+
+# ── Трафик самопроверки не идёт в замер xm stats: счётчик первого клиента — как до неё
+cfg = os.path.join(T, "xcfg.json")
+json.dump({"inbounds": [{"settings": {"clients": [{"id": "x", "email": "pc"}, {"id": "y", "email": "phone"}]}}]}, open(cfg, "w"))
+fake = os.path.join(T, "fake-xray")
+open(fake, "w").write("#!/bin/sh\necho '" + json.dumps({"stat": [
+    {"name": "user>>>pc>>>traffic>>>uplink", "value": "5000"}, {"name": "user>>>pc>>>traffic>>>downlink", "value": "9000"},
+    {"name": "user>>>phone>>>traffic>>>downlink", "value": "700"}]}) + "'\n")
+os.chmod(fake, 0o755)
+def stats_run(*extra):
+    for f in ("clients.json", "samples.jsonl"):
+        try: os.unlink(os.path.join(stats.DATA_DIR, f))
+        except OSError: pass
+    stats.main(["stats.py", "collect", "--xray", fake, "--api", "127.0.0.1:1", "--port", "443", "--config", cfg] + list(extra))
+    c = json.load(open(os.path.join(stats.DATA_DIR, "clients.json")))
+    smp = json.loads(open(os.path.join(stats.DATA_DIR, "samples.jsonl")).read().splitlines()[-1])
+    day = list(c["pc"]["days"].values())[0] if "pc" in c else None
+    return day, c.get("pc", {}).get("last", 0) > 0, smp["up"] + smp["down"]
+want("без самопроверки — весь счётчик", stats_run(), ([5000, 9000], True, 14700))
+want("клиент молчал до самопроверки — не «в сети», её байты не в замере", stats_run("--hold", "pc", "--before", "0 0"),
+     ([0, 0], False, 700))
+want("клиент работал до самопроверки — его трафик остаётся", stats_run("--hold", "pc", "--before", "100 200"),
+     ([100, 200], True, 1000))
+want("счётчики до самопроверки не сняты — обычный замер", stats_run("--hold", "pc", "--before", ""), ([5000, 9000], True, 14700))
 
 print("\n".join("FAIL " + f for f in fails) if fails else "ok")
 PY
@@ -164,16 +262,25 @@ PY
 CONFIG="$T/config.json"
 echo '{"inbounds":[{"port":8443,"streamSettings":{"realitySettings":{"serverNames":["example.com"]}}}]}' >"$CONFIG"
 FRONT_NGX="$T/no-front"
-eval "$(sed -n '/^_get_nginx_sni()/,/^}/p; /^_front_enabled()/p; /^_front_public_port()/,/^}/p; /^HEALTH_URL=/p; /^_health_selfcheck()/,/^}/p' "$root/xm.sh")"
-declare -F _health_selfcheck >/dev/null || { echo "FAIL: в xm.sh нет _health_selfcheck"; exit 1; }
-HEALTH_LOADAVG="$T/loadavg" HEALTH_MEMINFO="$T/meminfo"
+eval "$(sed -n '/^_get_nginx_sni()/,/^}/p; /^_front_enabled()/p; /^_front_public_port()/,/^}/p; /^HEALTH_URL=/p
+  /^_health_pubkey()/,/^}/p; /^_health_selfcheck()/,/^[)}]$/p; /^_health_run()/,/^}/p' "$root/xm.sh")"
+for f in _health_selfcheck _health_pubkey _health_run; do
+  declare -F $f >/dev/null || { echo "FAIL: в xm.sh нет $f"; exit 1; }
+done
+HEALTH_LOADAVG="$T/loadavg" HEALTH_MEMINFO="$T/meminfo" HEALTH_RUN="$T/hrun"
 systemctl() { [[ $XRAY == up ]]; }
 ss() { [[ $LISTEN == yes ]] && echo "LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:*"; }
 timeout() { shift; "$@"; }
-getent() { [[ $DNS == ok ]]; }
-_tunnel_up() { TUN_ARGS="$*"; [[ $TUN == up ]]; }
-_tunnel_down() { :; }
-_tunnel_code() { echo "$CODE"; }
+getent() {  # cold — первая попытка не успела, вторая из кеша
+  [[ $DNS == ok ]] && return 0
+  [[ $DNS == cold ]] || return 1
+  [[ -f $T/dns-warm ]] && return 0
+  touch "$T/dns-warm"; return 1
+}
+# Тело самопроверки — подоболочка: что она вызвала, видно только через файлы
+_tunnel_up() { echo "$*" >"$T/tun-args"; echo "$BASHPID" >"$T/tun-pid"; [[ $TUN == up ]]; }
+_tunnel_down() { echo down >>"$T/tun-down"; }
+_tunnel_code() { [[ $CODE == term ]] && { kill -TERM "$(<"$T/tun-pid")"; echo 000; return; }; echo "$CODE"; }
 curl() { echo "$DIRECT"; }
 sleep() { :; }
 fails=0
@@ -190,13 +297,50 @@ case_ "памяти 140 МБ"       '{"r":"skip","why":"mem"}' 0.2 140
 XRAY=down case_ "Xray остановлен"    '{"r":"fail","at":"listen"}' 0.2 900
 LISTEN=no case_ "порт не слушает"    '{"r":"fail","at":"listen"}' 0.2 900
 DNS=bad case_ "маска не резолвится"  '{"r":"fail","at":"dns"}' 0.2 900
+DNS=cold case_ "холодный резолвинг — не сбой" '{"r":"ok"}' 0.2 900
 TUN=down case_ "клиент не поднялся"  '{"r":"skip","why":"client"}' 0.2 900
 CODE=000 case_ "тоннель не прошёл, сервер в сеть ходит" '{"r":"fail","at":"handshake"}' 0.2 900
 CODE=000 DIRECT=000 case_ "сервер не ходит в сеть" '{"r":"fail","at":"egress"}' 0.2 900
 _health_selfcheck >/dev/null
-[[ $TUN_ARGS == "xhttp 8443 " ]] || { echo "FAIL самопроверка идёт не на публичный порт: $TUN_ARGS"; fails=$((fails + 1)); }
+[[ $(<"$T/tun-args") == "xhttp 8443 " ]] || { echo "FAIL самопроверка идёт не на публичный порт: $(<"$T/tun-args")"; fails=$((fails + 1)); }
 BAD=bad CODE=000 case_ "неверный ключ" '{"r":"fail","at":"handshake"}' 0.2 900
 _health_selfcheck bad >/dev/null
-[[ $TUN_ARGS =~ ^xhttp\ 8443\ [A-Za-z0-9_-]{43}$ ]] || { echo "FAIL неверный ключ не подставлен: $TUN_ARGS"; fails=$((fails + 1)); }
+[[ $(<"$T/tun-args") =~ ^xhttp\ 8443\ [A-Za-z0-9_-]{43}$ ]] || { echo "FAIL неверный ключ не подставлен: $(<"$T/tun-args")"; fails=$((fails + 1)); }
+# Юнит убит (TimeoutStartSec) посреди запроса — клиент и его конфиг всё равно убраны
+rm -f "$T/tun-down"
+got=$(CODE=term _health_selfcheck)
+[[ -z $got && $(<"$T/tun-down") == down ]] || { echo "FAIL после TERM клиент не убран: «$got», down=$(<"$T/tun-down")"; fails=$((fails + 1)); }
+
+# Ключ: вывод из privateKey — один раз на ключ, дальше кеш в RAM; сменился ключ — вывод заново
+echo '{"inbounds":[{"streamSettings":{"realitySettings":{"privateKey":"kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}}]}' >"$T/kcfg.json"
+_get_pubkey() { echo x >>"$T/derive"; echo "PUB-$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' "$CONFIG")-0123456789abcdef"; }
+k1=$(CONFIG="$T/kcfg.json" _health_pubkey); k2=$(CONFIG="$T/kcfg.json" _health_pubkey)
+sed -i 's/kAAA/kBBB/' "$T/kcfg.json"; k3=$(CONFIG="$T/kcfg.json" _health_pubkey)
+[[ $k1 == "$k2" && $k3 == PUB-kBBB* && $(wc -l <"$T/derive") -eq 2 ]] \
+  || { echo "FAIL кеш ключа: $k1 / $k2 / $k3, выводов $(wc -l <"$T/derive")"; fails=$((fails + 1)); }
+
+# Окно: счётчики первого клиента снимаются ДО самопроверки и уходят в замер после неё
+_health_params() { :; }
+_stats_api() { echo 127.0.0.1:10085; }
+_stats_peek() { echo "peek $*" >>"$T/calls"; echo "100 200"; }
+_health_selfcheck() { echo self >>"$T/calls"; echo '{"r":"ok"}'; }
+_stats_collect() { echo "collect $*" >>"$T/calls"; }
+_health_py() { echo "py $*" >>"$T/calls"; }
+echo '{"inbounds":[{"port":8443,"settings":{"clients":[{"id":"x","email":"pc"}]}}]}' >"$CONFIG"
+rm -f "$T/calls"; _health_run
+exp=$'peek 127.0.0.1:10085 pc\nself\ncollect --hold pc --before 100 200\npy window --self {"r":"ok"}'
+[[ $(<"$T/calls") == "$exp" ]] || { echo "FAIL порядок окна: $(paste -sd'|' "$T/calls")"; fails=$((fails + 1)); }
+rm -f "$T/calls"; _health_run dry
+[[ $(<"$T/calls") == $'self\npy window --self {"r":"ok"} --dry' ]] || { echo "FAIL окно --dry трогает замер: $(paste -sd'|' "$T/calls")"; fails=$((fails + 1)); }
 (( fails == 0 )) || exit 1
+
+# health.py — модулем: байткод кешируется, импорт не берёт health.py из текущего каталога
+mkdir -p "$T/ui" "$T/cwd"; cp "$root/ui/health.py" "$T/ui/"
+echo 'print("DECOY")' >"$T/cwd/health.py"
+unset PYTHONDONTWRITEBYTECODE
+UI_DIR="$T/ui"; XM_BIN=/nonexistent
+eval "$(sed -n '/^HEALTH_PY=/p; /^_health_py()/,/^}/p' "$root/xm.sh")"
+got=$(cd "$T/cwd" && XM_HEALTH_DIR="$T/empty" _health_py report --json)
+[[ $got == *'"band"'* && $got != *DECOY* ]] || { echo "FAIL запуск модулем: $got"; exit 1; }
+ls "$T"/ui/__pycache__/health.*.pyc >/dev/null 2>&1 || { echo "FAIL байткод health не закеширован"; exit 1; }
 echo "health: ok"

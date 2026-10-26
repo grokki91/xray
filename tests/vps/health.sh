@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Приёмка xm health (этап 1) на живом VPS: факты для сверки, классы соединений эмуляцией iptables
 # connbytes на тестовом порту петли (сверка netlink с ss), самопроверка с настоящим и с неверным
-# ключом, повторный on без дублей, off со стиранием, нагрузка юнитов, адресов на диске нет.
+# ключом, повторный on без дублей, off со стиранием, нагрузка юнитов по cgroup, тишина журнала,
+# адресов на диске нет.
 # Рабочий трафик не трогается: правила — только -i lo и тестовый порт; правила, nf_conntrack_acct
 # и прежнее состояние монитора (с данными) возвращаются. Запуск: sudo bash tests/vps/health.sh
 source "${BASH_SOURCE[0]%/*}/../lib.sh"
 CFG=/usr/local/etc/xray/config.json
 HD=/var/lib/xm/health
 PY=/usr/local/lib/xm/ui/health.py
+# Как зовёт xm: модулем из каталога панели
+HPY=(python3 -I -S -c "import sys; sys.path[:0] = ['${PY%/*}']; import health; sys.exit(health.main(sys.argv))")
 vpr
 vneed "iptables есть" bash -c 'command -v iptables'
 vneed "python3 есть" bash -c 'command -v python3'
@@ -32,7 +35,7 @@ fact "xm stats (API)" "$(jq -r '.api.listen // "выкл"' "$CFG" | sed 's/:.*//
 fact "таймер xm-stats" "$(systemctl is-active xm-stats.timer 2>&1)"
 fact "health до теста" "$([[ -f /etc/systemd/system/xm-health.timer ]] && echo "вкл, окон $(wc -l < "$HD/windows.jsonl" 2>/dev/null || echo 0)" || echo выкл)"
 fact "journald" "$(grep -hsE '^Storage=' /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf | tail -1)$( [[ -d /var/log/journal ]] && echo ' /var/log/journal есть' || echo ' только /run (volatile)')"
-fact "строка Consumed (образец)" "$(journalctl -q -u xray-watchdog.service -o cat --no-pager -n 200 2>/dev/null | grep -m1 -oE 'Consumed .*' || echo нет)"
+fact "cgroup / memory.peak" "$(stat -fc %T /sys/fs/cgroup 2>/dev/null) / $([[ -f /sys/fs/cgroup/system.slice/memory.peak ]] && echo есть || echo нет)"
 fact "ротация логов nginx" "$(grep -hE '^\s*(daily|weekly|compress|delaycompress|rotate)' /etc/logrotate.d/nginx 2>/dev/null | tr -s ' \n' ' ')"
 for L in /var/log/nginx/reality_fallback_error.log /var/log/nginx/front_error.log; do
   fact "${L##*/}" "$([[ -f $L ]] && echo "$(wc -l < "$L") строк, .1: $([[ -f $L.1 ]] && echo есть || echo нет)" || echo нет)"
@@ -149,33 +152,36 @@ vsame   "юниты после повторного on" "$VTMP/units" bash -c 's
 vexpect "таймеров два" "2" bash -c 'systemctl list-timers --all --no-legend "xm-health*" | grep -c xm-health'
 $STATS_ON && vexpect "таймер xm-stats снят, замер — в окне" "inactive" bash -c 'systemctl is-active xm-stats.timer; true'
 $STATS_ON && vcheck  "xm stats status: замер работает" bash -c 'xm stats status | grep -q "Таймер замеров работает"'
-vcheck  "опрос юнитом" systemctl start xm-health-sample.service
+for i in 1 2 3; do vcheck "опрос юнитом ($i)" systemctl start xm-health-sample.service; done
 VTIMEOUT=90 vcheck "окно юнитом" systemctl start xm-health.service
 vexpect "окно записано, самопроверка прошла" "ok" bash -c "tail -n1 $HD/windows.jsonl | jq -r .self.r"
+fact "соединения окна" "$(tail -n1 "$HD/windows.jsonl" | jq -r '"одновременно с адреса до \(.c.pmax), новых с адреса за опрос до \(.c.pnew), вердикт \(.vd)"')"
+VTIMEOUT=90 vcheck "второе окно юнитом" systemctl start xm-health.service
+$STATS_ON && xm stats collect >/dev/null 2>&1
 VTIMEOUT=90 vcheck "ручной run" xm health run
+$STATS_ON && fact "трафик окна, самопроверка исключена" "$(tail -n1 /var/lib/xm/stats/samples.jsonl | jq -r '"\(.up + .down) байт (выше — без исключения)"')"
 vexpect "дублей окон нет" "0" bash -c "jq -r .t $HD/windows.jsonl | sort | uniq -d | wc -l"
 vexpect "адресов на диске нет" "" bash -c "grep -rhoE '([0-9]{1,3}\.){3}[0-9]{1,3}' $HD /run/xm-health | sort -u; true"
 vcheck  "отчёт" bash -c 'xm health | grep -q "Сервер готов"'
 vcheck  "отчёт --json" bash -c 'xm health --json | jq -e ".band | length == 96" >/dev/null'
-# Нагрузка: запуски с начала теста по «Consumed» systemd, на сутки — 1440 опросов и 288 окон
-LOADJS=$(python3 -B - "$T0" <<'EOF'
-import json, re, subprocess, sys
-sys.path.insert(0, "/usr/local/lib/xm/ui"); import health as h
-r = {}
-for u in ("xm-health-sample.service", "xm-health.service"):
-    out = subprocess.run(["journalctl", "-q", "-u", u, "--since", sys.argv[1], "-o", "cat", "--no-pager"],
-                         capture_output=True, text=True).stdout
-    m = [x for x in map(h._CONSUMED.search, out.splitlines()) if x]
-    r[u] = (max(h._ms(x.group(1), x.group(2), x.group(3)) for x in m) if m else None,
-            max((float(x.group(4)) * {"K": 1 / 1024, "M": 1, "G": 1024}[x.group(5)] for x in m if x.group(4)), default=None))
-s, w = r["xm-health-sample.service"], r["xm-health.service"]
-cpu = None if s[0] is None or w[0] is None else (s[0] * 1440 + w[0] * 288) / 864000
-print(json.dumps({"sample_ms": s[0], "window_ms": w[0], "cpu_pct_day": cpu, "peak_mb": max([x for x in (s[1], w[1]) if x] or [0]) or None}))
-EOF
-)
-fact "нагрузка (оценка на сутки)" "$LOADJS"
+# Нагрузка — по cgroup юнитов (сами запуски пишут расход, окно его хранит); на сутки — 1440
+# опросов и 288 окон по средним за прогон. load берёт и окна, и ещё не забранное в окно: итог не
+# зависит от того, записал ли таймер окно этого слота раньше теста.
+LOADJS=$("${HPY[@]}" load | jq -c '. + {
+    sample_ms: (if .s.runs > 0 then .s.cpu_ms / .s.runs | floor else null end),
+    window_ms: (if .w.runs > 0 then .w.cpu_ms / .w.runs | floor else null end),
+    peak_mb: ([.s.peak_kb, .w.peak_kb] | map(select(. != null)) | if length > 0 then max / 1024 else null end)}
+  | . + {cpu_pct_day: (if .sample_ms != null and .window_ms != null
+                        then (.sample_ms * 1440 + .window_ms * 288) / 864000 else null end)}')
+fact "нагрузка (оценка на сутки)" "$(jq -c '{s, w, sample_ms, window_ms, cpu_pct_day, peak_mb}' <<<"$LOADJS")"
+vexpect "нагрузка измерена юнитами: опросы и окна" "true" jq -r '.s.runs >= 3 and .w.runs >= 2' <<<"$LOADJS"
 vexpect "CPU ≤ 0.3% ядра на сутки" "true" jq -r '.cpu_pct_day != null and .cpu_pct_day <= 0.3' <<<"$LOADJS"
 vexpect "пик памяти ≤ 77 МБ (запас до MemoryMax 96M)" "true" jq -r '.peak_mb != null and .peak_mb <= 77' <<<"$LOADJS"
+# LogLevelMax=notice: «Starting/Finished» на каждый запуск в журнал не идут, сбоев за прогон нет.
+# «Consumed» systemd поднимает до notice сам на тяжёлом запуске (холодный кеш) — это не спам.
+vexpect "запуски юнитов не пишут в журнал" "0" \
+  bash -c "journalctl -q -u xm-health-sample.service -u xm-health.service --since '$T0' -o cat --no-pager | grep -v Consumed | wc -l"
+vcheck  "status: нагрузка видна, юниты свежие" bash -c 'out=$(xm health status); grep -q "Нагрузка" <<<"$out" && ! grep -q "прежней версии" <<<"$out"'
 vcheck  "off" xm health off
 vexpect "off: юнитов и данных нет" "0" bash -c "ls -d /etc/systemd/system/xm-health* $HD /run/xm-health 2>/dev/null | wc -l"
 $STATS_ON && vexpect "off: таймер xm-stats вернулся" "active" systemctl is-active xm-stats.timer
