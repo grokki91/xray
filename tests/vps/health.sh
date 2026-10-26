@@ -9,8 +9,8 @@ CFG=/usr/local/etc/xray/config.json
 HD=/var/lib/xm/health
 PY=/usr/local/lib/xm/ui/health.py
 vpr
-vneed "iptables есть" command -v iptables
-vneed "python3 есть" command -v python3
+vneed "iptables есть" bash -c 'command -v iptables'
+vneed "python3 есть" bash -c 'command -v python3'
 vneed "health.py установлен (sudo xm self-update)" test -f "$PY"
 vneed "Xray работает" systemctl is-active --quiet xray
 
@@ -133,7 +133,7 @@ vexpect "nf_conntrack_acct как был" "$ACCT0" sysctl -n net.netfilter.nf_co
 # ─── Самопроверка: настоящий ключ — прошла, неверный — «сбой сервера: рукопожатие»
 VTIMEOUT=90 vexpect "самопроверка проходит" "ok" bash -c 'xm health run --dry | jq -r .self.r'
 VTIMEOUT=90 vexpect "неверный ключ → сбой сервера" "server fail handshake" \
-  bash -c 'xm health run --bad-key | jq -r "\(.vd) \(.self.r) \(.self.at)"'
+  bash -c 'xm health run --bad-key | jq -r "[.vd, .self.r, .self.at] | join(\" \")"'
 if $STATS_ON; then
   xm stats collect >/dev/null 2>&1; xm health run --dry >/dev/null 2>&1; xm stats collect >/dev/null 2>&1
   fact "трафик самопроверки" "$(tail -n1 /var/lib/xm/stats/samples.jsonl | jq -r '"\(.up + .down) байт (порог трафика клиентов 65536)"')"
@@ -177,7 +177,7 @@ fact "нагрузка (оценка на сутки)" "$LOADJS"
 vexpect "CPU ≤ 0.3% ядра на сутки" "true" jq -r '.cpu_pct_day != null and .cpu_pct_day <= 0.3' <<<"$LOADJS"
 vexpect "пик памяти ≤ 77 МБ (запас до MemoryMax 96M)" "true" jq -r '.peak_mb != null and .peak_mb <= 77' <<<"$LOADJS"
 vcheck  "off" xm health off
-vexpect "off: юнитов и данных нет" "0" bash -c "ls /etc/systemd/system/xm-health* $HD /run/xm-health 2>/dev/null | wc -l"
+vexpect "off: юнитов и данных нет" "0" bash -c "ls -d /etc/systemd/system/xm-health* $HD /run/xm-health 2>/dev/null | wc -l"
 $STATS_ON && vexpect "off: таймер xm-stats вернулся" "active" systemctl is-active xm-stats.timer
 
 # ─── Целостность: Xray цел, сквозной путь жив
