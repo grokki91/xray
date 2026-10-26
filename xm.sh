@@ -497,10 +497,14 @@ TUN_PORT=""; TUN_PID=""; TUN_CFG=""; TUN_LOG=""; TUN_SNI=""; TUN_SRVPORT=""
 _tunnel_up() {
   local net="${1:-xhttp}" idx=0 fb="PUBLIC KEY" uuid port sni sid pub path_v mode
   [[ "$net" == "tcp" ]] && { idx=1; fb="PUBLIC KEY2"; }
-  uuid=$(jq -r ".inbounds[$idx].settings.clients[0].id" "$CONFIG" 2>/dev/null)
-  port=${2:-$(jq -r ".inbounds[$idx].port" "$CONFIG" 2>/dev/null)}
-  sni=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.serverNames[0]" "$CONFIG" 2>/dev/null)
-  sid=$(jq  -r ".inbounds[$idx].streamSettings.realitySettings.shortIds[0]" "$CONFIG" 2>/dev/null)
+  # Поля inbound — одним jq, по строке на поле (null — «null», как у отдельных вызовов): самопроверка
+  # xm health идёт сюда 288 раз в сутки, а каждый запуск jq — заметная доля её CPU.
+  { IFS= read -r uuid; IFS= read -r port; IFS= read -r sni; IFS= read -r sid
+    IFS= read -r path_v; IFS= read -r mode; } < <(jq -r --argjson i "$idx" '.inbounds[$i]
+      | .settings.clients[0].id, .port, .streamSettings.realitySettings.serverNames[0],
+        .streamSettings.realitySettings.shortIds[0], .streamSettings.xhttpSettings.path,
+        .streamSettings.xhttpSettings.mode' "$CONFIG" 2>/dev/null)
+  port=${2:-$port}
   pub=${3:-$(_get_pubkey "$idx" "$fb")}
   [[ -z "$pub" || ${#pub} -lt 30 ]] && return 1
 
@@ -509,8 +513,6 @@ _tunnel_up() {
   TUN_LOG=$(mktemp /tmp/xm-tunnel.XXXXXX.log)
 
   if [[ "$net" == "xhttp" ]]; then
-    path_v=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.path' "$CONFIG")
-    mode=$(jq   -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
     jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
           --arg p "$path_v" --arg m "$mode" --argjson port "$port" --argjson sp "$TUN_PORT" \
           --argjson doh "$DOH_LIST" '{
@@ -2479,9 +2481,10 @@ _health_enabled() { [[ -f "$HEALTH_UNIT_DIR/xm-health.timer" ]]; }
 
 # Публичный ключ самопроверки. Вывод из privateKey — запуск python с cryptography (~70 мс CPU на
 # каждое окно), поэтому кеш в RAM, привязанный к хешу privateKey: сменился ключ — сменился кеш.
+# $1 — privateKey, если окно его уже прочитало (без аргумента — из config.json).
 _health_pubkey() {
-  local priv h c="" pub=""
-  priv=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // ""' "$CONFIG" 2>/dev/null)
+  local priv="${1-}" h c="" pub=""
+  (( $# )) || priv=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // ""' "$CONFIG" 2>/dev/null)
   [[ -n "$priv" ]] || return 0
   h=$(printf '%s' "$priv" | sha256sum | cut -c1-16)
   { read -r c pub < "$HEALTH_RUN/pubkey"; } 2>/dev/null
@@ -2495,32 +2498,31 @@ _health_pubkey() {
 # Самопроверка → JSON одной строкой: {"r":"ok|fail|skip", "at": где сломалось, "why": почему
 # пропущена, "ms"}. Настоящий VLESS+REALITY+XHTTP с самого сервера на публичный порт через петлю
 # и один запрос наружу. Пропуск — не сбой: под нагрузкой сам монитор не успел бы и обвинил сервер.
-# $1 = bad — тестовый режим: случайный публичный ключ вместо настоящего.
+# $1 = bad — тестовый режим: случайный публичный ключ вместо настоящего. $2 — публичный порт,
+# $3 — порт inbound, $4 — serverNames[0], $5 — privateKey: поля config.json читает _health_run.
 # Худший случай — 5 + 5 + 2 + 10 + 2 + 10 + 5 ≈ 39 с: вместе с замером и окном укладывается в
 # TimeoutStartSec=60, иначе systemd убил бы юнит и сбой сервера записался бы «нет данных».
 # Тело — подоболочка: ловушка EXIT уберёт клиент и его конфиг (в нём UUID) и при убийстве юнита.
 _health_selfcheck() (
-  local bad="${1:-}" la mem port xport p sni pub="" t0 code direct
+  local bad="${1:-}" port="${2:-}" xport="${3:-}" csni="${4:-}" priv="${5:-}" la mem p sni pub="" t0 code direct
   trap '_tunnel_down' EXIT
   trap 'exit 1' TERM INT
   read -r la _ < "$HEALTH_LOADAVG"
   mem=$(awk '$1 == "MemAvailable:" {print int($2 / 1024)}' "$HEALTH_MEMINFO")
   awk -v l="$la" 'BEGIN {exit !(l > 1.5)}' && { echo '{"r":"skip","why":"load"}'; return; }
   [[ "${mem:-0}" -lt 150 ]] && { echo '{"r":"skip","why":"mem"}'; return; }
-  port=$(_front_public_port)
-  xport=$(jq -r '.inbounds[0].port' "$CONFIG" 2>/dev/null)
   systemctl is-active --quiet xray || { echo '{"r":"fail","at":"listen"}'; return; }
   for p in $(printf '%s\n' "$port" "$xport" | sort -u); do
     [[ "$p" =~ ^[0-9]+$ ]] && ss -tlnH "( sport = :$p )" 2>/dev/null | grep -q . \
       || { echo '{"r":"fail","at":"listen"}'; return; }
   done
   sni=$(_get_nginx_sni)
-  [[ -z "$sni" ]] && sni=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0] // ""' "$CONFIG" 2>/dev/null)
+  [[ -z "$sni" ]] && sni=$csni
   # Повтор: холодный резолвинг через строгий DoT — единицы секунд, первая попытка греет кеш.
   { timeout 5 getent hosts "$sni" || timeout 5 getent hosts "$sni"; } >/dev/null 2>&1 \
     || { echo '{"r":"fail","at":"dns"}'; return; }
   if [[ "$bad" == bad ]]; then pub=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')
-  else pub=$(_health_pubkey); fi
+  else pub=$(_health_pubkey "$priv"); fi
   # Клиент самопроверки не поднялся (не хватило памяти юниту, нет ключа) — сервер тут ни при чём.
   _tunnel_up xhttp "$port" "$pub" || { _tunnel_down; echo '{"r":"skip","why":"client"}'; return; }
   t0=$(date +%s%N)
@@ -2537,10 +2539,10 @@ _health_selfcheck() (
 )
 
 # Порт для поминутного опроса: юнит зовёт health.py напрямую, без разбора xm. Пишется только при
-# смене и через rename — опрос не прочтёт файл наполовину записанным.
+# смене и через rename — опрос не прочтёт файл наполовину записанным. $1 — порт, если уже известен.
 _health_params() {
-  local port
-  port=$(_front_public_port)
+  local port="${1:-}"
+  [[ -n "$port" ]] || port=$(_front_public_port)
   [[ "$port" =~ ^[0-9]+$ ]] || return 1
   [[ "$(cat "$HEALTH_DIR/params.json" 2>/dev/null)" == "{\"port\":$port}" ]] && return 0
   install -d -m 700 "$HEALTH_DIR" && ( umask 077; echo "{\"port\":$port}" > "$HEALTH_DIR/params.json.tmp" ) \
@@ -2557,22 +2559,28 @@ _health_py() {
 }
 
 # Одно окно: $1 = dry — напечатать и ничего не записать, $2 = bad — неверный ключ в самопроверке.
+# Поля config.json — одним jq на окно (по строке на поле): окон 288 в сутки, а отдельные jq на
+# порт, API, email, ключ и SNI были заметной долей CPU окна.
 _health_run() {
-  local dry="${1:-}" bad="${2:-}" self api="" email="" before=""
-  [[ "$dry" == dry ]] || _health_params || return 1
-  [[ "$dry" == dry ]] || api=$(_stats_api)
+  local dry="${1:-}" bad="${2:-}" self xport email priv csni api port before="" st=()
+  { IFS= read -r xport; IFS= read -r email; IFS= read -r priv; IFS= read -r csni; IFS= read -r api; } < <(
+    jq -r '(.inbounds[0] | .port, (.settings.clients[0].email // ""),
+             (.streamSettings.realitySettings | (.privateKey // ""), (.serverNames[0] // ""))),
+           (.api.listen // "")' "$CONFIG" 2>/dev/null)
+  port=$xport
+  _front_enabled && port=$(_front_port)
+  [[ "$dry" == dry ]] && api=""
+  [[ "$dry" == dry ]] || _health_params "$port" || return 1
   # Самопроверка идёт через Xray под первым клиентом. Его счётчик до неё — настоящий трафик,
   # прирост за неё в замер не идёт: иначе клиент в панели «в сети» круглосуточно.
-  if [[ -n "$api" ]]; then
-    email=$(jq -r '.inbounds[0].settings.clients[0].email // empty' "$CONFIG" 2>/dev/null)
-    [[ -n "$email" ]] && before=$(_stats_peek "$api" "$email")
-  fi
-  self=$(_health_selfcheck "$bad")
-  # Трафик своих клиентов — замер xm stats (его таймер при включённом health снят).
-  if [[ -n "$before" ]]; then _stats_collect --hold "$email" --before "$before" >/dev/null 2>&1 || true
-  elif [[ -n "$api" ]]; then _stats_collect >/dev/null 2>&1 || true; fi
+  [[ -n "$api" && -n "$email" ]] && before=$(_stats_peek "$api" "$email")
+  self=$(_health_selfcheck "$bad" "$port" "$xport" "$csni" "$priv")
+  # Трафик своих клиентов — замер xm stats (его таймер при включённом health снят) делает само
+  # окно, в своём процессе: отдельный python на замер — заметная доля CPU окна.
+  [[ -n "$api" ]] && st=(--api "$api" --port "$port")
+  [[ -n "$api" && -n "$before" ]] && st+=(--hold "$email" --before "$before")
   if [[ "$dry" == dry ]]; then _health_py window --self "$self" --dry
-  else _health_py window --self "$self"; fi
+  else _health_py window --self "$self" "${st[@]}"; fi
 }
 
 # Юниты: один и тот же текст при каждом on — повторный on ничего не дублирует. LogLevelMax=notice:
@@ -6421,7 +6429,7 @@ health)
       else
         info "Окон пока нет — первое в течение 5 минут после включения"
       fi
-      HL_ST=$(jq -r '.t // empty' "$HEALTH_RUN/conns.json" 2>/dev/null)
+      HL_ST=$(stat -c %Y "$HEALTH_RUN/conns.bin" 2>/dev/null)
       [[ "$HL_ST" =~ ^[0-9]+$ ]] && info "Последний опрос соединений: $(( $(date +%s) - HL_ST )) с назад"
       [[ -z "$(_stats_api)" ]] && warn "Трафик своих клиентов не виден: ${BOLD}sudo xm stats on${NC}"
       # Нагрузка — по cgroup юнитов: каждый запуск сам дописывает свой расход, окно его хранит.

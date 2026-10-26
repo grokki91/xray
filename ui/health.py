@@ -6,7 +6,8 @@
 адреса клиентов живут в памяти одного прохода и не пишутся никуда.
 
   health.py sample [--port N --print --loopback]  опрос соединений (таймер раз в минуту)
-  health.py window --self JSON [--dry] …          окно 5 минут (таймер через xm health run)
+  health.py window --self JSON [--dry] …          окно 5 минут (таймер через xm health run);
+                                                  --api, --port, --hold, --before — замер xm stats
   health.py init                                  точки отсчёта без записи окна (xm health on)
   health.py report [--json]                       отчёт за 24 ч и 7 дней
   health.py load                                  CPU и пик памяти юнитов за сутки (cgroup)
@@ -14,14 +15,15 @@
 Хранилище: DATA_DIR/windows.jsonl (окна, KEEP_DAYS), DATA_DIR/days.jsonl (итоги суток,
 KEEP_DAYS_SUM), DATA_DIR/params.json (порт); промежуточное — RUN_DIR (RAM).
 
-Опрос идёт 1440 раз в сутки, поэтому наверху — только то, что нужно ему; datetime, hashlib,
-subprocess импортируются там, где нужны (окно, отчёт).
+Опрос идёт 1440 раз в сутки, поэтому наверху — только то, что нужно ему. Без json: он тянет re и
+enum, и их импорт был больше половины CPU опроса — состояние опроса в RUN_DIR поэтому marshal.
+Без обёртки socket.py (тянет enum и selectors) — _socket. json, re, datetime, hashlib, subprocess
+импортируются там, где нужны (окно, отчёт).
 """
+import _socket as socket
 import fcntl
-import json
+import marshal
 import os
-import re
-import socket
 import struct
 import sys
 import time
@@ -88,16 +90,18 @@ def _p(*names):
     return os.path.join(*names)
 
 
-def _atomic_write(path, text):
+def _atomic_write(path, data):
     d = os.path.dirname(path)
     os.makedirs(d, mode=0o700, exist_ok=True)
+    if isinstance(data, str):
+        data = data.encode("utf-8")
     # Без tempfile (его импорт — заметная доля CPU поминутного опроса): имя с pid уникально среди
     # живых процессов, остаток от убитого с тем же pid просто перезаписывается.
     tmp = "%s.%d.tmp" % (path, os.getpid())
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -108,6 +112,7 @@ def _atomic_write(path, text):
 
 
 def _load_json(path, default):
+    import json
     try:
         with open(path, encoding="utf-8") as f:
             v = json.load(f)
@@ -117,7 +122,23 @@ def _load_json(path, default):
 
 
 def _dump(obj):
+    import json
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+# Состояние опроса в RUN_DIR — marshal (см. docstring). Не прочиталось (обрыв записи, другая
+# версия python) — пустое: следующий опрос станет точкой отсчёта, как после перезагрузки.
+def _state(name):
+    try:
+        with open(_p(RUN_DIR, name), "rb") as f:
+            v = marshal.load(f)
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError, EOFError, TypeError):
+        return {}
+
+
+def _state_save(name, obj):
+    _atomic_write(_p(RUN_DIR, name), marshal.dumps(obj))
 
 
 def _lock():
@@ -232,8 +253,12 @@ def classify(c):
     return "late"
 
 
-def _params():
-    return _load_json(_p(DATA_DIR, "params.json"), {})
+def _port():
+    """Порт опроса из params.json. Без json: xm пишет файл ровно так — {"port":N}."""
+    s = _read(_p(DATA_DIR, "params.json")).strip()
+    if s.startswith(b'{"port":') and s.endswith(b"}") and s[8:-1].isdigit():
+        return int(s[8:-1])
+    return int(_load_json(_p(DATA_DIR, "params.json"), {}).get("port") or 0)
 
 
 def _win0():
@@ -241,7 +266,7 @@ def _win0():
 
 
 def cmd_sample(args):
-    port = int(args.get("port") or _params().get("port") or 0)
+    port = int(args.get("port") or _port() or 0)
     if not port:
         return 0                     # порт ещё не записан (первое окно после on) — тихо
     conns = connections(port, loopback="loopback" in args)
@@ -259,7 +284,7 @@ def cmd_sample(args):
     now = int(time.time())
     peers, fresh = {}, {}
     with _lock():
-        st = _load_json(_p(RUN_DIR, "conns.json"), {})
+        st = _state("conns.bin")
         # Первый опрос после включения или перезагрузки (RUN_DIR в RAM): соединения ещё не виданы,
         # но они не новые — без точки отсчёта каждое включение рисовало бы шквал.
         base = "c" not in st
@@ -288,7 +313,7 @@ def cmd_sample(args):
         win["pmax"] = max(win["pmax"], max(peers.values()) if peers else 0)
         win["pnew"] = max(win.get("pnew", 0), max(fresh.values()) if fresh else 0)
         st["c"], st["t"] = known, now
-        _atomic_write(_p(RUN_DIR, "conns.json"), _dump(st))
+        _state_save("conns.bin", st)
         _add_load("s")
     peers.clear()                    # адреса — только на время прохода
     fresh.clear()
@@ -297,7 +322,7 @@ def cmd_sample(args):
 
 def _close_conns(dry):
     """Итог соединений окна; сбрасывает окно, если не dry. None — опроса в окне не было."""
-    st = _load_json(_p(RUN_DIR, "conns.json"), {})
+    st = _state("conns.bin")
     win = st.get("w") or {}
     if not win.get("smp"):
         return None
@@ -319,13 +344,13 @@ def _close_conns(dry):
             rec[2] = 0
     if not dry:
         st["c"], st["w"] = known, _win0()
-        _atomic_write(_p(RUN_DIR, "conns.json"), _dump(st))
+        _state_save("conns.bin", st)
     return out
 
 
 # ─── Нагрузка юнитов: cgroup v2 ──────────────────────────────────────────────
 #
-# Каждый запуск юнита дописывает свой расход в RUN_DIR/load.json, окно забирает накопленное в
+# Каждый запуск юнита дописывает свой расход в RUN_DIR/load.bin, окно забирает накопленное в
 # запись (поле ld). Источник — счётчики ядра своего cgroup: весь запуск вместе с порождёнными
 # процессами (Xray самопроверки, curl, jq). Строки «Consumed …» journald не годятся: systemd
 # пишет их на уровне debug, пока запуск не съел заметно CPU, и без пика памяти до systemd 256 —
@@ -363,16 +388,15 @@ def _unit_usage(kind):
 
 
 def _add_load(kind):
-    """Расход этого запуска — в RUN_DIR/load.json: [запусков, CPU мс, пик КБ]. Вызывать под _lock."""
+    """Расход этого запуска — в RUN_DIR/load.bin: [запусков, CPU мс, пик КБ]. Вызывать под _lock."""
     u = _unit_usage(kind)
     if u is None:
         return
-    p = _p(RUN_DIR, "load.json")
-    ld = _load_json(p, {})
+    ld = _state("load.bin")
     v = ld.get(kind)
     n, ms, pk = v if isinstance(v, list) and len(v) == 3 else (0, 0, None)
     ld[kind] = [n + 1, ms + u[0], _peak(pk, u[1])]
-    _atomic_write(p, _dump(ld))
+    _state_save("load.bin", ld)
 
 
 # ─── Счётчики ядра: своя точка отсчёта ───────────────────────────────────────
@@ -523,6 +547,7 @@ def _facts(a):
 
 
 def _xray_version(xray):
+    import re
     m = re.search(r"Xray (\S+)", _run([xray, "version"]))
     return m.group(1) if m else "?"
 
@@ -556,6 +581,7 @@ def _events(prev, cur, a, since):
 
 def _traffic(since, now):
     """Сумма up+down из samples.jsonl xm stats за (since, now]; None — замеров с трафиком не было."""
+    import json
     total, seen = 0, False
     try:
         size = os.path.getsize(STATS_SAMPLES)
@@ -604,7 +630,30 @@ def verdict(w):
     return "suspect" if susp else "nodata"
 
 
+def _collect_stats(args):
+    """Замер xm stats (--api, --port, --hold EMAIL --before "UP DOWN") — в процессе окна: отдельный
+    python на каждое окно стоил заметную долю его CPU. Сбой замера окно не роняет: в отдельном
+    процессе он и раньше окна не касался."""
+    if not args.get("api"):
+        return
+    try:
+        import stats
+        hold = None
+        try:
+            up, down = (int(x) for x in args.get("before", "").split())
+            hold = (args["hold"], up, down) if args.get("hold") else None
+        except ValueError:
+            pass
+        stats.collect(args.get("xray") or "/usr/local/bin/xray", args["api"], int(args.get("port") or 0),
+                      args.get("config") or "/usr/local/etc/xray/config.json", hold=hold)
+    except Exception:
+        pass
+
+
 def cmd_window(args):
+    import json
+    # Замер — до «сейчас» окна: его отсчёт должен попасть в это окно, а не в следующее.
+    _collect_stats(args)
     now = int(time.time())
     t_end = now // WINDOW * WINDOW
     dry = "dry" in args
@@ -617,8 +666,10 @@ def cmd_window(args):
         last = _last_window()
         if not dry and last and last["t"] >= t_end:
             # Окно уже записано (ручной run в том же пятиминутном слоте): данные — в следующее.
-            print("health: окно %s уже записано — данные уйдут в следующее" %
-                  time.strftime("%H:%M", time.localtime(t_end)), file=sys.stderr)
+            # Только в терминал: stderr юнита — строка журнала с уровнем warning (SyslogLevel).
+            if sys.stderr.isatty():
+                print("health: окно %s уже записано — данные уйдут в следующее" %
+                      time.strftime("%H:%M", time.localtime(t_end)), file=sys.stderr)
             _add_load("w")
             return 0
         conns = _close_conns(dry)
@@ -641,14 +692,14 @@ def cmd_window(args):
             print(_dump(w))
             return 0
         # Расход юнитов с прошлого окна (свой запуск этого окна уйдёт в следующее).
-        ld = _load_json(_p(RUN_DIR, "load.json"), {})
+        ld = _state("load.bin")
         if ld:
             w["ld"] = ld
         os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
         fd = os.open(_p(DATA_DIR, "windows.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(_dump(w) + "\n")
-        _atomic_write(_p(RUN_DIR, "load.json"), "{}")
+        _state_save("load.bin", {})
         _atomic_write(_p(RUN_DIR, "ref.json"), _dump({
             "t": now, "snmp": cur_snmp, "logs": {"fb": fb_pos, "fr": fr_pos}}))
         _atomic_write(_p(DATA_DIR, "facts.json"), _dump(facts))
@@ -693,6 +744,7 @@ def _line_t(line):
 
 def _iter_windows(since=0):
     """Окна с t >= since по одному: файл за месяц (~3.5 МБ) в память целиком не берётся."""
+    import json
     try:
         with open(_p(DATA_DIR, "windows.jsonl"), encoding="utf-8") as f:
             for line in f:
@@ -717,6 +769,7 @@ def load_windows(since=0):
 
 
 def _last_window():
+    import json
     p = _p(DATA_DIR, "windows.jsonl")
     try:
         size = os.path.getsize(p)
@@ -759,6 +812,7 @@ def _rollup(now, prev_t):
     """Сутки сменились — итоги завершённых суток в days.jsonl, окна старше KEEP_DAYS и итоги
     старше года прочь. Раз в сутки и потоком: юнит окна держит в памяти итоги, а не окна —
     иначе через месяц пик памяти рос бы до ~60 МБ из 96."""
+    import json
     today = _day(now)
     if prev_t is None or _day(prev_t) >= today:
         return
@@ -977,7 +1031,7 @@ def cmd_load(args):
     tot = {k: [0, 0, None] for k in UNITS}
     srcs = [w["ld"] for w in load_windows(now - 86400) if isinstance(w.get("ld"), dict)]
     hours = round(len(srcs) * WINDOW / 3600, 2)
-    srcs.append(_load_json(_p(RUN_DIR, "load.json"), {}))
+    srcs.append(_state("load.bin"))
     for ld in srcs:
         for k in UNITS:
             v = ld.get(k)

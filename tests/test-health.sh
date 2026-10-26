@@ -38,7 +38,7 @@ want("backoff без неподтверждённых — норма", h.classif
 want("tcp_info короче 136 б — без класса", h.classify({"cookie": "1", "peer": "x"}), None)
 
 # ── Опрос и окно: зависшее считается один раз за жизнь, даже если живёт три окна
-os.makedirs(h.DATA_DIR); json.dump({"port": 443}, open(os.path.join(h.DATA_DIR, "params.json"), "w"))
+os.makedirs(h.DATA_DIR); open(os.path.join(h.DATA_DIR, "params.json"), "w").write('{"port":443}\n')   # как пишет xm
 cur = []
 h.connections = lambda port, loopback=False: list(cur)
 stalled = [sock("a%d" % i, "192.0.2.%d" % i, 300, 15360, 10, 4) for i in range(3)]
@@ -55,7 +55,7 @@ cur = []
 h.cmd_sample({})
 w3 = h._close_conns(False)
 want("окно 3: закрытые забыты", (w3["f16"], w3["norm"], w3["cmax"]), (0, 0, 0))
-want("после окна 3 состояние пусто", json.load(open(os.path.join(h.RUN_DIR, "conns.json")))["c"], {})
+want("после окна 3 состояние пусто", h._state("conns.bin")["c"], {})
 # Закрылось между опросами одного окна — всё равно в этом окне
 cur = [sock("z1", "192.0.2.50", 300, 1, 5, 3)]
 h.cmd_sample({}); cur = []; h.cmd_sample({})
@@ -72,7 +72,7 @@ h.cmd_sample({})
 want("долгие соединения без новых: шквала нет", (h._close_conns(False)["pnew"]), 0)
 cur = []
 h.cmd_sample({}); h._close_conns(False)
-os.unlink(os.path.join(h.RUN_DIR, "conns.json"))       # перезагрузка: /run пуст
+os.unlink(os.path.join(h.RUN_DIR, "conns.bin"))        # перезагрузка: /run пуст
 cur = [sock("r%d" % i, "198.51.100.30", 300, 90000) for i in range(40)]
 h.cmd_sample({})
 want("после перезагрузки первый опрос — точка отсчёта", (h._close_conns(False)["pnew"]), 0)
@@ -152,11 +152,21 @@ with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
     h.cmd_window({"self": '{"r":"ok","ms":300}'})
     h.cmd_window({"self": '{"r":"ok","ms":300}'})
 ws = h.load_windows()
-want("второй run в том же слоте не пишет дубль", (len(ws), "уже записано" in err.getvalue()), (1, True))
+# Из юнита stderr — строка журнала с уровнем warning: второй run в том же слоте молчит, в терминале — говорит
+want("второй run в том же слоте: дубля нет, из юнита — ни строки", (len(ws), err.getvalue()), (1, ""))
 want("окно: post и вердикт", (ws[0]["c"]["post"], ws[0]["vd"]), (1, "nodata"))
 want("окно из юнита не печатается (stdout юнита — журнал)", buf.getvalue(), "")
 want("расход опросов — в окне", ws[0].get("ld"), {"s": [2, 50, 12288]})
-want("свои запуски окна — в следующее", json.load(open(os.path.join(h.RUN_DIR, "load.json"))), {"w": [2, 800, 40960]})
+want("свои запуски окна — в следующее", h._state("load.bin"), {"w": [2, 800, 40960]})
+class Tty(io.StringIO):
+    def isatty(self):
+        return True
+err = Tty()
+open(h.PROC_CGROUP, "w").write("0::/user.slice/user-1000.slice/session-1.scope\n")
+with contextlib.redirect_stderr(err):
+    h.cmd_window({"self": '{"r":"ok","ms":300}'})
+want("в терминале второй run в слоте объясняет, куда ушли данные", "уже записано" in err.getvalue(), True)
+unit("xm-health.service", 400000, 40 << 20)
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     h.cmd_load({})
@@ -252,6 +262,25 @@ want("клиент работал до самопроверки — его тр�
      ([100, 200], True, 1000))
 want("счётчики до самопроверки не сняты — обычный замер", stats_run("--hold", "pc", "--before", ""), ([5000, 9000], True, 14700))
 
+# ── Замер xm stats делает окно в своём процессе (без отдельного python): с --hold и до «сейчас»
+# окна — его трафик в этом окне; сбой замера окно не роняет
+h.STATS_SAMPLES = os.path.join(stats.DATA_DIR, "samples.jsonl")
+for f in (h.STATS_SAMPLES, os.path.join(h.DATA_DIR, "windows.jsonl")):
+    if os.path.exists(f):
+        os.unlink(f)
+h._atomic_write(os.path.join(h.RUN_DIR, "ref.json"), h._dump({"t": int(time.time()) - 300}))
+st_args = {"self": '{"r":"ok"}', "api": "127.0.0.1:1", "port": "443", "xray": fake, "config": cfg,
+           "hold": "pc", "before": "100 200"}
+with contextlib.redirect_stdout(io.StringIO()):
+    h.cmd_window(dict(st_args))
+want("замер stats — в окне, трафик самопроверки снят", [w.get("tr") for w in h.load_windows()], [1000])
+real_collect, stats.collect = stats.collect, lambda *a, **k: 1 / 0
+os.unlink(os.path.join(h.DATA_DIR, "windows.jsonl"))
+with contextlib.redirect_stdout(io.StringIO()):
+    h.cmd_window(dict(st_args))
+stats.collect = real_collect
+want("сбой замера stats окно не роняет", len(h.load_windows()), 1)
+
 print("\n".join("FAIL " + f for f in fails) if fails else "ok")
 PY
 )
@@ -262,9 +291,10 @@ PY
 CONFIG="$T/config.json"
 echo '{"inbounds":[{"port":8443,"streamSettings":{"realitySettings":{"serverNames":["example.com"]}}}]}' >"$CONFIG"
 FRONT_NGX="$T/no-front"
-eval "$(sed -n '/^_get_nginx_sni()/,/^}/p; /^_front_enabled()/p; /^_front_public_port()/,/^}/p; /^HEALTH_URL=/p
-  /^_health_pubkey()/,/^}/p; /^_health_selfcheck()/,/^[)}]$/p; /^_health_run()/,/^}/p' "$root/xm.sh")"
-for f in _health_selfcheck _health_pubkey _health_run; do
+eval "$(sed -n '/^_get_nginx_sni()/,/^}/p; /^_front_enabled()/p; /^_front_port()/,/^}/p; /^_front_public_port()/,/^}/p
+  /^HEALTH_URL=/p; /^_health_pubkey()/,/^}/p; /^_health_selfcheck()/,/^[)}]$/p; /^_health_params()/,/^}/p
+  /^_health_run()/,/^}/p' "$root/xm.sh")"
+for f in _health_selfcheck _health_pubkey _health_params _health_run _front_port; do
   declare -F $f >/dev/null || { echo "FAIL: в xm.sh нет $f"; exit 1; }
 done
 HEALTH_LOADAVG="$T/loadavg" HEALTH_MEMINFO="$T/meminfo" HEALTH_RUN="$T/hrun"
@@ -284,10 +314,11 @@ _tunnel_code() { [[ $CODE == term ]] && { kill -TERM "$(<"$T/tun-pid")"; echo 00
 curl() { echo "$DIRECT"; }
 sleep() { :; }
 fails=0
+SC=(8443 8443 example.com "")   # публичный порт, порт inbound, serverNames[0], privateKey — из _health_run
 case_() {  # имя ожидаемый-JSON-без-ms нагрузка памятьМБ
   local name=$1 exp=$2 got
   echo "$3 0.5 0.4 1/100 1" >"$T/loadavg"; echo "MemAvailable: $(( $4 * 1024 )) kB" >"$T/meminfo"
-  got=$(_health_selfcheck "${BAD:-}" | sed -E 's/,"ms":[0-9]+//')
+  got=$(_health_selfcheck "${BAD:-}" "${SC[@]}" | sed -E 's/,"ms":[0-9]+//')
   [[ $got == "$exp" ]] || { echo "FAIL самопроверка, $name: ожидалось $exp, получено $got"; fails=$((fails + 1)); }
 }
 XRAY=up LISTEN=yes DNS=ok TUN=up CODE=204 DIRECT=204
@@ -301,14 +332,14 @@ DNS=cold case_ "холодный резолвинг — не сбой" '{"r":"ok
 TUN=down case_ "клиент не поднялся"  '{"r":"skip","why":"client"}' 0.2 900
 CODE=000 case_ "тоннель не прошёл, сервер в сеть ходит" '{"r":"fail","at":"handshake"}' 0.2 900
 CODE=000 DIRECT=000 case_ "сервер не ходит в сеть" '{"r":"fail","at":"egress"}' 0.2 900
-_health_selfcheck >/dev/null
+_health_selfcheck "" "${SC[@]}" >/dev/null
 [[ $(<"$T/tun-args") == "xhttp 8443 " ]] || { echo "FAIL самопроверка идёт не на публичный порт: $(<"$T/tun-args")"; fails=$((fails + 1)); }
 BAD=bad CODE=000 case_ "неверный ключ" '{"r":"fail","at":"handshake"}' 0.2 900
-_health_selfcheck bad >/dev/null
+_health_selfcheck bad "${SC[@]}" >/dev/null
 [[ $(<"$T/tun-args") =~ ^xhttp\ 8443\ [A-Za-z0-9_-]{43}$ ]] || { echo "FAIL неверный ключ не подставлен: $(<"$T/tun-args")"; fails=$((fails + 1)); }
 # Юнит убит (TimeoutStartSec) посреди запроса — клиент и его конфиг всё равно убраны
 rm -f "$T/tun-down"
-got=$(CODE=term _health_selfcheck)
+got=$(CODE=term _health_selfcheck "" "${SC[@]}")
 [[ -z $got && $(<"$T/tun-down") == down ]] || { echo "FAIL после TERM клиент не убран: «$got», down=$(<"$T/tun-down")"; fails=$((fails + 1)); }
 
 # Ключ: вывод из privateKey — один раз на ключ, дальше кеш в RAM; сменился ключ — вывод заново
@@ -319,19 +350,39 @@ sed -i 's/kAAA/kBBB/' "$T/kcfg.json"; k3=$(CONFIG="$T/kcfg.json" _health_pubkey)
 [[ $k1 == "$k2" && $k3 == PUB-kBBB* && $(wc -l <"$T/derive") -eq 2 ]] \
   || { echo "FAIL кеш ключа: $k1 / $k2 / $k3, выводов $(wc -l <"$T/derive")"; fails=$((fails + 1)); }
 
-# Окно: счётчики первого клиента снимаются ДО самопроверки и уходят в замер после неё
+# Окно читает config.json одним jq: окон 288 в сутки, а каждый запуск jq — заметная доля CPU окна
+# (прежде — отдельный jq на порт, API, email, ключ и SNI, по нескольку раз). Самопроверка — настоящая,
+# тоннель и замер — заглушки.
+echo '{"inbounds":[{"port":8443,"settings":{"clients":[{"id":"x","email":"pc"}]},"streamSettings":{"realitySettings":{"privateKey":"kCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC","serverNames":["example.com"]}}}],"api":{"listen":"127.0.0.1:10085"}}' >"$CONFIG"
+HEALTH_DIR="$T/hdir"
+_get_pubkey() { echo "PUB-0123456789abcdef0123456789abcdef"; }
+_stats_peek() { echo "100 200"; }
+_health_py() { :; }
+jq() { echo x >>"$T/jq-n"; command jq "$@"; }
+echo "0.2 0.5 0.4 1/100 1" >"$T/loadavg"; echo "MemAvailable: 921600 kB" >"$T/meminfo"
+rm -f "$T/jq-n"; _health_run >/dev/null
+[[ $(wc -l <"$T/jq-n") -eq 1 && $(<"$T/tun-args") == "xhttp 8443 PUB-0123456789abcdef0123456789abcdef" ]] \
+  || { echo "FAIL окно: jq $(wc -l <"$T/jq-n") раз (нужен 1), тоннель: $(<"$T/tun-args")"; fails=$((fails + 1)); }
+unset -f jq
+
+# Окно: счётчики первого клиента снимаются ДО самопроверки, замер с ними делает окно в своём процессе
+# (отдельного запуска stats.py нет); самопроверка идёт на публичный порт — порт фронта, когда он включён
 _health_params() { :; }
-_stats_api() { echo 127.0.0.1:10085; }
 _stats_peek() { echo "peek $*" >>"$T/calls"; echo "100 200"; }
-_health_selfcheck() { echo self >>"$T/calls"; echo '{"r":"ok"}'; }
+_health_selfcheck() { echo "self $*" >>"$T/calls"; echo '{"r":"ok"}'; }
 _stats_collect() { echo "collect $*" >>"$T/calls"; }
 _health_py() { echo "py $*" >>"$T/calls"; }
-echo '{"inbounds":[{"port":8443,"settings":{"clients":[{"id":"x","email":"pc"}]}}]}' >"$CONFIG"
+SELF='self  8443 8443 example.com kCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'
 rm -f "$T/calls"; _health_run
-exp=$'peek 127.0.0.1:10085 pc\nself\ncollect --hold pc --before 100 200\npy window --self {"r":"ok"}'
+exp="peek 127.0.0.1:10085 pc"$'\n'"$SELF"$'\npy window --self {"r":"ok"} --api 127.0.0.1:10085 --port 8443 --hold pc --before 100 200'
 [[ $(<"$T/calls") == "$exp" ]] || { echo "FAIL порядок окна: $(paste -sd'|' "$T/calls")"; fails=$((fails + 1)); }
 rm -f "$T/calls"; _health_run dry
-[[ $(<"$T/calls") == $'self\npy window --self {"r":"ok"} --dry' ]] || { echo "FAIL окно --dry трогает замер: $(paste -sd'|' "$T/calls")"; fails=$((fails + 1)); }
+[[ $(<"$T/calls") == "$SELF"$'\npy window --self {"r":"ok"} --dry' ]] || { echo "FAIL окно --dry трогает замер: $(paste -sd'|' "$T/calls")"; fails=$((fails + 1)); }
+FRONT_NGX="$T/front.conf" FRONT_STATE="$T/front.state"; : >"$FRONT_NGX"; echo "PORT=443" >"$FRONT_STATE"
+rm -f "$T/calls"; _health_run dry
+[[ $(head -n 1 "$T/calls") == "self  443 8443 example.com kCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC" ]] \
+  || { echo "FAIL за фронтом самопроверка не на его порт: $(head -n 1 "$T/calls")"; fails=$((fails + 1)); }
+FRONT_NGX="$T/no-front"
 (( fails == 0 )) || exit 1
 
 # health.py — модулем: байткод кешируется, импорт не берёт health.py из текущего каталога
@@ -343,4 +394,12 @@ eval "$(sed -n '/^HEALTH_PY=/p; /^_health_py()/,/^}/p' "$root/xm.sh")"
 got=$(cd "$T/cwd" && XM_HEALTH_DIR="$T/empty" _health_py report --json)
 [[ $got == *'"band"'* && $got != *DECOY* ]] || { echo "FAIL запуск модулем: $got"; exit 1; }
 ls "$T"/ui/__pycache__/health.*.pyc >/dev/null 2>&1 || { echo "FAIL байткод health не закеширован"; exit 1; }
+
+# Опрос — как его зовёт юнит — не тянет json, re и обёртку socket.py: их импорт был больше половины
+# CPU каждого из 1440 опросов в сутки
+mkdir -p "$T/pd"; echo '{"port":1}' >"$T/pd/params.json"
+got=$(cd "$T/cwd" && XM_HEALTH_DIR="$T/pd" XM_HEALTH_RUN="$T/pr" python3 -I -S -c "import sys
+sys.path[:0] = ['$UI_DIR']; import health; health.main(['health.py', 'sample'])
+print(' '.join(m for m in ('json', 're', 'enum', 'socket', 'selectors') if m in sys.modules))" 2>&1)
+[[ -z $got && -s "$T/pr/conns.bin" ]] || { echo "FAIL опрос тянет модули или не записал состояние: «$got»"; exit 1; }
 echo "health: ok"
