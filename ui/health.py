@@ -159,18 +159,24 @@ NETLINK_INET_DIAG = 4
 SOCK_DIAG_BY_FAMILY = 20
 NLMSG_ERROR, NLMSG_DONE = 2, 3
 INET_DIAG_INFO = 2
+INET_DIAG_REQ_BYTECODE, INET_DIAG_BC_S_COND = 1, 7
 TCP_ESTABLISHED, TCP_FIN_WAIT1 = 1, 4
 # struct tcp_info (linux/tcp.h): u8 backoff @4, u32 unacked @24, u32 last_data_recv @52,
 # u64 bytes_acked @120, u64 bytes_received @128 (ядро 4.1+). Короче — поля нет, класс не ставится.
 TI_MIN = 136
 
 
-def _diag_dump(family):
+def _diag_dump(family, port):
     s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_INET_DIAG)
     try:
         states = (1 << TCP_ESTABLISHED) | (1 << TCP_FIN_WAIT1)
         req = struct.pack("=BBBBI", family, socket.IPPROTO_TCP, 1 << (INET_DIAG_INFO - 1), 0, states)
         req += b"\0" * 48
+        # Фильтр в ядре — локальный порт = port (тот же байткод S_COND, что у `ss '( sport = :N )'`):
+        # tcp_info чужих сокетов (исходящие Xray, nginx — их тысячи) ядро не собирает, а python не
+        # разбирает. Без него опрос стоил вдвое дороже своей работы.
+        bc = struct.pack("=BBHBBxxi", INET_DIAG_BC_S_COND, 12, 16, socket.AF_UNSPEC, 0, port)
+        req += struct.pack("=HH", 4 + len(bc), INET_DIAG_REQ_BYTECODE) + bc
         hdr = struct.pack("=IHHII", 16 + len(req), SOCK_DIAG_BY_FAMILY, 0x301, 1, 0)
         s.sendto(hdr + req, (0, 0))
         while True:
@@ -228,7 +234,7 @@ def connections(port, loopback=False):
     """Соединения ESTABLISHED и FIN-WAIT-1 с локальным портом port. Петля (самопроверка) — мимо."""
     out = []
     for fam in (socket.AF_INET, socket.AF_INET6):
-        for msg in _diag_dump(fam):
+        for msg in _diag_dump(fam, port):
             r = _parse_diag(msg)
             if r and r["sport"] == port and (loopback or not _is_loopback(r["peer"])):
                 out.append(r)

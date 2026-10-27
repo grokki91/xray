@@ -37,6 +37,20 @@ want("один RTO — ещё не зависание", h.classify(sock("1", "x"
 want("backoff без неподтверждённых — норма", h.classify(sock("1", "x", 300, 15360, unacked=0, backoff=4)), "norm")
 want("tcp_info короче 136 б — без класса", h.classify({"cookie": "1", "peer": "x"}), None)
 
+# ── Фильтр в ядре: дамп netlink отдаёт только сокеты своего порта — чужие (исходящие Xray, nginx;
+# на сервере их тысячи) ядро не собирает, python не разбирает. Настоящие сокеты на петле.
+import socket as so, struct
+lst = [so.socket() for _ in range(2)]
+for x in lst:
+    x.bind(("127.0.0.1", 0)); x.listen(8)
+mine, other = (x.getsockname()[1] for x in lst)
+held = [so.create_connection(("127.0.0.1", p)) for p in (mine, other, other, other)]
+held += [lst[0].accept()[0]] + [lst[1].accept()[0] for _ in range(3)]
+want("дамп netlink — только свой порт", sorted(struct.unpack_from("!H", m, 4)[0] for m in h._diag_dump(so.AF_INET, mine)),
+     [mine])
+for x in held + lst:
+    x.close()
+
 # ── Опрос и окно: зависшее считается один раз за жизнь, даже если живёт три окна
 os.makedirs(h.DATA_DIR); open(os.path.join(h.DATA_DIR, "params.json"), "w").write('{"port":443}\n')   # как пишет xm
 cur = []
@@ -293,11 +307,12 @@ echo '{"inbounds":[{"port":8443,"streamSettings":{"realitySettings":{"serverName
 FRONT_NGX="$T/no-front"
 eval "$(sed -n '/^_get_nginx_sni()/,/^}/p; /^_front_enabled()/p; /^_front_port()/,/^}/p; /^_front_public_port()/,/^}/p
   /^HEALTH_URL=/p; /^_health_pubkey()/,/^}/p; /^_health_selfcheck()/,/^[)}]$/p; /^_health_params()/,/^}/p
-  /^_health_run()/,/^}/p' "$root/xm.sh")"
-for f in _health_selfcheck _health_pubkey _health_params _health_run _front_port; do
+  /^_health_run()/,/^}/p; /^_health_tls()/,/^}/p' "$root/xm.sh")"
+for f in _health_selfcheck _health_pubkey _health_params _health_run _front_port _health_tls; do
   declare -F $f >/dev/null || { echo "FAIL: в xm.sh нет $f"; exit 1; }
 done
-HEALTH_LOADAVG="$T/loadavg" HEALTH_MEMINFO="$T/meminfo" HEALTH_RUN="$T/hrun"
+HEALTH_LOADAVG="$T/loadavg" HEALTH_MEMINFO="$T/meminfo" HEALTH_RUN="$T/hrun" HEALTH_CERTS="$T/certs"
+mkdir -p "$T/certs"; : >"$T/certs/Some_Root.pem"
 systemctl() { [[ $XRAY == up ]]; }
 ss() { [[ $LISTEN == yes ]] && echo "LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:*"; }
 timeout() { shift; "$@"; }
@@ -310,8 +325,8 @@ getent() {  # cold — первая попытка не успела, втора
 # Тело самопроверки — подоболочка: что она вызвала, видно только через файлы
 _tunnel_up() { echo "$*" >"$T/tun-args"; echo "$BASHPID" >"$T/tun-pid"; [[ $TUN == up ]]; }
 _tunnel_down() { echo down >>"$T/tun-down"; }
-_tunnel_code() { [[ $CODE == term ]] && { kill -TERM "$(<"$T/tun-pid")"; echo 000; return; }; echo "$CODE"; }
-curl() { echo "$DIRECT"; }
+_tunnel_code() { echo "${*:3}" >"$T/code-args"; [[ $CODE == term ]] && { kill -TERM "$(<"$T/tun-pid")"; echo 000; return; }; echo "$CODE"; }
+curl() { echo "$*" >"$T/curl-args"; echo "$DIRECT"; }
 sleep() { :; }
 fails=0
 SC=(8443 8443 example.com "")   # публичный порт, порт inbound, serverNames[0], privateKey — из _health_run
@@ -334,6 +349,15 @@ CODE=000 case_ "тоннель не прошёл, сервер в сеть хо�
 CODE=000 DIRECT=000 case_ "сервер не ходит в сеть" '{"r":"fail","at":"egress"}' 0.2 900
 _health_selfcheck "" "${SC[@]}" >/dev/null
 [[ $(<"$T/tun-args") == "xhttp 8443 " ]] || { echo "FAIL самопроверка идёт не на публичный порт: $(<"$T/tun-args")"; fails=$((fails + 1)); }
+# Сертификат google проверяется, но корень — по хешу в каталоге сертификатов, без загрузки всего
+# набора CA (с OpenSSL 3 это ~⅔ CPU curl): и через тоннель, и прямым запросом
+[[ $(<"$T/code-args") == "--capath $T/certs --cacert $T/certs/Some_Root.pem" ]] \
+  || { echo "FAIL curl через тоннель без каталога корней: $(<"$T/code-args")"; fails=$((fails + 1)); }
+CODE=000 DIRECT=000 case_ "прямой запрос — с тем же каталогом" '{"r":"fail","at":"egress"}' 0.2 900
+[[ $(<"$T/curl-args") == *"--capath $T/certs --cacert $T/certs/Some_Root.pem"* && $(<"$T/curl-args") != *" -k"* ]] \
+  || { echo "FAIL прямой curl: $(<"$T/curl-args")"; fails=$((fails + 1)); }
+HEALTH_CERTS="$T/no-certs" case_ "каталога корней нет — curl как обычно" '{"r":"ok"}' 0.2 900
+[[ -z $(<"$T/code-args") ]] || { echo "FAIL без каталога корней ключи всё равно переданы: $(<"$T/code-args")"; fails=$((fails + 1)); }
 BAD=bad CODE=000 case_ "неверный ключ" '{"r":"fail","at":"handshake"}' 0.2 900
 _health_selfcheck bad "${SC[@]}" >/dev/null
 [[ $(<"$T/tun-args") =~ ^xhttp\ 8443\ [A-Za-z0-9_-]{43}$ ]] || { echo "FAIL неверный ключ не подставлен: $(<"$T/tun-args")"; fails=$((fails + 1)); }

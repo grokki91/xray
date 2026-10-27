@@ -2,7 +2,8 @@
 # Приёмка xm health (этап 1) на живом VPS: факты для сверки, классы соединений эмуляцией iptables
 # connbytes на петле отдельного сетевого пространства (сверка netlink с ss), самопроверка с настоящим
 # и с неверным ключом, повторный on без дублей, off со стиранием, нагрузка юнитов по cgroup, тишина
-# журнала, адресов на диске нет; справочно — петля хоста и из чего складывается CPU окна.
+# журнала, адресов на диске нет, curl самопроверки проверяет сертификат строго; справочно — петля
+# хоста и из чего складывается CPU окна.
 # Хост не трогается: правила эмуляции и nf_conntrack_acct — внутри своего пространства; прежнее
 # состояние монитора (с данными) возвращается. Запуск: sudo bash tests/vps/health.sh
 source "${BASH_SOURCE[0]%/*}/../lib.sh"
@@ -172,6 +173,29 @@ if $STATS_ON; then
   fact "трафик самопроверки" "$(tail -n1 /var/lib/xm/stats/samples.jsonl | jq -r '"\(.up + .down) байт (порог трафика клиентов 65536)"')"
 fi
 
+# ─── curl самопроверки проверяет сертификат строго: корень — по хешу в системном каталоге (без
+# загрузки всего набора CA), чужой самоподписанный — отказ, настоящий generate_204 — 204
+eval "$(sed -n '/^HEALTH_CERTS=/p; /^_health_tls()/,/^}/p' /usr/local/bin/xm)"; _health_tls
+vexpect "curl самопроверки: корни — по системному каталогу" "--capath $HEALTH_CERTS" printf "%s %s" "${TLS[@]:0:2}"
+TP=""; for p in $(seq 39200 39299); do ss -tlnH "( sport = :$p )" | grep -q . || { TP=$p; break; }; done
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout "$VTMP/tk.pem" -out "$VTMP/tc.pem" \
+  -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost 2>/dev/null
+python3 - "$VTMP" "$TP" >/dev/null 2>&1 <<'EOF2' & TSRV=$!
+import http.server, ssl, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(204); self.end_headers()
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", int(sys.argv[2])), H)
+c = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); c.load_cert_chain(sys.argv[1] + "/tc.pem", sys.argv[1] + "/tk.pem")
+s.socket = c.wrap_socket(s.socket, server_side=True); s.timeout = 30; s.handle_request(); s.handle_request()
+EOF2
+sleep 1
+vexpect "curl самопроверки: самоподписанный — отказ" "000" \
+  bash -c 'curl -s --noproxy "*" -o /dev/null -w "%{http_code}" --max-time 5 "${@:2}" "https://localhost:$1/"; true' _ "$TP" "${TLS[@]}"
+vexpect "curl самопроверки: generate_204 — с проверкой" "204" \
+  bash -c 'curl -s --noproxy "*" -o /dev/null -w "%{http_code}" --max-time 5 "$@" https://www.google.com/generate_204; true' _ "${TLS[@]}"
+kill "$TSRV" 2>/dev/null
+
 # ─── on / повторный on / окно / off
 xm health off >/dev/null 2>&1
 T0=$(date '+%F %T')
@@ -215,6 +239,7 @@ fact "CPU частей окна, мс" "$(printf '%s ' "xm=$(cpu xm health __non
   "python=$(cpu python3 -I -S -c pass)" "xray-version=$(cpu xray version)" \
   ${API:+"xray-api=$(cpu xray api statsquery --server="$API" -pattern 'user>>>' -t 3)"} \
   "curl-204=$(cpu curl -s -o /dev/null --max-time 5 https://www.google.com/generate_204)" \
+  "curl-204-каталог=$(cpu curl -s -o /dev/null --max-time 5 "${TLS[@]}" https://www.google.com/generate_204)" \
   "journalctl=$(cpu journalctl -q -u xray-watchdog.service --since -5min -o cat --no-pager)" \
   "systemctl-show=$(cpu systemctl show -p InvocationID --value xray nginx)" \
   "окно-py=$(cpu "${HPY[@]}" window --self '{"r":"ok"}' --dry --config "$CFG" --xm /usr/local/bin/xm --xray "$(command -v xray)")" \

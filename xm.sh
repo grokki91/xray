@@ -553,12 +553,13 @@ _tunnel_down() {
   TUN_PID=""; TUN_CFG=""; TUN_LOG=""
 }
 
-# HTTP-код запроса через поднятый тоннель (пустой URL → проверка выхода в сеть); $2 — таймаут, с.
+# HTTP-код запроса через поднятый тоннель (пустой URL → проверка выхода в сеть); $2 — таймаут, с;
+# дальше — ключи curl (xm health: где искать корневые сертификаты).
 # --noproxy '': NO_PROXY из окружения curl применяет и к явному -x — имя из
 # этого списка ушло бы мимо тоннеля и вернуло 200 без единого хендшейка.
 _tunnel_code() {
   local url="${1:-https://api.ipify.org}" code
-  code=$(curl -s --noproxy '' -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time "${2:-15}" -o /dev/null \
+  code=$(curl -s --noproxy '' -x "socks5h://127.0.0.1:${TUN_PORT}" --max-time "${2:-15}" "${@:3}" -o /dev/null \
          -w '%{http_code}' "$url" 2>/dev/null) || true
   echo "${code:-000}"
 }
@@ -2476,8 +2477,23 @@ HEALTH_RUN="/run/xm-health"
 HEALTH_URL="https://www.google.com/generate_204"
 HEALTH_UNIT_DIR="/etc/systemd/system"
 HEALTH_LOADAVG="/proc/loadavg"; HEALTH_MEMINFO="/proc/meminfo"
+HEALTH_CERTS="/etc/ssl/certs"
 
 _health_enabled() { [[ -f "$HEALTH_UNIT_DIR/xm-health.timer" ]]; }
+
+# Ключи curl самопроверки → массив TLS. Сертификат проверяется как обычно, но корень ищется по
+# хешу в HEALTH_CERTS (--capath): то же системное доверие, что в наборе ca-certificates.crt (оба
+# строит update-ca-certificates), а набор целиком curl не грузит — с OpenSSL 3 его разбор был
+# ~⅔ CPU curl, а окно идёт 288 раз в сутки. --cacert — один системный корень из того же каталога:
+# без него curl взял бы набор по умолчанию. Каталога нет — ключей нет, curl как обычно.
+_health_tls() {
+  local seed
+  TLS=()
+  for seed in "$HEALTH_CERTS"/*.pem; do
+    [[ -f "$seed" ]] && TLS=(--capath "$HEALTH_CERTS" --cacert "$seed")
+    return 0
+  done
+}
 
 # Публичный ключ самопроверки. Вывод из privateKey — запуск python с cryptography (~70 мс CPU на
 # каждое окно), поэтому кеш в RAM, привязанный к хешу privateKey: сменился ключ — сменился кеш.
@@ -2486,7 +2502,7 @@ _health_pubkey() {
   local priv="${1-}" h c="" pub=""
   (( $# )) || priv=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey // ""' "$CONFIG" 2>/dev/null)
   [[ -n "$priv" ]] || return 0
-  h=$(printf '%s' "$priv" | sha256sum | cut -c1-16)
+  read -r h _ < <(printf '%s' "$priv" | sha256sum); h=${h:0:16}
   { read -r c pub < "$HEALTH_RUN/pubkey"; } 2>/dev/null
   if [[ "$c" != "$h" || ${#pub} -lt 30 ]]; then
     pub=$(_get_pubkey 0 "PUBLIC KEY")
@@ -2504,16 +2520,18 @@ _health_pubkey() {
 # TimeoutStartSec=60, иначе systemd убил бы юнит и сбой сервера записался бы «нет данных».
 # Тело — подоболочка: ловушка EXIT уберёт клиент и его конфиг (в нём UUID) и при убийстве юнита.
 _health_selfcheck() (
-  local bad="${1:-}" port="${2:-}" xport="${3:-}" csni="${4:-}" priv="${5:-}" la mem p sni pub="" t0 code direct
+  local bad="${1:-}" port="${2:-}" xport="${3:-}" csni="${4:-}" priv="${5:-}" la mem p ports sni pub="" t0 code direct TLS
   trap '_tunnel_down' EXIT
   trap 'exit 1' TERM INT
+  # Окно идёт 288 раз в сутки: внешних процессов — сколько нужно, не больше (каждый — мс CPU).
   read -r la _ < "$HEALTH_LOADAVG"
-  mem=$(awk '$1 == "MemAvailable:" {print int($2 / 1024)}' "$HEALTH_MEMINFO")
-  awk -v l="$la" 'BEGIN {exit !(l > 1.5)}' && { echo '{"r":"skip","why":"load"}'; return; }
+  mem=$(awk -v l="$la" '$1 == "MemAvailable:" {m = int($2 / 1024)} END {print (l > 1.5 ? "load" : m + 0)}' "$HEALTH_MEMINFO")
+  [[ "$mem" == load ]] && { echo '{"r":"skip","why":"load"}'; return; }
   [[ "${mem:-0}" -lt 150 ]] && { echo '{"r":"skip","why":"mem"}'; return; }
   systemctl is-active --quiet xray || { echo '{"r":"fail","at":"listen"}'; return; }
-  for p in $(printf '%s\n' "$port" "$xport" | sort -u); do
-    [[ "$p" =~ ^[0-9]+$ ]] && ss -tlnH "( sport = :$p )" 2>/dev/null | grep -q . \
+  ports=("$port"); [[ "$xport" != "$port" ]] && ports+=("$xport")
+  for p in "${ports[@]}"; do
+    [[ "$p" =~ ^[0-9]+$ && -n "$(ss -tlnH "( sport = :$p )" 2>/dev/null)" ]] \
       || { echo '{"r":"fail","at":"listen"}'; return; }
   done
   sni=$(_get_nginx_sni)
@@ -2525,16 +2543,17 @@ _health_selfcheck() (
   else pub=$(_health_pubkey "$priv"); fi
   # Клиент самопроверки не поднялся (не хватило памяти юниту, нет ключа) — сервер тут ни при чём.
   _tunnel_up xhttp "$port" "$pub" || { _tunnel_down; echo '{"r":"skip","why":"client"}'; return; }
-  t0=$(date +%s%N)
-  code=$(_tunnel_code "$HEALTH_URL" 10)
+  _health_tls
+  t0=${EPOCHREALTIME//[!0-9]/}
+  code=$(_tunnel_code "$HEALTH_URL" 10 "${TLS[@]}")
   # Один повтор: единичная потеря на петле не должна рисовать «сбой сервера» на 5 минут.
-  [[ "$code" == 204 ]] || { sleep 2; t0=$(date +%s%N); code=$(_tunnel_code "$HEALTH_URL" 10); }
+  [[ "$code" == 204 ]] || { sleep 2; t0=${EPOCHREALTIME//[!0-9]/}; code=$(_tunnel_code "$HEALTH_URL" 10 "${TLS[@]}"); }
   _tunnel_down
   if [[ "$code" == 204 ]]; then
-    echo "{\"r\":\"ok\",\"ms\":$(( ($(date +%s%N) - t0) / 1000000 ))}"; return
+    echo "{\"r\":\"ok\",\"ms\":$(( (${EPOCHREALTIME//[!0-9]/} - t0) / 1000 ))}"; return
   fi
   # Тоннель не прошёл: выход в интернет или рукопожатие — разводит прямой запрос с сервера.
-  direct=$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null) || true
+  direct=$(curl -s --noproxy '*' "${TLS[@]}" -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null) || true
   [[ "$direct" == 204 ]] && echo '{"r":"fail","at":"handshake"}' || echo '{"r":"fail","at":"egress"}'
 )
 
@@ -2605,6 +2624,14 @@ SyslogLevel=warning'
   printf '%s\n' "[Unit]" "Description=xm health: window every 5 minutes" "" "[Timer]" \
     "OnCalendar=*:0/5:30" "AccuracySec=5s" "" "[Install]" "WantedBy=timers.target" > "$1/xm-health.timer"
 }
+
+# Юнит окна (xm-health.service: «xm health run» без ключей, 288 раз в сутки) — до case ниже: bash
+# разбирает case целиком, прежде чем выполнить, а это половина CPU разбора xm. Проверки — те же,
+# что у health run в case; не прошли — туда же, за сообщением.
+if [[ $# -eq 2 && "$1" == health && "$2" == run && $EUID -eq 0 && -f "$UI_DIR/health.py" ]] \
+   && command -v python3 >/dev/null && _health_enabled; then
+  _health_run; exit $?
+fi
 
 case "$1" in
 
