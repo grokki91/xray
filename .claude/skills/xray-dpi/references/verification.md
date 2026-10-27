@@ -48,6 +48,7 @@ sudo xm tune --check
 sudo xm front status
 sudo xm neighbors       # что ещё живёт на сервере
 sudo xm stats status    # статистика для панели: API, таймер, последний замер
+sudo xm health status   # журнал здоровья: таймеры, последнее окно, нагрузка за сутки
 ```
 
 `xm journal` в этот пакет входит всегда, не только «по релевантности задаче»:
@@ -240,3 +241,10 @@ sudo systemd-run --unit=xm-probe --collect --property=RuntimeMaxSec=21600 \
   панели виден трафик клиента. `sudo xm stats off` возвращает конфиг (`jq '{stats,api}'
   /usr/local/etc/xray/config.json` — оба `null`) и стирает `/var/lib/xm/stats`;
 - Xray при `stats on` перезапускается: убедиться, что клиент на телефоне переподключился сам.
+- `xm health` — `tests/vps/health.sh`: классы соединений эмулируются iptables connbytes на петле
+  своего сетевого пространства (`ip netns`: чужие правила хоста эмуляцию не искажают, хост не
+  трогается), дроп — на входе (`INPUT -i lo`), иначе стек видит ошибку отправки, а не потерю;
+  поля netlink сверяются с `ss -ti` (нет поля — 0). curl самопроверки проверяет сертификат
+  строго (чужой самоподписанный — отказ). Петля хоста и CPU частей окна — справочные строки. Нагрузка — по cgroup юнитов (каждый запуск пишет свой `cpu.stat` и `memory.peak`,
+  окно хранит), за сутки — `sudo xm health status` через сутки после включения; строки
+  «Consumed» journald для коротких запусков не годятся (lessons.md).
