@@ -409,7 +409,7 @@ _switch_sni() {
       then .inbounds[1].streamSettings.realitySettings.serverNames = [$s] else . end
   ' "$XRAY_CONFIG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-  chmod 640 "$tmp"; chown root:nogroup "$tmp"; mv "$tmp" "$XRAY_CONFIG"
+  chmod 640 "$tmp"; chown "root:$XRAY_GROUP" "$tmp"; mv "$tmp" "$XRAY_CONFIG"
 
   if [[ -f /etc/nginx/reality-fallback.conf.tmpl ]]; then
     sed "s/__DEST_SNI__/${new}/g" /etc/nginx/reality-fallback.conf.tmpl \
@@ -749,8 +749,10 @@ fi
 # 8. ЛОГИ + LOGROTATE
 # =============================================================================
 # install, а не mkdir+chown: mkdir -p на существующем каталоге права не меняет,
-# и Xray от nobody падает с exit 23, который юнит запрещает рестартовать.
+# и Xray от пользователя сервиса падает с exit 23, который юнит запрещает рестартовать.
 # `xray -test` этого не ловит — ошибка существует только в рантайме.
+# Пользователя задаёт юнит install-release.sh: сейчас xray, раньше nobody.
+# По его группе — и config.json (640 root:<группа>), иначе Xray его не прочтёт.
 XRAY_USER=$(systemctl show -p User --value xray 2>/dev/null || true)
 XRAY_USER=${XRAY_USER:-nobody}
 XRAY_GROUP=$(id -gn "$XRAY_USER" 2>/dev/null || echo nogroup)
@@ -1197,12 +1199,12 @@ jq -n \
     }
   }' > "$XRAY_CONFIG"
 
-# В файле приватный ключ REALITY: 640 root:nogroup — пишет root, читает nobody
-# (от него работает Xray), остальные не видят. chmod до chown, чтобы между ними
+# В файле приватный ключ REALITY: 640 root:<группа Xray> — пишет root, читает
+# пользователь сервиса, остальные не видят. chmod до chown, чтобы между ними
 # не было окна с неверными правами.
 chmod 640 "$XRAY_CONFIG"
-chown root:nogroup "$XRAY_CONFIG"
-success "config.json записан (640 root:nogroup)"
+chown "root:$XRAY_GROUP" "$XRAY_CONFIG"
+success "config.json записан (640 root:$XRAY_GROUP)"
 
 # =============================================================================
 # 11b. DNS: DoH на сервере + перехват :53 из тоннеля
@@ -1238,7 +1240,7 @@ else
       | (.outbounds[] | select(.protocol == "freedom")).settings.domainStrategy = $ds
     ' "$XRAY_CONFIG" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     jq empty "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
-    chmod 640 "$tmp"; chown root:nogroup "$tmp"; mv "$tmp" "$XRAY_CONFIG"
+    chmod 640 "$tmp"; chown "root:$XRAY_GROUP" "$tmp"; mv "$tmp" "$XRAY_CONFIG"
     xray -test -config "$XRAY_CONFIG" 2>&1 | grep -q "Configuration OK"
   }
 
@@ -1272,7 +1274,7 @@ else
       success "DNS: DoH ($DOH_OK резолвера) + перехват :53"
       warn "nonIPQuery эта сборка не приняла — режим не-A/AAAA остался её дефолтным" ;;
   esac
-  chmod 640 "$XRAY_CONFIG"; chown root:nogroup "$XRAY_CONFIG"
+  chmod 640 "$XRAY_CONFIG"; chown "root:$XRAY_GROUP" "$XRAY_CONFIG"
   rm -f "$CFG_NODNS"
 fi
 
@@ -1370,8 +1372,8 @@ else
   warn "─── journalctl -u xray (последние 30 строк) ───"
   journalctl -u xray -n 30 --no-pager 2>/dev/null | sed 's/^/  /' || true
   echo ""
-  warn "─── запуск от имени nobody (точный текст ошибки) ───"
-  timeout 5 sudo -u nobody "$(command -v xray)" run -config "$XRAY_CONFIG" 2>&1 \
+  warn "─── запуск от имени $XRAY_USER (точный текст ошибки) ───"
+  timeout 5 sudo -u "$XRAY_USER" "$(command -v xray)" run -config "$XRAY_CONFIG" 2>&1 \
     | head -20 | sed 's/^/  /' || true
   echo ""
   warn "─── кто занял порт ${XRAY_PORT} ───"
