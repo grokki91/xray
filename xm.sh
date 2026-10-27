@@ -3265,6 +3265,12 @@ update)
     fi
 
     NEW_VER=$(xray version 2>/dev/null | head -1 || echo "?")
+    # Установщик при «No new version» выходит с 0, ничего не трогая. Перезапуск
+    # тогда только рвёт живые соединения клиентов — не делаем его.
+    if [[ "$NEW_VER" == "$CUR_VER" ]]; then
+      ok "Установлена актуальная версия — бинарник и сервис не тронуты"
+      exit 0
+    fi
     ok "Бинарник обновлён: $NEW_VER"
 
     # Шаг 4: контроль прав config.json (приватный ключ не должен стать всеобщим)
@@ -3288,7 +3294,8 @@ update)
         echo -e "  Рекомендуется: ${BOLD}xm diag${NC} для полной проверки"
       else
         fail "Xray не запустился после обновления!"
-        warn "Смотри: journalctl -u xray -n 50"
+        journalctl -u xray -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+        warn "Полный лог: sudo journalctl -u xray -n 50"
         warn "Конфиг НЕ менялся; бэкап на всякий случай: $UPD_BACKUP"
         exit 1
       fi
@@ -3324,7 +3331,10 @@ update-geo)
       exit 1
     fi
 
-    if bash "$INSTALLER" install-geodata; then
+    # Действие установщика — update-geodata (раньше install-geodata; старое имя
+    # он отвергает «unknown option -- -»). Ставит geoip-full/geosite-expand из
+    # XTLS/Xray-rules-dat под именами geoip.dat/geosite.dat.
+    if bash "$INSTALLER" update-geodata; then
       ok "geodata обновлена"
       # Xray читает geo-файлы при старте — нужен перезапуск
       _apply

@@ -80,6 +80,11 @@ te-st.org.
   pre-release. `install-release.sh` (setup.sh, `xm update`) без `--beta` ставит Latest — то есть
   по умолчанию сервер на v26.3.27, и пороги, умолчания и проверки ниже, помеченные версией
   новее, на нём не действуют. — github.com/XTLS/Xray-core/releases (2026-10-06).
+- **install-release.sh**: действие обновления баз — `update-geodata` (`install-geodata`
+  отвергается «unknown option -- -»); ставит `geoip-full.dat`/`geosite-expand.dat` из
+  XTLS/Xray-rules-dat как geoip.dat/geosite.dat; архив релиза несёт lite-версии. При «No new
+  version» `install` выходит с 0, не трогая бинарник и сервис. — XTLS/Xray-install,
+  install-release.sh в main (2026-10-27).
 
 - **v25.7.26** — пресет chrome шлёт X25519MLKEM768. — стенд владельца, коммит e6955c8.
 - **v25.9.5** — VLESS Encryption (ML-KEM-768) в стабильном релизе. — XTLS PR #5067.
