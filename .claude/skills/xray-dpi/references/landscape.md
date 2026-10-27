@@ -83,7 +83,9 @@ te-st.org.
 - **install-release.sh**: действие обновления баз — `update-geodata` (`install-geodata`
   отвергается «unknown option -- -»); ставит `geoip-full.dat`/`geosite-expand.dat` из
   XTLS/Xray-rules-dat как geoip.dat/geosite.dat; архив релиза несёт lite-версии. При «No new
-  version» `install` выходит с 0, не трогая бинарник и сервис. — XTLS/Xray-install,
+  version» `install` выходит с 0, не трогая бинарник и сервис. Новая версия ставится с юнитом
+  `User=xray`/`Group=xray` (пользователь создаётся через systemd-sysusers, /var/log/xray и
+  geodata — xray:xray); config.json существующей установки он не трогает. — XTLS/Xray-install,
   install-release.sh в main (2026-10-27).
 
 - **v25.7.26** — пресет chrome шлёт X25519MLKEM768. — стенд владельца, коммит e6955c8.
