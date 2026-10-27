@@ -30,6 +30,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import health
 import stats
 
 UI_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -425,8 +426,43 @@ def api_stats(q, body):
     return out
 
 
+HEALTH_TIMERS = ("xm-health-sample.timer", "xm-health.timer")
+
+
+def api_health(q, body):
+    """Отчёт xm health — тот же build_report, что у `sudo xm health`, с текстами для страницы.
+    Включение и выключение — командами на сервере: on пишет юниты systemd, off стирает данные."""
+    enabled = os.path.exists("/etc/systemd/system/xm-health.timer")
+    active = False
+    if enabled:
+        try:
+            r = subprocess.run(["systemctl", "is-active"] + list(HEALTH_TIMERS),
+                               capture_output=True, text=True, timeout=5, env=SAFE_ENV)
+            active = r.stdout.split() == ["active"] * len(HEALTH_TIMERS)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    r = health.build_report()
+    near = [e for x in r["incidents"] for e in x["events"]]
+    # Как в отчёте терминала: события вне инцидентов — отдельным списком, последние 10.
+    r["events"] = [e for e in r["events"] if e not in near][-10:]
+    for e in near + r["events"]:
+        e["text"] = health._event_text(e["e"])
+    w = r["last"]
+    if w:
+        c = w.get("c") or {}
+        r["last"] = {
+            "t": w["t"], "vd": w.get("vd"), "verdict": health.VERDICT_TEXT.get(w.get("vd"), "?"),
+            "self": health.self_text(w.get("self")),
+            "conns": {k: c.get(k, 0) for k in ("cmax", "new", "pmax", "pnew")} if c else None,
+            "classes": [{"text": health.CLASS_TEXT[k], "n": c[k]} for k in health.CLASS_TEXT if c.get(k)],
+            "storm_new": health.STORM_NEW,
+        }
+    r.update({"enabled": enabled, "active": active, "stats": stats_state()["enabled"]})
+    return r
+
+
 GET_ROUTES = {"session": api_session, "overview": api_overview, "clients": api_clients,
-              "job": api_job, "logs": api_logs, "stats": api_stats}
+              "job": api_job, "logs": api_logs, "stats": api_stats, "health": api_health}
 POST_ROUTES = {"ping": api_ping, "stop": api_stop, "clients/add": api_add, "clients/del": api_del,
                "run": api_run, "job/cancel": api_job_cancel}
 
