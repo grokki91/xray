@@ -131,7 +131,7 @@
   }
 
   // ───────── вкладки ─────────
-  const TABS = ['overview', 'clients', 'charts', 'logs'];
+  const TABS = ['overview', 'clients', 'charts', 'health', 'logs'];
   const loaded = {};
   function setTab(id, focus) {
     if (!TABS.includes(id)) id = 'overview';
@@ -147,6 +147,7 @@
     if (id === 'overview') loadOverview();
     else if (id === 'clients') loadClients();
     else if (id === 'charts') loadCharts();
+    else if (id === 'health') loadHealth();
     else loadLogs();
     try { history.replaceState(null, '', '#' + id); } catch (e) { /* рамка может запрещать */ }
   }
@@ -701,6 +702,88 @@
   }));
   let rq = 0;
   new ResizeObserver(() => { cancelAnimationFrame(rq); rq = requestAnimationFrame(renderCharts); }).observe($('main'));
+
+  // ───────── здоровье (xm health) ─────────
+  const CELL_WORD = { ok: 'OK', warn: 'деградация', bad: 'сбой сервера или заморозка', none: 'нет данных' };
+  const dhm = ep => { const d = sd(ep); return pad(d.getUTCDate()) + '.' + pad(d.getUTCMonth() + 1) + ' ' + hm(d); };
+  async function loadHealth() {
+    try {
+      const d = await api('health');
+      $('#hl-err').hidden = true;
+      renderHealth(d);
+    } catch (e) { onFail(e, $('#hl-err')); }
+  }
+  function renderHealth(d) {
+    const d7 = d.d7 || {};
+    let title = '', text = '';
+    if (!d.enabled) {
+      title = 'Монитор выключен';
+      text = 'Раз в минуту записывает состояние соединений на публичном порту, раз в 5 минут — самопроверку сервера и вердикт окна: сбой сервера, заморозка или клиенты не подключались. Включить:';
+    } else if (!d.active) {
+      title = 'Монитор остановлен';
+      text = 'Юниты на месте, но таймеры не работают. Запустить заново (данные не трогает):';
+    } else if (!d7.windows) {
+      title = 'Окон пока нет';
+      text = 'Первое окно появится в течение 5 минут после включения: откройте вкладку ещё раз.';
+    }
+    $('#hl-off').hidden = !title;
+    $('#hl-off-title').textContent = title;
+    $('#hl-off-text').textContent = text;
+    $('#hl-off-cmd').hidden = !!d.enabled && !!d.active;
+    $('#hl-stats').hidden = !d.enabled || !!d.stats;
+    $('#hl-body').hidden = !d7.windows;
+    if (!d7.windows) return;
+
+    const band = $('#hl-band');
+    band.textContent = '';
+    const cells = d.band || [];
+    for (let r = 0; r < 4; r++) {
+      const row = cells.slice(r * 24, r * 24 + 24);
+      if (!row.length) break;
+      band.append(h('span', { class: 'hr', text: hm(sd(row[0].t)) }));
+      row.forEach(c => band.append(h('span', { class: 'hc hc-' + c.s, title: hm(sd(c.t)) + '–' + hm(sd(c.t + 900)) + ': ' + CELL_WORD[c.s] })));
+    }
+    const bad = cells.filter(c => c.s === 'bad').length, warn = cells.filter(c => c.s === 'warn').length;
+    band.setAttribute('aria-label', 'Сутки по 15 минут: сбоев ' + bad + ', деградации ' + warn + ', OK ' + cells.filter(c => c.s === 'ok').length);
+
+    const pct = v => v == null ? '—' : f1.format(v) + NB + '%';
+    $('#hl-ready').textContent = pct(d7.ready_pct);
+    $('#hl-ready-sub').textContent = d7.ready_pct == null ? 'Самопроверок нет'
+      : 'Прошло ' + d7.self_ok + ' из ' + d7.self_runs + ' самопроверок; покрытие ' + f1.format(d7.self_cov_h) + ' ч';
+    $('#hl-sess').textContent = pct(d7.sessions_pct);
+    $('#hl-sess-sub').textContent = d7.sessions_pct == null ? 'Нет окон с трафиком своих клиентов'
+      : d7.traffic_ok + ' из ' + d7.traffic_windows + ' окон с трафиком; покрытие ' + f1.format(d7.traffic_cov_h) + ' ч';
+    $('#hl-cov').textContent = f1.format(d7.coverage_h) + NB + 'ч';
+
+    const dl = $('#hl-last');
+    dl.textContent = '';
+    const w = d.last;
+    const row = (label, value, bad) => dl.append(h('div', null, h('dt', { text: label }), h('dd', { class: bad ? 'bad' : null, text: value })));
+    if (w) {
+      row('Окно', dhm(w.t));
+      row('Вердикт', w.verdict, !['ok', 'nodata', 'monitor'].includes(w.vd));
+      row('Самопроверка', w.self, !w.self.startsWith('прошла'));
+      if (w.conns) {
+        row('Соединений', w.conns.cmax + ' (новых ' + w.conns.new + ')');
+        row('С одного адреса', 'до ' + w.conns.pmax + ' одновременно, до ' + w.conns.pnew + ' новых между опросами',
+          w.conns.pnew > w.storm_new);
+        row('Классы', w.classes.length ? w.classes.map(c => c.text + ' — ' + c.n).join(', ') : 'все в норме');
+      }
+    }
+
+    const inc = $('#hl-inc');
+    inc.textContent = '';
+    if (!d.incidents.length) inc.append(h('li', { class: 'sub', text: 'Сбоев, заморозок и деградации за 7 дней нет' }));
+    d.incidents.slice().reverse().forEach(x => inc.append(h('li', null,
+      h('span', { class: 'when', text: dhm(x.from) + '–' + hm(sd(x.to)) }), h('span', { text: x.why }),
+      ...x.events.map(e => h('span', { class: 'near', text: 'рядом: ' + hm(sd(e.t)) + ' ' + e.text })))));
+
+    const ev = $('#hl-ev');
+    ev.textContent = '';
+    $('#hl-ev-card').hidden = !d.events.length;
+    d.events.slice().reverse().forEach(e => ev.append(h('li', null,
+      h('span', { class: 'when', text: dhm(e.t) }), h('span', { text: e.text }))));
+  }
 
   // ───────── логи ─────────
   const LOGNOTE = {

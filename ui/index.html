@@ -33,6 +33,7 @@
     <button class="tab" type="button" role="tab" id="t-overview" aria-controls="p-overview" aria-selected="true">Обзор</button>
     <button class="tab" type="button" role="tab" id="t-clients" aria-controls="p-clients" aria-selected="false">Клиенты</button>
     <button class="tab" type="button" role="tab" id="t-charts" aria-controls="p-charts" aria-selected="false">Графики</button>
+    <button class="tab" type="button" role="tab" id="t-health" aria-controls="p-health" aria-selected="false">Здоровье</button>
     <button class="tab" type="button" role="tab" id="t-logs" aria-controls="p-logs" aria-selected="false">Логи</button>
   </nav>
 </header>
@@ -203,6 +204,61 @@
       </div>
 
       <p class="foot">На сервере хранятся только счётчики: трафик всех клиентов за каждые 5 минут, по клиентам — суммы за сутки и время последнего трафика. Ни адресов клиентов, ни адресов назначения. Срок хранения — 31 день. Время — серверное.</p>
+    </div>
+  </section>
+
+  <!-- Здоровье (xm health) -->
+  <section class="panel" id="p-health" role="tabpanel" aria-labelledby="t-health" hidden>
+    <div class="card alert" id="hl-err" role="alert" hidden></div>
+    <div class="card" id="hl-off" hidden>
+      <h2 id="hl-off-title"></h2>
+      <p class="sub" id="hl-off-text"></p>
+      <pre class="cmd" id="hl-off-cmd">sudo xm health on</pre>
+    </div>
+    <p class="hint" id="hl-stats" hidden>Трафик своих клиентов не виден — окна без него «нет данных», а не OK. На сервере: <code>sudo xm stats on</code> (один раз перезапустит Xray)</p>
+
+    <div class="panel" id="hl-body">
+      <div class="card">
+        <h2>Последние 24 часа</h2>
+        <p class="sub">Клетка — 15 минут, время серверное</p>
+        <div class="hband" id="hl-band" role="img"></div>
+        <div class="legend"><span><i class="k hc-ok"></i>OK</span><span><i class="k hc-warn"></i>деградация</span><span><i class="k hc-bad"></i>сбой сервера или заморозка</span><span><i class="k hc-none"></i>нет данных (не подключались, ПК выключен, монитор не работал)</span></div>
+      </div>
+
+      <div class="tiles">
+        <div class="card">
+          <div class="t-label">Сервер готов, 7 дней</div>
+          <div class="t-value" id="hl-ready">—</div>
+          <div class="t-sub" id="hl-ready-sub"></div>
+        </div>
+        <div class="card">
+          <div class="t-label">Сессии без заморозок, 7 дней</div>
+          <div class="t-value" id="hl-sess">—</div>
+          <div class="t-sub" id="hl-sess-sub"></div>
+        </div>
+        <div class="card">
+          <div class="t-label">Данных за 7 дней</div>
+          <div class="t-value" id="hl-cov">—</div>
+          <div class="t-sub">часов из 168</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Последнее окно</h2>
+        <dl class="kv" id="hl-last"></dl>
+      </div>
+
+      <div class="card">
+        <h2>Причины</h2>
+        <ul class="hlist" id="hl-inc"></ul>
+      </div>
+
+      <div class="card" id="hl-ev-card">
+        <h2>События</h2>
+        <ul class="hlist" id="hl-ev"></ul>
+      </div>
+
+      <p class="foot">Доступность считается по попыткам: окно без самопроверки и без трафика своих клиентов — «нет данных», а не сбой. На сервере хранятся только числа, классы соединений и место поломки, без адресов. Окна — 31 день, итоги суток — год. Выключить и стереть: <code>sudo xm health off</code>.</p>
     </div>
   </section>
 

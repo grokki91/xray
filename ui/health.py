@@ -965,6 +965,16 @@ def _dhm(t):
     return time.strftime("%d.%m %H:%M", time.localtime(t))
 
 
+def self_text(s):
+    """Итог самопроверки окна словами: отчёт в терминале и панель (xm ui)."""
+    s = s or {}
+    if s.get("r") == "ok":
+        return "прошла"
+    if s.get("r") == "fail":
+        return "не прошла: " + STAGE_TEXT.get(s.get("at"), "?")
+    return "пропущена: " + SKIP_TEXT.get(s.get("why"), "?")
+
+
 def print_report(r, color=True):
     C = (lambda c, s: "\033[%sm%s\033[0m" % (c, s)) if color else (lambda c, s: s)
     sym = {"ok": C("0;32", "✓"), "warn": C("1;33", "~"), "bad": C("0;31", "✗"), "none": "·"}
@@ -1005,10 +1015,8 @@ def print_report(r, color=True):
     w = r["last"]
     if w:
         print()
-        s = w.get("self") or {}
-        st = "прошла" if s.get("r") == "ok" else ("не прошла: " + STAGE_TEXT.get(s.get("at"), "?")) \
-            if s.get("r") == "fail" else "пропущена: " + SKIP_TEXT.get(s.get("why"), "?")
-        print("  Последнее окно %s: %s; самопроверка %s" % (_hm(w["t"]), VERDICT_TEXT.get(w.get("vd"), "?"), st))
+        print("  Последнее окно %s: %s; самопроверка %s" % (_hm(w["t"]), VERDICT_TEXT.get(w.get("vd"), "?"),
+                                                        self_text(w.get("self"))))
         c = w.get("c")
         if c:
             print("  Соединения: %d (новых %d; с одного адреса — до %d одновременно, до %d новых между опросами); %s" % (

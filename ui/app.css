@@ -198,6 +198,21 @@ td.empty { white-space: normal; color: var(--muted); }
 .legend .k { margin-right: 6px; vertical-align: middle; }
 .k.s1 { background: var(--s1); }
 .k.s2 { background: var(--s2); }
+
+/* Здоровье: полоса суток — 4 строки по 24 клетки (15 минут) */
+.hband { display: grid; grid-template-columns: 3.2em repeat(24, minmax(0, 1fr)); gap: 3px; margin-top: 12px; align-items: center; }
+.hband .hr { font: 12px var(--font-mono); color: var(--muted); }
+.hc { height: 18px; border-radius: 3px; }
+.hc-ok { background: var(--good); }
+.hc-warn { background: var(--warn); }
+.hc-bad { background: var(--crit); }
+.hc-none { background: var(--surface-2); box-shadow: inset 0 0 0 1px var(--line); }
+.legend .k.hc-ok, .legend .k.hc-warn, .legend .k.hc-bad, .legend .k.hc-none { width: 10px; height: 10px; border-radius: 2px; }
+.hlist { list-style: none; margin: 8px 0 0; padding: 0; }
+.hlist li { padding: 8px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.hlist li:last-child { border-bottom: 0; }
+.hlist .when { font: 13px var(--font-mono); color: var(--ink-2); margin-right: 10px; }
+.hlist .near { display: block; color: var(--muted); font-size: 12.5px; margin: 2px 0 0 1em; }
 .plot { position: relative; margin-top: 6px; }
 .plot svg { display: block; overflow: visible; }
 .plot text { font: 11px var(--font-ui); fill: var(--muted); font-variant-numeric: tabular-nums; }
