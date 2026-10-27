@@ -205,6 +205,25 @@ _xray_latest_ver() {
 # Версия установленного Xray-core числом x.y.z; пусто — не определилась.
 _xray_ver() { xray version 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -1; }
 
+# Пользователь и группа, от которых systemd запускает Xray. install-release.sh
+# при установке новой версии пишет юнит с User=xray/Group=xray (раньше —
+# nobody/nogroup): config.json с группой nogroup новый юнит не читает, Xray падает
+# с exit 23 «permission denied».
+_xray_user() { local u; u=$(systemctl show -p User --value xray 2>/dev/null); echo "${u:-nobody}"; }
+_xray_group() {
+  local g; g=$(systemctl show -p Group --value xray 2>/dev/null)
+  [[ -n "$g" ]] || g=$(id -gn "$(_xray_user)" 2>/dev/null)
+  echo "${g:-nogroup}"
+}
+
+# Права под пользователя сервиса: config.json 640 root:<группа>, логи — его.
+_xray_fix_perms() {
+  local u g; u=$(_xray_user); g=$(_xray_group)
+  chmod 640 "$CONFIG"; chown "root:$g" "$CONFIG"
+  [[ -d /var/log/xray ]] && chown -R "$u:$g" /var/log/xray
+  return 0
+}
+
 # _ver_ge <a> <b> — версия a не младше b.
 _ver_ge() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$2" ]]; }
 
@@ -2193,7 +2212,7 @@ _selftest() {
   [[ "$code" == "200" ]]
 }
 
-# Атомарная замена config.json: JSON через stdin → mktemp → chmod 640 root:nogroup → mv.
+# Атомарная замена config.json: JSON через stdin → mktemp → chmod 640 root:<группа Xray> → mv.
 # mktemp (непредсказуемое имя) исключает symlink/race, mv в пределах ФС атомарен.
 _atomic_write_config() {
   local tmp
@@ -2205,9 +2224,9 @@ _atomic_write_config() {
     echo -e "${RED}[ERR] Новый конфиг пуст или невалиден — запись отменена, config.json не тронут${NC}" >&2
     rm -f "$tmp"; trap - EXIT INT TERM; return 1
   fi
-  # 640 root:nogroup выставляем до mv, чтобы приватный ключ не был доступен по umask
+  # 640 root:<группа Xray> выставляем до mv, чтобы приватный ключ не был доступен по umask
   chmod 640 "$tmp"
-  chown root:nogroup "$tmp"
+  chown "root:$(_xray_group)" "$tmp"
   mv "$tmp" "$CONFIG"
   trap - EXIT INT TERM
 }
@@ -2732,13 +2751,13 @@ set-sni)
       if [[ "$(_get_nginx_sni)" != "$NEW_SNI" ]]; then
         fail "SNI в $NGINX_CONF не обновился — откат"
         [[ -n "$NGX_BACKUP" ]] && cp "$NGX_BACKUP" "$NGINX_CONF"
-        cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
         exit 1
       fi
       if ! nginx -t 2>/dev/null; then
         fail "nginx -t не прошёл — откат nginx и config"
         [[ -n "$NGX_BACKUP" ]] && cp "$NGX_BACKUP" "$NGINX_CONF"
-        cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
         systemctl reload nginx 2>/dev/null || true
         exit 1
       fi
@@ -2778,12 +2797,12 @@ set-sni)
         fi
       else
         fail "Xray не поднялся — откат config"
-        cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
         systemctl restart xray; exit 1
       fi
     else
       fail "Конфиг невалиден — откат config"
-      cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+      cp "$CFG_BACKUP" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
       exit 1
     fi
 
@@ -2860,7 +2879,7 @@ set-port)
     fi
     if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
       fail "Конфиг невалиден — откат"
-      cp "$PBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+      cp "$PBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"; exit 1
     fi
 
     # UFW открываем ДО рестарта: иначе между стартом и правилом есть окно,
@@ -2873,7 +2892,7 @@ set-port)
       ok "Xray слушает $NEW_PORT"
     else
       fail "Xray не поднялся на $NEW_PORT — откат"
-      cp "$PBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+      cp "$PBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
       ufw delete allow "${NEW_PORT}/tcp" >/dev/null 2>&1 || true
       systemctl restart xray
       journalctl -u xray -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
@@ -2909,7 +2928,7 @@ restore)
     read -rp "Выбери [Enter=1]: " CHOICE; CHOICE=${CHOICE:-1}
     cp "${FILES[$((CHOICE-1))]}" "$CONFIG"
     chmod 640 "$CONFIG"
-    chown root:nogroup "$CONFIG"
+    chown "root:$(_xray_group)" "$CONFIG"
     echo -e "${GREEN}Восстановлен: ${FILES[$((CHOICE-1))]}${NC}"
     _apply
     ;;
@@ -3332,7 +3351,7 @@ add-tcp)
         echo -e "${YELLOW}Откат к бэкапу...${NC}"
         cp "$BACKUP_FILE" "$CONFIG"
         chmod 640 "$CONFIG"
-        chown root:nogroup "$CONFIG"
+        chown "root:$(_xray_group)" "$CONFIG"
         systemctl restart xray
         exit 1
       fi
@@ -3340,7 +3359,7 @@ add-tcp)
       echo -e "${RED}Конфиг невалиден — откат к бэкапу${NC}"
       cp "$BACKUP_FILE" "$CONFIG"
       chmod 640 "$CONFIG"
-      chown root:nogroup "$CONFIG"
+      chown "root:$(_xray_group)" "$CONFIG"
       systemctl restart xray
       exit 1
     fi
@@ -3455,16 +3474,35 @@ update)
     fi
 
     NEW_VER=$(xray version 2>/dev/null | head -1 || echo "?")
+    # Установщик при «No new version» выходит с 0, ничего не трогая. Перезапуск
+    # тогда только рвёт живые соединения клиентов — не делаем его.
+    if [[ "$NEW_VER" == "$CUR_VER" ]]; then
+      ok "Установлена актуальная версия — бинарник не тронут"
+      if ! systemctl is-active --quiet xray; then
+        # Лежащий сервис — чаще всего права после прошлого install с новым юнитом
+        _xray_fix_perms
+        systemctl restart xray; sleep 2
+        if systemctl is-active --quiet xray; then
+          ok "Xray не работал — права выправлены, сервис запущен"
+        else
+          fail "Xray не запускается"
+          journalctl -u xray -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+          exit 1
+        fi
+      fi
+      exit 0
+    fi
     ok "Бинарник обновлён: $NEW_VER"
 
     # Шаг 4: контроль прав config.json (приватный ключ не должен стать всеобщим)
+    # и группа — та, от которой юнит запускает Xray (установщик мог её сменить)
+    UPD_WANT="640 root:$(_xray_group)"
     UPD_PERMS=$(stat -c "%a %U:%G" "$CONFIG" 2>/dev/null || echo "?")
-    if [[ "$UPD_PERMS" != "640 root:nogroup" ]]; then
-      warn "Права config.json после обновления: $UPD_PERMS — восстанавливаю 640 root:nogroup"
-      chmod 640 "$CONFIG"
-      chown root:nogroup "$CONFIG"
+    if [[ "$UPD_PERMS" != "$UPD_WANT" ]]; then
+      warn "Права config.json после обновления: $UPD_PERMS — восстанавливаю $UPD_WANT"
     fi
-    ok "config.json: 640 root:nogroup"
+    _xray_fix_perms
+    ok "config.json: $UPD_WANT"
 
     # Шаг 5: валидация конфига новым бинарником + перезапуск
     if xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
@@ -3478,7 +3516,8 @@ update)
         echo -e "  Рекомендуется: ${BOLD}xm diag${NC} для полной проверки"
       else
         fail "Xray не запустился после обновления!"
-        warn "Смотри: journalctl -u xray -n 50"
+        journalctl -u xray -n 15 --no-pager 2>/dev/null | sed 's/^/    /'
+        warn "Полный лог: sudo journalctl -u xray -n 50"
         warn "Конфиг НЕ менялся; бэкап на всякий случай: $UPD_BACKUP"
         exit 1
       fi
@@ -3514,7 +3553,10 @@ update-geo)
       exit 1
     fi
 
-    if bash "$INSTALLER" install-geodata; then
+    # Действие установщика — update-geodata (раньше install-geodata; старое имя
+    # он отвергает «unknown option -- -»). Ставит geoip-full/geosite-expand из
+    # XTLS/Xray-rules-dat под именами geoip.dat/geosite.dat.
+    if bash "$INSTALLER" update-geodata; then
       ok "geodata обновлена"
       # Xray читает geo-файлы при старте — нужен перезапуск
       _apply
@@ -3653,7 +3695,7 @@ reality-debug)
         "$CONFIG" | _atomic_write_config || exit 1
       _apply || exit 1
       [[ -f "$LOG" ]] && { shred -u "$LOG" 2>/dev/null || rm -f "$LOG"; }
-      touch "$LOG"; chown nobody:nogroup "$LOG" 2>/dev/null || true
+      touch "$LOG"; chown "$(_xray_user):$(_xray_group)" "$LOG" 2>/dev/null || true
       ok "REALITY-отладка выключена, лог затёрт"
       ;;
     *)
@@ -3804,11 +3846,11 @@ for svc in xray nginx fail2ban chrony; do
     info "Inbound'ов: $(jq '.inbounds | length' "$CONFIG")"
     info "Клиентов:   $(jq '.inbounds[0].settings.clients | length' "$CONFIG")"
 
-    CONFIG_PERMS=$(stat -c "%a" "$CONFIG" 2>/dev/null || echo "???")
-    if [[ "$CONFIG_PERMS" == "640" ]]; then
-      ok "config.json права: 640 (root:nogroup — xray читает, остальные нет)"
+    CONFIG_PERMS=$(stat -c "%a %U:%G" "$CONFIG" 2>/dev/null || echo "???")
+    if [[ "$CONFIG_PERMS" == "640 root:$(_xray_group)" ]]; then
+      ok "config.json права: $CONFIG_PERMS — xray читает, остальные нет"
     else
-      fail "config.json права: ${CONFIG_PERMS} — должно быть 640! Исправь: chmod 640 $CONFIG && chown root:nogroup $CONFIG"
+      fail "config.json права: ${CONFIG_PERMS} — должно быть 640 root:$(_xray_group)! Исправь: sudo chmod 640 $CONFIG && sudo chown root:$(_xray_group) $CONFIG"
       ((ISSUES++))
     fi
 
@@ -5285,7 +5327,7 @@ tune)
         systemctl restart xray
         ok "policy.handshake: ${HS_NOW} → 8 с, Xray перезапущен"
       else
-        cp "$TBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        cp "$TBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
         fail "Конфиг не принят — откат из бэкапа"
       fi
     fi
@@ -5782,16 +5824,16 @@ harden)
       fi
       if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
         fail "Конфиг с правилом не прошёл xray -test (нет geoip.dat? ${BOLD}sudo xm update-geo${NC}) — откат"
-        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"; exit 1
       fi
       if [[ "$RU_NEW" == "on" ]] && ! _ru_report ok warn; then
         fail "Правило не подействовало — откат"
-        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"; exit 1
       fi
       systemctl restart xray; sleep 2
       if ! systemctl is-active --quiet xray; then
         fail "Xray не поднялся — откат"
-        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        cp "$RBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
         systemctl restart xray; exit 1
       fi
       if [[ "$RU_NEW" == "on" ]]; then
@@ -5890,12 +5932,12 @@ harden)
       fi
       if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
         fail "Сборка Xray не приняла значение «${NONIP_NEW}» — откат"
-        cp "$NBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+        cp "$NBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"; exit 1
       fi
       systemctl restart xray; sleep 2
       if ! systemctl is-active --quiet xray; then
         fail "Xray не поднялся — откат"
-        cp "$NBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+        cp "$NBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
         systemctl restart xray; exit 1
       fi
       ok "nonIPQuery: ${NONIP_CUR:-<не задано>} → ${NONIP_NEW:-<не задано>}, Xray перезапущен"
@@ -6012,7 +6054,7 @@ harden)
     HBAK=$(_backup_config before_harden); ok "Бэкап: $HBAK"
 
     _harden_restore() {
-      cp "$HBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+      cp "$HBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
       systemctl restart xray 2>/dev/null || true
     }
 
@@ -6030,7 +6072,7 @@ harden)
     # сама, без поля, так что откат ведёт в нужную сторону, а не в молчание.
     NONIP_SET="none"
     for v in reject drop ""; do
-      cp "$HBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+      cp "$HBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
       if _harden_patch "$QS" "$DS" "$v" | _atomic_write_config \
          && xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
         NONIP_SET="$v"; break
@@ -6194,7 +6236,7 @@ pq)
         if ! xray -test -config "$CONFIG" 2>&1 | grep -q "Configuration OK"; then
           fail "Xray не принял mldsa65Seed — откат"
           xray -test -config "$CONFIG" 2>&1 | tail -5 | sed 's/^/    /'
-          cp "$PQBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"; exit 1
+          cp "$PQBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"; exit 1
         fi
         systemctl restart xray; sleep 2
 
@@ -6207,7 +6249,7 @@ pq)
         fi
         if [[ "$PQCODE" != "200" ]]; then
           fail "После включения трафик через тоннель не идёт (код $PQCODE) — откат"
-          cp "$PQBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown root:nogroup "$CONFIG"
+          cp "$PQBAK" "$CONFIG"; chmod 640 "$CONFIG"; chown "root:$(_xray_group)" "$CONFIG"
           systemctl restart xray; exit 1
         fi
         ok "Включено. Клиент БЕЗ mldsa65Verify по-прежнему работает (HTTP 200) — старые конфиги не сломались"
