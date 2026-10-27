@@ -6,25 +6,26 @@
 адреса клиентов живут в памяти одного прохода и не пишутся никуда.
 
   health.py sample [--port N --print --loopback]  опрос соединений (таймер раз в минуту)
-  health.py window --self JSON [--dry] …          окно 5 минут (таймер через xm health run)
+  health.py window --self JSON [--dry] …          окно 5 минут (таймер через xm health run);
+                                                  --api, --port, --hold, --before — замер xm stats
   health.py init                                  точки отсчёта без записи окна (xm health on)
   health.py report [--json]                       отчёт за 24 ч и 7 дней
-  health.py load                                  CPU и пик памяти юнитов за сутки (journald)
+  health.py load                                  CPU и пик памяти юнитов за сутки (cgroup)
 
 Хранилище: DATA_DIR/windows.jsonl (окна, KEEP_DAYS), DATA_DIR/days.jsonl (итоги суток,
 KEEP_DAYS_SUM), DATA_DIR/params.json (порт); промежуточное — RUN_DIR (RAM).
+
+Опрос идёт 1440 раз в сутки, поэтому наверху — только то, что нужно ему. Без json: он тянет re и
+enum, и их импорт был больше половины CPU опроса — состояние опроса в RUN_DIR поэтому marshal.
+Без обёртки socket.py (тянет enum и selectors) — _socket. json, re, datetime, hashlib, subprocess
+импортируются там, где нужны (окно, отчёт).
 """
-import datetime
+import _socket as socket
 import fcntl
-import hashlib
-import json
+import marshal
 import os
-import re
-import socket
 import struct
-import subprocess
 import sys
-import tempfile
 import time
 
 DATA_DIR = os.environ.get("XM_HEALTH_DIR", "/var/lib/xm/health")
@@ -46,15 +47,19 @@ CLASSES = ("norm", "pre", "post", "mid", "f16", "late")
 STALL = ("post", "mid", "f16", "late")
 
 # Вердикт окна. Заморозка — от 3 соединений «после ClientHello» или «10–32 КБ» в окне с трафиком
-# своих клиентов; без трафика — только подозрение. Шквал — больше 30 соединений с одного адреса
-# одновременно (тот же порог, что diag-dpi G5). Ретрансмиты — как в _tune_counters: доля
-# считается только при исходящем потоке от 50 сегм/с, порог 3 %.
+# своих клиентов; без трафика — только подозрение. Шквал — больше 30 НОВЫХ соединений с одного
+# адреса между двумя опросами (порог 30 — как diag-dpi G5): шквал — это хендшейки. Одновременные
+# соединения с адреса (pmax) в вердикт не идут: XHTTP-клиент держит десятки долгих соединений
+# без единого нового за окно, и вердикт по ним рисовал «деградацию» на исправном канале.
+# Ретрансмиты — как в _tune_counters: доля считается только при исходящем потоке от 50 сегм/с,
+# порог 3 %.
 FREEZE_MIN = 3
-STORM_PEER = 30
+STORM_NEW = 30
 RETR_RATE_MIN = 50
 RETR_PCT = 3.0
-# «Есть трафик своих клиентов» — от 64 КБ за окно: самопроверка сама проходит через Xray под
-# первым клиентом (TLS до generate_204 — единицы КБ) и не должна делать каждое окно «с трафиком».
+# «Есть трафик своих клиентов» — от 64 КБ за окно: фон подключённого, но не используемого
+# клиента (keepalive, пуши) — единицы КБ. Трафик самопроверки в замер не входит (xm stats
+# collect --hold), иначе первый клиент был бы «в сети» круглосуточно.
 TRAFFIC_MIN = 65536
 
 FALLBACK_LOG = "/var/log/nginx/reality_fallback_error.log"
@@ -71,6 +76,7 @@ STAGE_TEXT = {
 }
 SKIP_TEXT = {"load": "высокая нагрузка", "mem": "мало памяти", "client": "клиент самопроверки не запустился",
              "off": "не запускалась"}
+DEGRADED_TEXT = {"retr": "ретрансмиты от 3 %", "storm": "шквал новых соединений"}
 CLASS_TEXT = {"pre": "встало до ClientHello", "post": "встало после ClientHello",
               "mid": "встало на 1–10 КБ", "f16": "встало на 10–32 КБ",
               "late": "пропало позже (сон/смена сети)"}
@@ -84,14 +90,18 @@ def _p(*names):
     return os.path.join(*names)
 
 
-def _atomic_write(path, text):
+def _atomic_write(path, data):
     d = os.path.dirname(path)
     os.makedirs(d, mode=0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    # Без tempfile (его импорт — заметная доля CPU поминутного опроса): имя с pid уникально среди
+    # живых процессов, остаток от убитого с тем же pid просто перезаписывается.
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-        os.chmod(tmp, 0o600)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -102,6 +112,7 @@ def _atomic_write(path, text):
 
 
 def _load_json(path, default):
+    import json
     try:
         with open(path, encoding="utf-8") as f:
             v = json.load(f)
@@ -111,7 +122,23 @@ def _load_json(path, default):
 
 
 def _dump(obj):
+    import json
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+# Состояние опроса в RUN_DIR — marshal (см. docstring). Не прочиталось (обрыв записи, другая
+# версия python) — пустое: следующий опрос станет точкой отсчёта, как после перезагрузки.
+def _state(name):
+    try:
+        with open(_p(RUN_DIR, name), "rb") as f:
+            v = marshal.load(f)
+        return v if isinstance(v, dict) else {}
+    except (OSError, ValueError, EOFError, TypeError):
+        return {}
+
+
+def _state_save(name, obj):
+    _atomic_write(_p(RUN_DIR, name), marshal.dumps(obj))
 
 
 def _lock():
@@ -132,18 +159,24 @@ NETLINK_INET_DIAG = 4
 SOCK_DIAG_BY_FAMILY = 20
 NLMSG_ERROR, NLMSG_DONE = 2, 3
 INET_DIAG_INFO = 2
+INET_DIAG_REQ_BYTECODE, INET_DIAG_BC_S_COND = 1, 7
 TCP_ESTABLISHED, TCP_FIN_WAIT1 = 1, 4
 # struct tcp_info (linux/tcp.h): u8 backoff @4, u32 unacked @24, u32 last_data_recv @52,
 # u64 bytes_acked @120, u64 bytes_received @128 (ядро 4.1+). Короче — поля нет, класс не ставится.
 TI_MIN = 136
 
 
-def _diag_dump(family):
+def _diag_dump(family, port):
     s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_INET_DIAG)
     try:
         states = (1 << TCP_ESTABLISHED) | (1 << TCP_FIN_WAIT1)
         req = struct.pack("=BBBBI", family, socket.IPPROTO_TCP, 1 << (INET_DIAG_INFO - 1), 0, states)
         req += b"\0" * 48
+        # Фильтр в ядре — локальный порт = port (тот же байткод S_COND, что у `ss '( sport = :N )'`):
+        # tcp_info чужих сокетов (исходящие Xray, nginx — их тысячи) ядро не собирает, а python не
+        # разбирает. Без него опрос стоил вдвое дороже своей работы.
+        bc = struct.pack("=BBHBBxxi", INET_DIAG_BC_S_COND, 12, 16, socket.AF_UNSPEC, 0, port)
+        req += struct.pack("=HH", 4 + len(bc), INET_DIAG_REQ_BYTECODE) + bc
         hdr = struct.pack("=IHHII", 16 + len(req), SOCK_DIAG_BY_FAMILY, 0x301, 1, 0)
         s.sendto(hdr + req, (0, 0))
         while True:
@@ -201,7 +234,7 @@ def connections(port, loopback=False):
     """Соединения ESTABLISHED и FIN-WAIT-1 с локальным портом port. Петля (самопроверка) — мимо."""
     out = []
     for fam in (socket.AF_INET, socket.AF_INET6):
-        for msg in _diag_dump(fam):
+        for msg in _diag_dump(fam, port):
             r = _parse_diag(msg)
             if r and r["sport"] == port and (loopback or not _is_loopback(r["peer"])):
                 out.append(r)
@@ -226,12 +259,20 @@ def classify(c):
     return "late"
 
 
-def _params():
-    return _load_json(_p(DATA_DIR, "params.json"), {})
+def _port():
+    """Порт опроса из params.json. Без json: xm пишет файл ровно так — {"port":N}."""
+    s = _read(_p(DATA_DIR, "params.json")).strip()
+    if s.startswith(b'{"port":') and s.endswith(b"}") and s[8:-1].isdigit():
+        return int(s[8:-1])
+    return int(_load_json(_p(DATA_DIR, "params.json"), {}).get("port") or 0)
+
+
+def _win0():
+    return {"smp": 0, "new": 0, "pmax": 0, "cmax": 0, "pnew": 0}
 
 
 def cmd_sample(args):
-    port = int(args.get("port") or _params().get("port") or 0)
+    port = int(args.get("port") or _port() or 0)
     if not port:
         return 0                     # порт ещё не записан (первое окно после on) — тихо
     conns = connections(port, loopback="loopback" in args)
@@ -247,11 +288,14 @@ def cmd_sample(args):
         print(" ".join("%s=%d" % (k, cnt[k]) for k in CLASSES) + (" unknown=%d" % unknown if unknown else ""))
         return 0
     now = int(time.time())
-    peers = {}
+    peers, fresh = {}, {}
     with _lock():
-        st = _load_json(_p(RUN_DIR, "conns.json"), {})
+        st = _state("conns.bin")
+        # Первый опрос после включения или перезагрузки (RUN_DIR в RAM): соединения ещё не виданы,
+        # но они не новые — без точки отсчёта каждое включение рисовало бы шквал.
+        base = "c" not in st
         known = st.get("c") or {}
-        win = st.setdefault("w", {"smp": 0, "new": 0, "pmax": 0, "cmax": 0})
+        win = st.setdefault("w", _win0())
         present = set()
         for c in conns:
             k = classify(c)
@@ -261,7 +305,9 @@ def cmd_sample(args):
             peers[c["peer"]] = peers.get(c["peer"], 0) + 1
             rec = known.get(c["cookie"])
             if rec is None:
-                win["new"] += 1
+                if not base:
+                    win["new"] += 1
+                    fresh[c["peer"]] = fresh.get(c["peer"], 0) + 1
                 known[c["cookie"]] = [k, 0, 1]
             else:
                 rec[0], rec[2] = k, 1
@@ -271,20 +317,23 @@ def cmd_sample(args):
         win["smp"] += 1
         win["cmax"] = max(win["cmax"], len(present))
         win["pmax"] = max(win["pmax"], max(peers.values()) if peers else 0)
+        win["pnew"] = max(win.get("pnew", 0), max(fresh.values()) if fresh else 0)
         st["c"], st["t"] = known, now
-        _atomic_write(_p(RUN_DIR, "conns.json"), _dump(st))
+        _state_save("conns.bin", st)
+        _add_load("s")
     peers.clear()                    # адреса — только на время прохода
+    fresh.clear()
     return 0
 
 
 def _close_conns(dry):
     """Итог соединений окна; сбрасывает окно, если не dry. None — опроса в окне не было."""
-    st = _load_json(_p(RUN_DIR, "conns.json"), {})
+    st = _state("conns.bin")
     win = st.get("w") or {}
     if not win.get("smp"):
         return None
     out = dict.fromkeys(CLASSES, 0)
-    out.update(smp=win["smp"], new=win["new"], pmax=win["pmax"], cmax=win["cmax"])
+    out.update(smp=win["smp"], new=win["new"], pmax=win["pmax"], cmax=win["cmax"], pnew=win.get("pnew", 0))
     known = st.get("c") or {}
     for ck in list(known):
         rec = known[ck]
@@ -300,9 +349,60 @@ def _close_conns(dry):
         else:
             rec[2] = 0
     if not dry:
-        st["c"], st["w"] = known, {"smp": 0, "new": 0, "pmax": 0, "cmax": 0}
-        _atomic_write(_p(RUN_DIR, "conns.json"), _dump(st))
+        st["c"], st["w"] = known, _win0()
+        _state_save("conns.bin", st)
     return out
+
+
+# ─── Нагрузка юнитов: cgroup v2 ──────────────────────────────────────────────
+#
+# Каждый запуск юнита дописывает свой расход в RUN_DIR/load.bin, окно забирает накопленное в
+# запись (поле ld). Источник — счётчики ядра своего cgroup: весь запуск вместе с порождёнными
+# процессами (Xray самопроверки, curl, jq). Строки «Consumed …» journald не годятся: systemd
+# пишет их на уровне debug, пока запуск не съел заметно CPU, и без пика памяти до systemd 256 —
+# на живом сервере за прогон приёмки их не нашлось ни одной.
+PROC_CGROUP = "/proc/self/cgroup"
+CG_ROOTS = ("/sys/fs/cgroup", "/sys/fs/cgroup/unified")
+UNITS = {"s": "xm-health-sample.service", "w": "xm-health.service"}
+
+
+def _peak(a, b):
+    return b if a is None else (a if b is None else max(a, b))
+
+
+def _unit_usage(kind):
+    """[CPU мс, пик памяти КБ или None] текущего запуска юнита; None — запущено не юнитом."""
+    try:
+        with open(PROC_CGROUP, encoding="ascii") as f:
+            cg = next((ln[3:].strip() for ln in f if ln.startswith("0::")), "")
+    except OSError:
+        return None
+    if not cg.endswith("/" + UNITS[kind]):
+        return None                  # вручную из SSH: это расход сеанса, а не юнита
+    for root in CG_ROOTS:
+        try:
+            with open(root + cg + "/cpu.stat", encoding="ascii") as f:
+                usec = next(int(ln.split()[1]) for ln in f if ln.startswith("usage_usec "))
+        except (OSError, StopIteration, ValueError, IndexError):
+            continue
+        try:
+            peak = int(_read(root + cg + "/memory.peak")) // 1024
+        except ValueError:
+            peak = None              # memory.peak — с ядра 5.19
+        return [usec // 1000, peak]
+    return None
+
+
+def _add_load(kind):
+    """Расход этого запуска — в RUN_DIR/load.bin: [запусков, CPU мс, пик КБ]. Вызывать под _lock."""
+    u = _unit_usage(kind)
+    if u is None:
+        return
+    ld = _state("load.bin")
+    v = ld.get(kind)
+    n, ms, pk = v if isinstance(v, list) and len(v) == 3 else (0, 0, None)
+    ld[kind] = [n + 1, ms + u[0], _peak(pk, u[1])]
+    _state_save("load.bin", ld)
 
 
 # ─── Счётчики ядра: своя точка отсчёта ───────────────────────────────────────
@@ -415,6 +515,7 @@ def _read(path, n=None):
 
 
 def _sha(*paths):
+    import hashlib
     h = hashlib.sha256()
     for p in paths:
         h.update(_read(p))
@@ -422,6 +523,7 @@ def _sha(*paths):
 
 
 def _run(cmd, timeout=10):
+    import subprocess
     try:
         r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
         return r.stdout
@@ -451,6 +553,7 @@ def _facts(a):
 
 
 def _xray_version(xray):
+    import re
     m = re.search(r"Xray (\S+)", _run([xray, "version"]))
     return m.group(1) if m else "?"
 
@@ -473,7 +576,7 @@ def _events(prev, cur, a, since):
         cur["xver"] = _xray_version(a.get("xray") or "/usr/local/bin/xray")
     if since:
         out = _run(["journalctl", "-q", "-u", "xray-watchdog.service", "--since", "@%d" % since,
-                    "-o", "cat", "--no-pager"], timeout=20)
+                    "-o", "cat", "--no-pager"], timeout=10)
         n = sum(1 for ln in out.splitlines() if "перезапускаю" in ln)
         if n:
             ev.append("wd:%d" % n)
@@ -484,6 +587,7 @@ def _events(prev, cur, a, since):
 
 def _traffic(since, now):
     """Сумма up+down из samples.jsonl xm stats за (since, now]; None — замеров с трафиком не было."""
+    import json
     total, seen = 0, False
     try:
         size = os.path.getsize(STATS_SAMPLES)
@@ -504,6 +608,16 @@ def _traffic(since, now):
 
 # ─── Вердикт окна ────────────────────────────────────────────────────────────
 
+def degraded_why(w):
+    """Причина деградации окна: "retr", "storm" или None."""
+    tcp = w.get("tcp") or {}
+    if tcp.get("pct") is not None and tcp["pct"] >= RETR_PCT:
+        return "retr"
+    if (w.get("c") or {}).get("pnew", 0) > STORM_NEW:
+        return "storm"
+    return None
+
+
 def verdict(w):
     """Первая подходящая строка (порядок — из постановки; канарейка ПК — этап 2)."""
     s = w.get("self") or {}
@@ -512,21 +626,40 @@ def verdict(w):
     c = w.get("c") or {}
     tr = w.get("tr")
     has_tr = tr is not None and tr >= TRAFFIC_MIN
-    if c.get("post", 0) + c.get("f16", 0) >= FREEZE_MIN:
-        if has_tr:
-            return "freeze"
-        susp = True
-    else:
-        susp = False
-    tcp = w.get("tcp") or {}
-    if (tcp.get("pct") is not None and tcp["pct"] >= RETR_PCT) or c.get("pmax", 0) > STORM_PEER:
+    susp = c.get("post", 0) + c.get("f16", 0) >= FREEZE_MIN
+    if susp and has_tr:
+        return "freeze"
+    if degraded_why(w):
         return "degraded"
     if has_tr:
         return "ok"
     return "suspect" if susp else "nodata"
 
 
+def _collect_stats(args):
+    """Замер xm stats (--api, --port, --hold EMAIL --before "UP DOWN") — в процессе окна: отдельный
+    python на каждое окно стоил заметную долю его CPU. Сбой замера окно не роняет: в отдельном
+    процессе он и раньше окна не касался."""
+    if not args.get("api"):
+        return
+    try:
+        import stats
+        hold = None
+        try:
+            up, down = (int(x) for x in args.get("before", "").split())
+            hold = (args["hold"], up, down) if args.get("hold") else None
+        except ValueError:
+            pass
+        stats.collect(args.get("xray") or "/usr/local/bin/xray", args["api"], int(args.get("port") or 0),
+                      args.get("config") or "/usr/local/etc/xray/config.json", hold=hold)
+    except Exception:
+        pass
+
+
 def cmd_window(args):
+    import json
+    # Замер — до «сейчас» окна: его отсчёт должен попасть в это окно, а не в следующее.
+    _collect_stats(args)
     now = int(time.time())
     t_end = now // WINDOW * WINDOW
     dry = "dry" in args
@@ -539,8 +672,11 @@ def cmd_window(args):
         last = _last_window()
         if not dry and last and last["t"] >= t_end:
             # Окно уже записано (ручной run в том же пятиминутном слоте): данные — в следующее.
-            print("health: окно %s уже записано — данные уйдут в следующее" %
-                  time.strftime("%H:%M", time.localtime(t_end)), file=sys.stderr)
+            # Только в терминал: stderr юнита — строка журнала с уровнем warning (SyslogLevel).
+            if sys.stderr.isatty():
+                print("health: окно %s уже записано — данные уйдут в следующее" %
+                      time.strftime("%H:%M", time.localtime(t_end)), file=sys.stderr)
+            _add_load("w")
             return 0
         conns = _close_conns(dry)
         cur_snmp = _snmp()
@@ -561,15 +697,23 @@ def cmd_window(args):
         if dry:
             print(_dump(w))
             return 0
+        # Расход юнитов с прошлого окна (свой запуск этого окна уйдёт в следующее).
+        ld = _state("load.bin")
+        if ld:
+            w["ld"] = ld
         os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
         fd = os.open(_p(DATA_DIR, "windows.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(_dump(w) + "\n")
+        _state_save("load.bin", {})
         _atomic_write(_p(RUN_DIR, "ref.json"), _dump({
             "t": now, "snmp": cur_snmp, "logs": {"fb": fb_pos, "fr": fr_pos}}))
         _atomic_write(_p(DATA_DIR, "facts.json"), _dump(facts))
         _rollup(now, last["t"] if last else None)
-    print(_dump(w))
+        _add_load("w")
+    # Из юнита stdout уходит в журнал: окно там не дублируется — оно уже в windows.jsonl.
+    if sys.stdout.isatty():
+        print(_dump(w))
     return 0
 
 
@@ -593,23 +737,45 @@ def cmd_init(args):
 
 # ─── Хранилище: окна, итоги суток ────────────────────────────────────────────
 
-def load_windows(since=0):
-    out = []
+def _line_t(line):
+    """Время окна по началу строки: окно пишется с "t" первым ключом — старые строки отсеиваются
+    без разбора JSON. None — начало не такое (тогда решает разбор)."""
+    if line.startswith('{"t":'):
+        try:
+            return int(line[5:line.index(",", 5)])
+        except ValueError:
+            pass
+    return None
+
+
+def _iter_windows(since=0):
+    """Окна с t >= since по одному: файл за месяц (~3.5 МБ) в память целиком не берётся."""
+    import json
     try:
         with open(_p(DATA_DIR, "windows.jsonl"), encoding="utf-8") as f:
             for line in f:
+                t = _line_t(line)
+                if t is not None and t < since:
+                    continue
                 try:
                     w = json.loads(line)
                 except ValueError:
                     continue
                 if isinstance(w, dict) and isinstance(w.get("t"), int) and w["t"] >= since:
-                    out.append(w)
+                    # Вердикт — функция данных окна: правка правил действует и на записанные
+                    # окна, а данные, пришедшие позже окна (канарейка ПК, этап 2), в него попадут.
+                    w["vd"] = verdict(w)
+                    yield w
     except OSError:
         pass
-    return out
+
+
+def load_windows(since=0):
+    return list(_iter_windows(since))
 
 
 def _last_window():
+    import json
     p = _p(DATA_DIR, "windows.jsonl")
     try:
         size = os.path.getsize(p)
@@ -629,25 +795,30 @@ def _last_window():
 
 
 def _day(ts):
+    import datetime
     return datetime.date.fromtimestamp(ts).isoformat()
 
 
-def _day_summary(day, ws):
-    s = {"d": day, "n": len(ws)}
-    for k in VERDICT_TEXT:
-        s[k] = sum(1 for w in ws if w.get("vd") == k)
-    s["self_ok"] = sum(1 for w in ws if (w.get("self") or {}).get("r") == "ok")
-    s["self_fail"] = sum(1 for w in ws if (w.get("self") or {}).get("r") == "fail")
-    s["trw"] = sum(1 for w in ws if (w.get("tr") or 0) >= TRAFFIC_MIN)
-    s["tr"] = sum(w.get("tr") or 0 for w in ws)
+def _day_add(s, w):
+    s["n"] += 1
+    if w.get("vd") in VERDICT_TEXT:
+        s[w["vd"]] += 1
+    r = (w.get("self") or {}).get("r")
+    s["self_ok"] += r == "ok"
+    s["self_fail"] += r == "fail"
+    tr = w.get("tr") or 0
+    s["trw"] += tr >= TRAFFIC_MIN
+    s["tr"] += tr
+    c = w.get("c") or {}
     for k in STALL + ("pre",):
-        s[k] = sum((w.get("c") or {}).get(k, 0) for w in ws)
-    return s
+        s[k] += c.get(k, 0)
 
 
 def _rollup(now, prev_t):
     """Сутки сменились — итоги завершённых суток в days.jsonl, окна старше KEEP_DAYS и итоги
-    старше года прочь. Раз в сутки: файл окон целиком читается только здесь и в отчёте."""
+    старше года прочь. Раз в сутки и потоком: юнит окна держит в памяти итоги, а не окна —
+    иначе через месяц пик памяти рос бы до ~60 МБ из 96."""
+    import json
     today = _day(now)
     if prev_t is None or _day(prev_t) >= today:
         return
@@ -663,20 +834,41 @@ def _rollup(now, prev_t):
     except OSError:
         pass
     have = {d.get("d") for d in days}
-    by_day = {}
-    ws = load_windows()
-    for w in ws:
+    cutoff = now - KEEP_DAYS * 86400
+    new, old = {}, False
+    for w in _iter_windows():
+        old = old or w["t"] < cutoff
         d = _day(w["t"])
         if d < today and d not in have:
-            by_day.setdefault(d, []).append(w)
-    days += [_day_summary(d, x) for d, x in sorted(by_day.items())]
+            if d not in new:
+                new[d] = dict({"d": d, "n": 0, "self_ok": 0, "self_fail": 0, "trw": 0, "tr": 0},
+                              **dict.fromkeys(tuple(VERDICT_TEXT) + STALL + ("pre",), 0))
+            _day_add(new[d], w)
+    days += [new[d] for d in sorted(new)]
     cut_sum = _day(now - KEEP_DAYS_SUM * 86400)
     days = [d for d in days if d.get("d", "") >= cut_sum]
     _atomic_write(dp, "".join(_dump(d) + "\n" for d in days))
-    cutoff = now - KEEP_DAYS * 86400
-    if ws and ws[0]["t"] < cutoff:
-        keep = [_dump(w) for w in ws if w["t"] >= cutoff]
-        _atomic_write(wp, "\n".join(keep) + ("\n" if keep else ""))
+    if old:
+        tmp = "%s.%d.tmp" % (wp, os.getpid())
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with open(wp, encoding="utf-8") as src, os.fdopen(fd, "w", encoding="utf-8") as dst:
+                for line in src:
+                    t = _line_t(line)
+                    if t is None:
+                        try:
+                            t = json.loads(line).get("t")
+                        except (ValueError, AttributeError):
+                            continue
+                    if isinstance(t, int) and t >= cutoff:
+                        dst.write(line)
+            os.replace(tmp, wp)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 # ─── Отчёт ───────────────────────────────────────────────────────────────────
@@ -705,6 +897,8 @@ def _incidents(ws):
         why = VERDICT_TEXT[v]
         if v == "server":
             why += ": " + STAGE_TEXT.get((w.get("self") or {}).get("at"), "?")
+        elif v == "degraded":
+            why += ": " + DEGRADED_TEXT.get(degraded_why(w), "?")
         if out and out[-1]["why"] == why and w["t"] - out[-1]["to"] <= WINDOW:
             out[-1]["to"] = w["t"]
             out[-1]["n"] += 1
@@ -817,9 +1011,12 @@ def print_report(r, color=True):
         print("  Последнее окно %s: %s; самопроверка %s" % (_hm(w["t"]), VERDICT_TEXT.get(w.get("vd"), "?"), st))
         c = w.get("c")
         if c:
-            print("  Соединения: %d (новых %d, с одного адреса до %d); %s" % (
-                c["cmax"], c["new"], c["pmax"],
+            print("  Соединения: %d (новых %d; с одного адреса — до %d одновременно, до %d новых между опросами); %s" % (
+                c["cmax"], c["new"], c["pmax"], c.get("pnew", 0),
                 ", ".join("%s — %d" % (CLASS_TEXT[k], c[k]) for k in CLASS_TEXT if c.get(k)) or "все в норме"))
+            if c["pmax"] > STORM_NEW:
+                print("  Одновременных с одного адреса больше %d — в вердикт не идёт; чьи они: sudo xm diag-dpi (G5)"
+                      % STORM_NEW)
 
 
 def cmd_report(args):
@@ -833,33 +1030,24 @@ def cmd_report(args):
 
 # ─── Нагрузка юнитов за сутки ────────────────────────────────────────────────
 
-_CONSUMED = re.compile(r"Consumed (?:(\d+)min )?(?:([\d.]+)(ms|us|s) )?CPU time"
-                       r"(?:, ([\d.]+)([KMG]) memory peak)?")
-
-
-def _ms(mins, val, unit):
-    ms = int(mins or 0) * 60000.0
-    if val:
-        ms += float(val) * {"ms": 1, "us": 0.001, "s": 1000}[unit]
-    return ms
-
-
 def cmd_load(args):
-    """CPU и пик памяти юнитов за 24 ч по строкам «Consumed …» systemd в journald."""
-    res = {}
-    for unit in ("xm-health-sample.service", "xm-health.service"):
-        out = _run(["journalctl", "-q", "-u", unit, "--since", "-24h", "-o", "cat", "--no-pager"], timeout=30)
-        runs, cpu, peak = 0, 0.0, 0.0
-        for ln in out.splitlines():
-            m = _CONSUMED.search(ln)
-            if not m:
-                continue
-            runs += 1
-            cpu += _ms(m.group(1), m.group(2), m.group(3))
-            if m.group(4):
-                peak = max(peak, float(m.group(4)) * {"K": 1 / 1024, "M": 1, "G": 1024}[m.group(5)])
-        res[unit] = {"runs": runs, "cpu_ms": round(cpu), "peak_mb": round(peak, 1)}
-    print(_dump(res))
+    """Расход юнитов за 24 ч: окна (поле ld) и ещё не забранное в окно. hours — время, которое
+    покрывают окна с замером: CPU в % ядра = cpu_ms / (hours · 36000)."""
+    now = int(time.time())
+    tot = {k: [0, 0, None] for k in UNITS}
+    srcs = [w["ld"] for w in load_windows(now - 86400) if isinstance(w.get("ld"), dict)]
+    hours = round(len(srcs) * WINDOW / 3600, 2)
+    srcs.append(_state("load.bin"))
+    for ld in srcs:
+        for k in UNITS:
+            v = ld.get(k)
+            if isinstance(v, list) and len(v) == 3:
+                tot[k][0] += v[0]
+                tot[k][1] += v[1]
+                tot[k][2] = _peak(tot[k][2], v[2])
+    out = {k: {"runs": v[0], "cpu_ms": v[1], "peak_kb": v[2]} for k, v in tot.items()}
+    out["hours"] = hours
+    print(_dump(out))
     return 0
 
 

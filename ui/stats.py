@@ -8,7 +8,7 @@
 Адреса клиентов и назначений Xray отдаёт только при statsUserOnline, он не включается.
 Срок хранения — KEEP_DAYS, дальше записи удаляются при очередном замере.
 
-  stats.py collect --xray PATH --api HOST:PORT --port N --config PATH
+  stats.py collect --xray PATH --api HOST:PORT --port N --config PATH [--hold EMAIL --before "UP DOWN"]
 """
 import bisect
 import datetime
@@ -162,8 +162,14 @@ def _prune_samples(now):
     _atomic_write(p, "\n".join(keep) + ("\n" if keep else ""))
 
 
-def collect(xray, api, port, config_path, now=None):
-    """Один замер. Возвращает (код возврата, сообщение или "")."""
+def collect(xray, api, port, config_path, now=None, hold=None):
+    """Один замер. Возвращает (код возврата, сообщение или "").
+
+    hold = (email, up, down) — счётчики клиента, снятые без сброса перед самопроверкой xm health:
+    она идёт через Xray под этим клиентом, и всё, что он набрал сверх них, — её трафик. В замер
+    он не идёт, иначе клиент «в сети» каждые 5 минут. Настоящий трафик клиента за секунды
+    самопроверки теряется вместе с ним.
+    """
     now = int(now or time.time())
     os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
     lock = open(_path(".lock"), "w")
@@ -178,6 +184,9 @@ def collect(xray, api, port, config_path, now=None):
         users = query_users(xray, api)
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
         problem = str(e)
+    if users and hold and hold[0] in users:
+        u, d = users[hold[0]]
+        users[hold[0]] = [min(u, hold[1]), min(d, hold[2])]   # min: Xray мог перезапуститься между
 
     sample = {"t": now, "conns": count_established(port)}
     if users is not None:
@@ -304,8 +313,14 @@ def main(argv):
     it = iter(argv[2:])
     for key in it:
         args[key.lstrip("-")] = next(it, "")
+    hold = None
     try:
-        rc, msg = collect(args["xray"], args["api"], int(args["port"]), args["config"])
+        up, down = (int(x) for x in args.get("before", "").split())
+        hold = (args["hold"], up, down) if args.get("hold") else None
+    except ValueError:
+        pass                         # нет снятых счётчиков — обычный замер, а не отказ
+    try:
+        rc, msg = collect(args["xray"], args["api"], int(args["port"]), args["config"], hold=hold)
     except (KeyError, ValueError, OSError) as e:
         print("stats: " + str(e), file=sys.stderr)
         return 2
