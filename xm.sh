@@ -5048,6 +5048,42 @@ selftest)
     fi
     ;;
 
+# ─── Почему клиент не подключается ───────────────────────────────────────────
+# Факты сервера (самопроверка, UFW, версия) — здесь; попытки клиента в окне, повтор решения REALITY
+# по ключу сервера, хронология, профиль и вердикт — ui/doctor.py. Ничего не меняет: ни config.json,
+# ни Xray, ни логи. Адреса клиентов — только в памяти doctor.py, в отчёте сети помечены буквами.
+doctor)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm doctor [--live СЕК|--no-live] [--json]${NC}"; exit 1; }
+    if [[ ! -f "$UI_DIR/doctor.py" ]] || ! command -v python3 >/dev/null 2>&1; then
+      fail "Нет $UI_DIR/doctor.py или python3"; echo -e "  Поставить: ${BOLD}sudo xm self-update${NC}"; exit 1
+    fi
+    DR_LIVE=60; DR_ARGS=()
+    set -- "${@:2}"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --live)    DR_LIVE="${2:-}"; shift ;;
+        --no-live) DR_LIVE=0 ;;
+        --json)    DR_ARGS+=(--json) ;;
+        --iface)   DR_ARGS+=(--iface "${2:-}"); shift ;;   # tests/vps/doctor.sh: свои клиенты на петле
+        *) echo -e "${RED}xm doctor [--live СЕК|--no-live] [--json]${NC}"; exit 1 ;;
+      esac
+      shift
+    done
+    [[ "$DR_LIVE" =~ ^[0-9]+$ ]] || { fail "--live: число секунд"; exit 1; }
+    { IFS= read -r DR_XPORT; IFS= read -r DR_PRIV; IFS= read -r DR_CSNI; } < <(jq -r '.inbounds[0] | .port,
+        (.streamSettings.realitySettings | (.privateKey // ""), (.serverNames[0] // ""))' "$CONFIG" 2>/dev/null)
+    DR_PORT=$(_front_public_port)
+    [[ " ${DR_ARGS[*]} " == *" --json "* ]] || echo -e "${BOLD}${CYAN}[ xm doctor: почему клиент не подключается ]${NC}\n"
+    DR_SELF=$(_health_selfcheck "" "$DR_PORT" "$DR_XPORT" "$DR_CSNI" "$DR_PRIV")
+    if _ufw_active; then _ufw_allowed "$DR_PORT" && DR_UFW=open || DR_UFW=closed; else DR_UFW=off; fi
+    # Адрес SSH-сеанса — чтобы узнать сеть владельца среди попыток; в doctor.py — окружением (его читает
+    # только root), а не аргументом (командную строку процесса видит любой пользователь); дальше не уходит.
+    DR_PEER=$(who -m --ips 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p' | head -1)
+    XM_SSH_PEER="$DR_PEER" python3 -I "$UI_DIR/doctor.py" run --config "$CONFIG" --self "$DR_SELF" \
+      --xver "$(_xray_ver)" --port "$DR_PORT" --ufw "$DR_UFW" --server-ip "$(_get_field "SERVER IP")" \
+      --live "$DR_LIVE" --backups "$BACKUP_DIR" --api "$(_stats_api)" --xray "$(command -v xray)" "${DR_ARGS[@]}"
+    ;;
+
 # ─── Подбор домена-маски ─────────────────────────────────────────────────────
 sni-scan)
     # Пул массовых CDN-имён: домен-маска должна быть тем, обращение к чему с
@@ -6933,6 +6969,8 @@ neighbors)
     echo -e "${BOLD}Порт 443${NC}    front on|off|status|add <sni> <порт>|del <sni>   делить 443 по SNI"
     echo    "            access status|add <порт>/<proto> [iface|-] [src|-]|del|apply|clear"
     echo -e "${BOLD}${GREEN}Проверка${NC}    ${GREEN}selftest [--tcp|--all]${NC}   живой хендшейк — начинай с неё"
+    echo -e "            ${GREEN}doctor [--live СЕК|--no-live] [--json]${NC}   клиент не подключается: окно 60 с, жми"
+    echo    "                                     «Подключить» — вердикт: сервер, профиль, ядро клиента или сеть"
     echo -e "            ${GREEN}diag${NC} · ${GREEN}diag-dpi [--quick]${NC} · sni-scan [--local [CIDR]] · neighbors"
     echo    "            reality-debug on|off · diag-ntp|diag-ports|diag-tls|diag-fw|diag-log"
     echo -e "${BOLD}Обновление${NC}  ${GREEN}self-update [--check|--force|--from <url>]${NC}  xm из репозитория"
