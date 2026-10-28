@@ -680,7 +680,9 @@ def cmd_window(args):
             return 0
         conns = _close_conns(dry)
         cur_snmp = _snmp()
-        tcp = _tcp_delta(ref.get("snmp"), now, cur_snmp)
+        # Время точки — в ref.json рядом со счётчиками, а _tcp_delta ждёт его в одном словаре с ними:
+        # без него дельта не считалась ни разу, и ретрансмиты в вердикт не попадали.
+        tcp = _tcp_delta(dict(ref.get("snmp") or {}, t=ref.get("t")), now, cur_snmp)
         fb, fb_pos = _read_new(FALLBACK_LOG, (ref.get("logs") or {}).get("fb"))
         fr, fr_pos = _read_new(FRONT_LOG, (ref.get("logs") or {}).get("fr"))
         facts_prev = _load_json(_p(DATA_DIR, "facts.json"), {})

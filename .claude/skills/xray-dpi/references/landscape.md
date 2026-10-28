@@ -1,6 +1,6 @@
 # Актуальная картина: ТСПУ, Xray, клиенты
 
-**Проверено: 2026-10-06.** Здесь всё, что устаревает: поведение цензора, версии, умолчания и
+**Проверено: 2026-10-06; Latest Xray, правило X25519MLKEM768 и клиенты sing-box — 2026-10-28.** Здесь всё, что устаревает: поведение цензора, версии, умолчания и
 пороги Xray, совместимость клиентов. У каждой строки — дата и источник. Старше трёх месяцев —
 сначала обновить, потом опираться; на вопрос «что работает сейчас» сверять всегда.
 
@@ -76,10 +76,11 @@ te-st.org.
 
 Проверено по исходникам тегов, если не сказано иное.
 
-- **Стабильный (Latest) — v26.3.27**: всё после него, v26.5.3…v26.9.30, выходит как
-  pre-release. `install-release.sh` (setup.sh, `xm update`) без `--beta` ставит Latest — то есть
-  по умолчанию сервер на v26.3.27, и пороги, умолчания и проверки ниже, помеченные версией
-  новее, на нём не действуют. — github.com/XTLS/Xray-core/releases (2026-10-06).
+- **Стабильный (Latest) — v26.10.21**: `install-release.sh` без `--beta` (setup.sh, `xm update`)
+  ставит его, то есть любой сервер после `xm update` — на правиле X25519MLKEM768 (v26.9.9 ниже):
+  клиенты на ядре sing-box перестают подключаться. REALITY в нём — 83f6217 (2026-10-14), правило
+  то же; `minClientVer` по умолчанию не задан. — вывод установщика на VPS владельца «No new
+  version… v26.10.21» (2026-10-28); go.mod и infra/conf/transport_security.go тега v26.10.21.
 - **install-release.sh**: действие обновления баз — `update-geodata` (`install-geodata`
   отвергается «unknown option -- -»); ставит `geoip-full.dat`/`geosite-expand.dat` из
   XTLS/Xray-rules-dat как geoip.dat/geosite.dat; архив релиза несёт lite-версии. При «No new
@@ -99,9 +100,14 @@ te-st.org.
   ядра (mihomo) получают отказ. — коммит af7eb68; XTLS/Xray-core#6477.
 - **v26.7.28** — `maxConnections` по умолчанию 3 («anti-TSPU»); в предупреждения добавлены
   microsoft и зоны .ru/.ir/.cn. — коммит 18e2839; infra/conf.
-- **v26.9.8** — REALITY 8cdf7bf: ClientHello без X25519MLKEM768 перед X25519 уходит в fallback
+- **v26.9.9** — REALITY 8cdf7bf: ClientHello без X25519MLKEM768 перед X25519 уходит в fallback
   (у клиента таймаут, в логе «processed invalid connection»); `minClientVer` по умолчанию снят;
-  буфер записи target 8192 → 17 408 б (393f8de, предок 8cdf7bf).
+  буфер записи target 8192 → 17 408 б (393f8de, предок 8cdf7bf). Тега v26.9.8 нет: где в коде и
+  строках ниже «v26.9.8» и порог `26.9.8`, это та же граница — между v26.7.28 и v26.9.9 релизов
+  нет. — go.mod тегов v26.7.28 (REALITY 9234c77) и v26.9.9 (8cdf7bf), `git ls-remote --tags` (2026-10-28).
+  Сервер повторяет это решение сам (`xm doctor`, ui/doctor.py): по ClientHello и privateKey —
+  тот же порядок проверок, что в tls.go (TLS 1.3 и SNI → доли → AEAD session_id → версия, время,
+  shortId); сверено с сервером v26.10.21 клиентами Xray fp chrome/firefox/edge (2026-10-28).
 - **v26.9.30** — последний pre-release на дату проверки; REALITY та же (8cdf7bf);
   `nonIPQuery`/`blockTypes` dns-outbound ещё принимаются, но устарели → `rules`, смешивать нельзя.
   В `main` после него (по 2026-10-05) — WireGuard, XDNS finalmask, Mux, gRPC; REALITY и XHTTP
@@ -149,10 +155,17 @@ te-st.org.
   ≥ v26.3.27. v2rayN (Windows, macOS), v2rayNG (Android), Happ (iOS, macOS) — при свежем ядре.
 - Не проходят до своих патчей: sing-box (Hiddify, NekoBox, Karing) — sing-box#4520,
   Karing#1952; mihomo — отказ уже с v26.7.11. Проверять конкретную версию клиента.
-- Hiddify 4.1.1 (2026-03-05, последний на 2026-10-06): ядро — свой форк sing-box, XHTTP с
-  4.0.5. Со стабильным сервером v26.3.27 по XHTTP работает (замер владельца, 2026-10). Пускает
-  ли его REALITY ≥ v26.9.8, не проверено: до проверки сервер на pre-release не переводить. —
-  github.com/hiddify/hiddify-app/releases; apkmirror, «What's new in Hiddify 4.0.5».
+- Hiddify 4.1.1/4.1.2 (последний тег на 2026-10-28): ядро — hiddify-sing-box 0a02b77 (форк
+  sing-box 1.13), XHTTP с 4.0.5. Со стабильным сервером v26.3.27 по XHTTP работал (замер
+  владельца, 2026-10). **REALITY ≥ v26.9.9 его не пускает**: `common/tls/reality_client.go`
+  вырезает X25519MLKEM768 из supported_groups и key_share и пишет в session_id версию 1.8.1 —
+  сервер отдаёт такой ClientHello сайту-маске, клиент пишет «таймаут» (на VPS владельца трафик
+  пропал с обновления Xray до v26.10.21, 2026-10-27). Исправление — ветка v5 форка (2026-10-26/27:
+  версия 26.10.17, опция key_share с X25519MLKEM768 по умолчанию), в релиз не вышло. Upstream
+  sing-box v1.14.4 — тот же фильтр и 1.8.1; mihomo — версия 1.8.2, X25519MLKEM768 по опции
+  `support-x25519mlkem768`. — hiddify-app v4.1.1 → hiddify-core c9d6f0f → hiddify-sing-box 0a02b77;
+  ветка v5 (d35fe96, b80a398); SagerNet/sing-box v1.14.4; MetaCubeX/mihomo component/tls/reality.go
+  (2026-10-28).
 - Hiddify 4.1.1 на Android, `createService - null` при подключении — сбой до чтения профиля:
   приложение не дождалось, пока закроется loopback-порт 17079 его фонового ядра, или ядро не
   поднялось; `null` — у ошибки нет текста. Сервер и URI ни при чём. Обход — очистить данные
@@ -216,6 +229,9 @@ te-st.org.
 - CDN как спасение: крупные зарубежные CDN сами под заморозкой, ECH заблокирован.
 
 ## Устарело
+
+- 2026-10-28 — «Latest — v26.3.27, всё после — pre-release; по умолчанию сервер на v26.3.27»
+  (2026-10-06): Latest стал v26.10.21, правило X25519MLKEM768 теперь у сервера по умолчанию.
 
 - 2026-09 — «буфер записи target у REALITY — 8192 б»: верно для Xray < v26.9.8, с v26.9.8 —
   17 408 б. С 2026-10 в коде порог по версии на сервере (`_cert_limits`): 8192/7000 до

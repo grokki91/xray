@@ -118,6 +118,15 @@ d = h._tcp_delta({"t": 1000, "TcpOutSegs": 0, "TcpRetransSegs": 0, "TcpPassiveOp
                   "TcpExtListenOverflows": 0, "TcpExtListenDrops": 0})
 want("100 сегм/с: 3%", (d["rate"], d["pct"]), (100, 3.0))
 want("счётчики обнулились — дельты нет", h._tcp_delta({"t": 1, "TcpOutSegs": 9}, 900, {"TcpOutSegs": 1}), None)
+# Окно берёт точку из ref.json так, как её пишет само: время сверху, счётчики в snmp.
+import io, contextlib
+h._atomic_write(os.path.join(h.RUN_DIR, "ref.json"), h._dump({"t": int(time.time()) - 300, "snmp": h._snmp()}))
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    h.cmd_window({"self": '{"r":"ok"}', "dry": True})
+want("окно считает дельту счётчиков по точке из ref.json", sorted((json.loads(buf.getvalue()).get("tcp") or {}).keys()),
+     ["ld", "lo", "out", "pct", "po", "rate", "retr", "to"])
+os.unlink(os.path.join(h.RUN_DIR, "ref.json"))
 
 # ── Логи со смещения: первая встреча без истории, ротация в .1 дочитывается
 lg = os.path.join(T, "fb.log")
