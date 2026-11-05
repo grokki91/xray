@@ -151,6 +151,28 @@ _get_ssh_port() {
   echo "${port:-22}"
 }
 
+# Адрес SSH-клиента этого сеанса (doctor узнаёт по нему сеть владельца). who -m знает только сеанс с
+# терминалом, а мост xdiag (ssh -T … sudo -n xm bridge) идёт без него: тогда — по сокету ближайшего
+# предка sshd (sshd-session в OpenSSH 9.8+). SSH_CONNECTION sudo сбрасывает, а предка не подменить.
+# Пусто — не SSH или адрес не нашёлся.
+_ssh_peer() {
+  local p=$$ c="" peer
+  peer=$(who -m --ips 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p' | head -1)
+  [[ -n "$peer" ]] && { echo "$peer"; return 0; }
+  while [[ "$p" =~ ^[0-9]+$ ]] && (( p > 1 )); do
+    c=$(ps -o comm= -p "$p" 2>/dev/null)
+    [[ "$c" == sshd* ]] && break
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  done
+  [[ "$c" == sshd* ]] || return 0
+  # С фильтром state ss не печатает столбец State: $4 — адрес собеседника, «[v6]:порт» или «v4:порт».
+  # Петля — соединения проброса портов того же sshd (ssh -L к панели), а не клиент.
+  peer=$(ss -tnpH state established 2>/dev/null | awk -v k="pid=$p," \
+    'index($0, k) && $4 !~ /^(127\.|\[::1\]|\[::ffff:127\.)/ {print $4; exit}')
+  peer=${peer%:*}; peer=${peer#[}; peer=${peer%]}
+  echo "$peer"
+}
+
 _has_tcp_inbound() {
   [[ $(jq '.inbounds | length' "$CONFIG" 2>/dev/null || echo 0) -ge 2 ]]
 }
@@ -2644,6 +2666,23 @@ SyslogLevel=warning'
     "OnCalendar=*:0/5:30" "AccuracySec=5s" "" "[Install]" "WantedBy=timers.target" > "$1/xm-health.timer"
 }
 
+# ─── Мост для xdiag (xm bridge) ──────────────────────────────────────────────
+BRIDGE_SUDOERS="/etc/sudoers.d/xm-bridge"
+
+# Правило sudo для пользователя $1: без пароля — только команды моста с допустимыми аргументами.
+# Без «*»: в sudoers он совпадает и через пробел, то есть с любыми аргументами дальше; окно doctor —
+# 10–129 по маске, а 10–120 проверяет сам xm bridge.
+_bridge_rule() {
+  local x="$XM_BIN bridge"
+  echo "# xm bridge on: xdiag reads server facts over SSH (sudo -n), read-only. Remove: sudo xm bridge off"
+  echo "$1 ALL=(root) NOPASSWD: $x facts, $x health, $x doctor, $x doctor --live [1-9][0-9], $x doctor --live 1[0-2][0-9]"
+}
+
+# Проходит ли мост у пользователя $1 так, как его зовёт xdiag: sudo -n без терминала. setsid — без
+# управляющего терминала: метка sudo от только что введённого в этом сеансе пароля не засчитается.
+# Код — sudo; в stdout — его stderr (причина отказа).
+_bridge_try() { setsid -w runuser -u "$1" -- sudo -n xm bridge "${@:2}" </dev/null 2>&1 >/dev/null; }
+
 # Юнит окна (xm-health.service: «xm health run» без ключей, 288 раз в сутки) — до case ниже: bash
 # разбирает case целиком, прежде чем выполнить, а это половина CPU разбора xm. Проверки — те же,
 # что у health run в case; не прошли — туда же, за сообщением.
@@ -5078,10 +5117,110 @@ doctor)
     if _ufw_active; then _ufw_allowed "$DR_PORT" && DR_UFW=open || DR_UFW=closed; else DR_UFW=off; fi
     # Адрес SSH-сеанса — чтобы узнать сеть владельца среди попыток; в doctor.py — окружением (его читает
     # только root), а не аргументом (командную строку процесса видит любой пользователь); дальше не уходит.
-    DR_PEER=$(who -m --ips 2>/dev/null | sed -n 's/.*(\([^)]*\)).*/\1/p' | head -1)
+    DR_PEER=$(_ssh_peer)
     XM_SSH_PEER="$DR_PEER" python3 -I "$UI_DIR/doctor.py" run --config "$CONFIG" --self "$DR_SELF" \
       --xver "$(_xray_ver)" --port "$DR_PORT" --ufw "$DR_UFW" --server-ip "$(_get_field "SERVER IP")" \
       --live "$DR_LIVE" --backups "$BACKUP_DIR" --api "$(_stats_api)" --xray "$(command -v xray)" "${DR_ARGS[@]}"
+    ;;
+
+# ─── Мост для xdiag ──────────────────────────────────────────────────────────
+# xdiag на ПК владельца зовёт по SSH «sudo -n xm bridge facts|doctor|health» и разбирает JSON. Только
+# чтение: config.json, Xray и логи не меняются. Команды и аргументы — из списка; sudo без пароля —
+# только на них (bridge on). В stdout — только JSON, ошибка — строкой в stderr и код 1.
+bridge)
+    BR_USAGE="xm bridge facts|health|doctor [--live 10-120] · on|off|status"
+    [[ $EUID -ne 0 ]] && { echo "Запусти от root: sudo $BR_USAGE" >&2; exit 1; }
+    case "${2:-}" in
+    facts)
+      [[ $# -eq 2 ]] || { echo "xm bridge facts — без аргументов (соль сессии — в stdin)" >&2; exit 1; }
+      [[ -f "$UI_DIR/bridge.py" ]] && command -v python3 >/dev/null 2>&1 \
+        || { echo "xm bridge: нет $UI_DIR/bridge.py или python3 — sudo xm self-update" >&2; exit 1; }
+      # Соль — 32 hex из stdin (xdiag пишет её и закрывает поток); нет её — фактов профиля нет.
+      BR_SALT=""; [[ -t 0 ]] || IFS= read -r -t 5 BR_SALT
+      [[ "$BR_SALT" =~ ^[0-9a-f]{32}$ ]] || BR_SALT=""
+      { IFS= read -r BR_XPORT; IFS= read -r BR_PRIV; IFS= read -r BR_CSNI; } < <(jq -r '.inbounds[0] | .port,
+          (.streamSettings.realitySettings | (.privateKey // ""), (.serverNames[0] // ""))' "$CONFIG" 2>/dev/null)
+      BR_PORT=$(_front_public_port)
+      if _ufw_active; then _ufw_allowed "$BR_PORT" && BR_UFW=open || BR_UFW=closed; else BR_UFW=off; fi
+      # Самопроверка — та же, что у doctor и окна health: факты о сервере «сейчас», а не по журналу.
+      BR_SELF=$(_health_selfcheck "" "$BR_PORT" "$BR_XPORT" "$BR_CSNI" "$BR_PRIV")
+      BR_PBK=""; [[ -n "$BR_SALT" ]] && BR_PBK=$(_health_pubkey "$BR_PRIV")
+      unset BR_PRIV
+      BR_COMMIT=""; BR_BRANCH=""
+      if BR_REPO=$(_xm_repo); then
+        BR_COMMIT=$(git -C "$BR_REPO" rev-parse --short HEAD 2>/dev/null)
+        BR_BRANCH=$(git -C "$BR_REPO" symbolic-ref --quiet --short HEAD 2>/dev/null)
+      fi
+      # Соль — окружением (его читает только root), а не аргументом: командную строку видят все.
+      XM_BRIDGE_SALT="$BR_SALT" python3 -I "$UI_DIR/bridge.py" facts --config "$CONFIG" --xver "$(_xray_ver)" \
+        --active "$(_jb systemctl is-active --quiet xray)" --port "$BR_PORT" --fp "$(_get_fp)" \
+        --front "$(_jb _front_enabled)" --tcp "$(_jb _has_tcp_inbound)" --pq "$(_jb _pq_on)" --ufw "$BR_UFW" \
+        --doh "$(_jb _dns_doh_on)" --hijack "$(_jb _dns_hijack_on)" --nonip "$(_nonip_current)" --ru "$(_jb _ru_on)" \
+        --self "$BR_SELF" --health "$(_jb _health_enabled)" --commit "$BR_COMMIT" --branch "$BR_BRANCH" --pbk "$BR_PBK"
+      ;;
+    doctor|health)
+      if [[ "$2" == doctor ]]; then
+        BR_LIVE=60
+        if [[ $# -eq 4 && "$3" == --live && "$4" =~ ^[0-9]{2,3}$ ]] && (( 10#$4 >= 10 && 10#$4 <= 120 )); then
+          BR_LIVE=$((10#$4))
+        elif [[ $# -ne 2 ]]; then echo "xm bridge doctor [--live 10-120]" >&2; exit 1; fi
+        BR_CMD=(doctor --live "$BR_LIVE" --json)
+      else
+        [[ $# -eq 2 ]] || { echo "xm bridge health — без аргументов" >&2; exit 1; }
+        BR_CMD=(health --json)
+      fi
+      # Тот же xm (doctor/health --json как есть) плюс schema — версия контракта для xdiag.
+      BR_OUT=$(bash "$0" "${BR_CMD[@]}") \
+        && jq -ec --arg n "$2" '{schema: {name: $n, major: 1, minor: 0}} + .' <<<"$BR_OUT" 2>/dev/null \
+        || { echo "xm bridge $2: ${BR_OUT:-нет вывода}" >&2; exit 1; }
+      ;;
+    on)
+      BR_USER="${SUDO_USER:-}"
+      if [[ -z "$BR_USER" || "$BR_USER" == root ]]; then
+        fail "Запусти из-под пользователя, под которым xdiag входит по SSH: sudo xm bridge on"; exit 1
+      fi
+      [[ "$BR_USER" =~ ^[a-z_][a-z0-9_.-]*$ ]] && id -u "$BR_USER" >/dev/null 2>&1 \
+        || { fail "Имя пользователя «$BR_USER» не годится для sudoers"; exit 1; }
+      for c in visudo runuser setsid; do
+        command -v "$c" >/dev/null 2>&1 || { fail "Нет $c (пакеты sudo, util-linux)"; exit 1; }
+      done
+      [[ -f "$UI_DIR/bridge.py" ]] || { fail "Нет $UI_DIR/bridge.py: sudo xm self-update"; exit 1; }
+      grep -qE '^[@#]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers 2>/dev/null \
+        || { fail "/etc/sudoers не подключает /etc/sudoers.d — правило не подействует: sudo visudo, строка @includedir /etc/sudoers.d"; exit 1; }
+      # Временный файл — с точкой в имени: такие файлы sudo не читает, пока правило не проверено.
+      BR_TMP=$(mktemp /etc/sudoers.d/.xm-bridge.XXXXXX) || { fail "Не создать файл в /etc/sudoers.d"; exit 1; }
+      _bridge_rule "$BR_USER" > "$BR_TMP" && chmod 440 "$BR_TMP"
+      visudo -cqf "$BR_TMP" >/dev/null 2>&1 || { rm -f "$BR_TMP"; fail "visudo отверг правило — ничего не изменено"; exit 1; }
+      BR_NEW=true
+      if cmp -s "$BR_TMP" "$BRIDGE_SUDOERS"; then rm -f "$BR_TMP"; BR_NEW=false
+      else mv -f "$BR_TMP" "$BRIDGE_SUDOERS"; fi
+      visudo -cq >/dev/null 2>&1 \
+        || { rm -f "$BRIDGE_SUDOERS"; fail "sudoers целиком не прошёл проверку — правило снято: sudo visudo -c"; exit 1; }
+      if BR_ERR=$(_bridge_try "$BR_USER" health); then
+        if $BR_NEW; then ok "Мост включён: $BR_USER запускает без пароля только xm bridge facts, health, doctor [--live 10–120]"
+        else ok "Мост уже включён для $BR_USER — правило не менялось"; fi
+        info "Дальше xdiag сам: «Настройки» → SSH-мост → «Проверить». Снять: ${BOLD}sudo xm bridge off${NC}"
+      else
+        fail "Правило стоит, но sudo -n xm bridge health от $BR_USER не прошёл: ${BR_ERR:-без сообщения}"; exit 1
+      fi
+      ;;
+    off)
+      if [[ -f "$BRIDGE_SUDOERS" ]]; then
+        rm -f "$BRIDGE_SUDOERS"; ok "Мост выключен: правило sudo снято, xdiag без него — в ручном режиме"
+      else
+        info "Мост уже выключен"
+      fi
+      ;;
+    status)
+      [[ -f "$BRIDGE_SUDOERS" ]] || { info "Мост выключен. Включить: ${BOLD}sudo xm bridge on${NC} (из-под своего пользователя)"; exit 0; }
+      BR_USER=$(awk '!/^#/ && NF {print $1; exit}' "$BRIDGE_SUDOERS")
+      cmp -s <(_bridge_rule "$BR_USER") "$BRIDGE_SUDOERS" \
+        || warn "Правило не от этой версии xm — обновить: ${BOLD}sudo xm bridge on${NC}"
+      if BR_ERR=$(_bridge_try "$BR_USER" health); then ok "Мост работает: sudo -n xm bridge от $BR_USER проходит"
+      else fail "Правило есть, но sudo -n xm bridge health от $BR_USER не прошёл: ${BR_ERR:-без сообщения}"; exit 1; fi
+      ;;
+    *) echo "xm bridge: неизвестная команда «${2:-}» — $BR_USAGE" >&2; exit 1 ;;
+    esac
     ;;
 
 # ─── Подбор домена-маски ─────────────────────────────────────────────────────
@@ -6971,6 +7110,8 @@ neighbors)
     echo -e "${BOLD}${GREEN}Проверка${NC}    ${GREEN}selftest [--tcp|--all]${NC}   живой хендшейк — начинай с неё"
     echo -e "            ${GREEN}doctor [--live СЕК|--no-live] [--json]${NC}   клиент не подключается: окно 60 с, жми"
     echo    "                                     «Подключить» — вердикт: сервер, профиль, ядро клиента или сеть"
+    echo -e "            ${GREEN}bridge on|off|status${NC}     мост для xdiag: sudo без пароля только на чтение —"
+    echo    "                                     bridge facts · health · doctor [--live 10-120] (JSON по SSH)"
     echo -e "            ${GREEN}diag${NC} · ${GREEN}diag-dpi [--quick]${NC} · sni-scan [--local [CIDR]] · neighbors"
     echo    "            reality-debug on|off · diag-ntp|diag-ports|diag-tls|diag-fw|diag-log"
     echo -e "${BOLD}Обновление${NC}  ${GREEN}self-update [--check|--force|--from <url>]${NC}  xm из репозитория"
