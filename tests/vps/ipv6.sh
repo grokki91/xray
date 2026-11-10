@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Приёмка IPv6 на живом VPS: xm ipv6 со стороны сервера проблем не находит; ссылки --v6 — те же, что
-# по IPv4, но с [адрес], с которым сервер виден снаружи (api64.ipify.org — независимо от src
-# маршрута, по которому выбирает код), и хвостом -v6; ссылки по IPv4 прежние; на [IPv6]:публичный
-# порт сервер отвечает зонду сертификатом маски, как по IPv4. config.json, Xray, ufw и nginx не
-# тронуты. Доступность снаружи отсюда не видна (зонд идёт через lo) — это проверка с клиента.
+# Приёмка IPv6 на живом VPS: вердикт xm ipv6 по ufw для каждого порта совпадает с правилами ip6tables
+# (не с разбором ufw status, как в коде): XHTTP-порт закрыт — [✗] и код 1, TCP-порт закрыт — только
+# [!], на код не влияет; открыт — [✓]. Ссылки --v6 — те же, что по IPv4, но с [адрес], с которым
+# сервер виден снаружи (api64.ipify.org — независимо от src маршрута, по которому выбирает код), и
+# хвостом -v6; ссылки по IPv4 прежние; на [IPv6]:публичный порт сервер отвечает зонду сертификатом
+# маски, как по IPv4. config.json, Xray, ufw и nginx не тронуты. Доступность снаружи отсюда не видна (зонд идёт через lo) — это проверка с клиента.
 # Адресов скрипт не печатает. Запуск: sudo bash tests/vps/ipv6.sh
 source "${BASH_SOURCE[0]%/*}/../lib.sh"
 CFG=/usr/local/etc/xray/config.json
@@ -12,6 +13,8 @@ vpr
 vneed "Xray работает" systemctl is-active --quiet xray
 vneed "у VPS есть маршрут IPv6 наружу (настроить — по подсказке sudo xm ipv6)" ip -6 route get 2001:4860:4860::8888
 vneed "есть curl, openssl" bash -c 'command -v curl && command -v openssl'
+vneed "ufw активен, IPV6=yes (иначе вердикт по портам не с чем сверить)" bash -c \
+  'ufw status | grep -q "Status: active" && grep -qE "^IPV6=yes" /etc/default/ufw'
 
 fact() { printf '  · %-34s %s\n' "$1" "$2"; }
 mask6() { sed -E 's/\x1b\[[0-9;]*m//g; s/\[?[0-9a-fA-F]{1,4}(:[0-9a-fA-F]{0,4}){2,7}\]?/<v6>/g'; }
@@ -22,6 +25,10 @@ fi
 export SNI; SNI=$(jq -r '.inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CFG")
 EXT6=$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null | tr -d '[:space:]' | tr 'A-F' 'a-f')
 SRC6=$(ip -6 route get 2001:4860:4860::8888 | sed -n 's/.* src \([0-9a-fA-F:]*\).*/\1/p' | tr 'A-F' 'a-f')
+TPORT=$(jq -r '.inbounds[1].port // empty' "$CFG")
+# Порт открыт для IPv6 по правилам ip6tables, которые ставит ufw
+open6() { ip6tables -S ufw6-user-input 2>/dev/null | grep -E -- "--dport $1( |\$)" | grep -q -- '-j ACCEPT'; }
+yn() { "$@" && echo да || echo нет; }
 V4=$(awk -F: 'toupper($1) ~ /^SERVER IP[[:space:]]*$/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "$INFO" 2>/dev/null)
 
 echo "Факты:"
@@ -33,6 +40,7 @@ fact "src маршрута = адрес снаружи" "$([[ -n $EXT6 && $SRC6 
 fact "SERVER IP6 в client-info.txt" "$(grep -qiE '^SERVER IP6[[:space:]]*:' "$INFO" && echo задан || echo нет)"
 fact "ufw / IPV6" "$(ufw status 2>/dev/null | head -1) / $(grep -E '^IPV6=' /etc/default/ufw 2>/dev/null)"
 fact "ip6tables INPUT" "$(ip6tables -S INPUT 2>/dev/null | head -1)"
+fact "открыт для IPv6: XHTTP / TCP-порт" "$(yn open6 "$PUB") / $([[ -n $TPORT ]] && yn open6 "$TPORT" || echo 'TCP-inbound нет')"
 fact "сокеты публичного порта" "$(ss -Htln "sport = :$PUB" | awk '{sub(/:[0-9]+$/, "", $4); print $4}' | mask6 | sort -u | paste -sd ' ')"
 
 # Целостность: проверка и ссылки ничего не меняют
@@ -44,9 +52,17 @@ vsnap "$VTMP/ngx" bash -c 'cat /etc/nginx/stream-enabled/*.conf 2>/dev/null | sh
 vneed "сервер выходит наружу по IPv6 (curl -6 https://api64.ipify.org)" test -n "$EXT6"
 vneed "в client-info.txt есть SERVER IP" test -n "$V4"
 
-# ─── xm ipv6: всё, что видно с VPS
-VTIMEOUT=120 vcheck "xm ipv6: со стороны VPS готов" bash -c "xm ipv6 > $VTMP/ipv6.out 2>&1"
-mask6 <"$VTMP/ipv6.out" | grep -E '\[(✗|!)\]' | sed 's/^ */  · xm ipv6: /'
+# ─── xm ipv6: вердикт по портам = ip6tables; код 0 ⇔ XHTTP-порт открыт (и остальное на нём прошло)
+VTIMEOUT=120 vsnap "$VTMP/rc" bash -c "xm ipv6 > $VTMP/ipv6.out 2>&1; echo \$?"
+mask6 <"$VTMP/ipv6.out" | grep -E '^ *\[(✗|!)\]' | sed 's/^ */  · xm ipv6: /'
+export VTMP
+mark() { sed -E 's/\x1b\[[0-9;]*m//g' "$VTMP/ipv6.out" | grep -E "UFW: ($1/tcp открыт и для IPv6|для IPv6 порт $1 закрыт)" \
+  | grep -oE '^ *\[[^]]+\]' | tr -d ' '; }
+export -f mark
+vexpect "xm ipv6: UFW по XHTTP-порту = ip6tables" "$(open6 "$PUB" && echo '[✓]' || echo '[✗]')" bash -c 'mark "$0"' "$PUB"
+[[ -n $TPORT ]] && vexpect "xm ipv6: UFW по TCP-порту = ip6tables, закрыт — [!]" \
+  "$(open6 "$TPORT" && echo '[✓]' || echo '[!]')" bash -c 'mark "$0"' "$TPORT"
+vexpect "xm ipv6: код 0 ⇔ XHTTP-порт открыт для IPv6" "$(open6 "$PUB" && echo 0 || echo 1)" cat "$VTMP/rc"
 
 # ─── Ссылки: --v6 = IPv4-ссылка с [внешний IPv6] и хвостом -v6
 NCL=$(jq '.inbounds[0].settings.clients | length' "$CFG")

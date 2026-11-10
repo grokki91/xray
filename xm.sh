@@ -5160,10 +5160,17 @@ ipv6|ip6)
 
     PUBPORT=$(_front_public_port)
     V6_PORTS=("$PUBPORT"); _has_tcp_inbound && V6_PORTS+=("$(jq -r '.inbounds[1].port' "$CONFIG")")
+    # Основной профиль — XHTTP на публичном порту: его осечка — «не готов». TCP-inbound — запасной
+    # профиль на своём порту (не 443): его по IPv6 можно не открывать — предупреждение с ценой.
+    V6_WARN=0
+    _v6_bad() {
+      if [[ "$1" == "$PUBPORT" ]]; then fail "$2"; V6_BAD=$((V6_BAD + 1))
+      else warn "$2"; info "Это порт TCP-профиля: без него по IPv6 работает только XHTTP (sudo xm qr <имя> --v6); открыть — ещё один публичный порт на новом адресе"; V6_WARN=$((V6_WARN + 1)); fi
+    }
     for p in "${V6_PORTS[@]}"; do
       L6=$(ss -Htln "sport = :$p" 2>/dev/null | awk '$4 ~ /^(\*|\[)/ {print $4; exit}')
       if [[ -n "$L6" ]]; then ok "Порт $p слушается и на IPv6 ($L6)"
-      else fail "Порт $p слушается только на IPv4 — кто держит: sudo ss -tlnp 'sport = :$p'"; V6_BAD=$((V6_BAD + 1)); fi
+      else _v6_bad "$p" "Порт $p слушается только на IPv4 — кто держит: sudo ss -tlnp 'sport = :$p'"; fi
     done
 
     # IPV6=no: ufw не трогает ip6tables, и что пропускать по IPv6 — решает не он.
@@ -5171,7 +5178,7 @@ ipv6|ip6)
       if grep -qE '^[[:space:]]*IPV6=yes' /etc/default/ufw 2>/dev/null; then
         for p in "${V6_PORTS[@]}"; do
           if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)? \(v6\)[[:space:]]+ALLOW"; then ok "UFW: ${p}/tcp открыт и для IPv6"
-          else fail "UFW: для IPv6 порт $p закрыт — открыть: ${BOLD}sudo ufw allow ${p}/tcp${NC}"; V6_BAD=$((V6_BAD + 1)); fi
+          else _v6_bad "$p" "UFW: для IPv6 порт $p закрыт — открыть: ${BOLD}sudo ufw allow ${p}/tcp${NC}"; fi
         done
       else
         fail "UFW не управляет IPv6 (IPV6 ≠ yes в /etc/default/ufw): правила на IPv6 не действуют, политика ip6tables — $(ip6tables -S INPUT 2>/dev/null | head -1)"
@@ -5190,15 +5197,18 @@ ipv6|ip6)
       if [[ "$CODE" == "200" ]]; then
         ok "REALITY $net на [$V6]:$TUN_SRVPORT — трафик прошёл (HTTP 200)"
       else
-        fail "REALITY $net на [$V6]:$TUN_SRVPORT — трафик не прошёл (код $CODE), по IPv4: sudo xm selftest"
-        _tunnel_hint | sed 's/^/    /'; V6_BAD=$((V6_BAD + 1))
+        _v6_bad "${p:-${V6_PORTS[1]}}" "REALITY $net на [$V6]:${p:-${V6_PORTS[1]}} — трафик не прошёл (код $CODE), по IPv4: sudo xm selftest"
+        _tunnel_hint | sed 's/^/    /'
       fi
       _tunnel_down
     done
 
     sep
     if (( V6_BAD )); then fail "IPv6 не готов: проблем — $V6_BAD (выше)"
-    else ok "Со стороны VPS IPv6 готов. Снаружи отсюда не видно (зонд идёт через lo) — проверка с клиента"; fi
+    else
+      ok "Со стороны VPS IPv6 готов для XHTTP на порту $PUBPORT. Снаружи отсюда не видно (зонд идёт через lo) — проверка с клиента"
+      (( V6_WARN )) && warn "TCP-профиль по IPv6 не готов — предупреждения выше"
+    fi
     info "Ссылка на IPv6: sudo xm uri <имя> --v6   ·   QR: sudo xm qr <имя> --v6"
     info "С клиента без VPN (PowerShell): Test-NetConnection -ComputerName $V6 -Port $PUBPORT   → TcpTestSucceeded : True"
     exit $(( V6_BAD > 0 ))
