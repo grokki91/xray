@@ -137,6 +137,30 @@ _get_server_ip() {
   echo "$ip"
 }
 
+# Глобальные IPv6 сервера, годные для ссылки: временные (privacy) и устаревшие адреса меняются, а
+# ссылка у клиента — нет; tentative/dadfailed ещё не работают. ULA (fc00::/7) снаружи не виден —
+# берётся только 2000::/3.
+_ip6_candidates() {
+  ip -o -6 addr show scope global 2>/dev/null \
+    | awk '/ (temporary|deprecated|tentative|dadfailed)( |$)/ {next}
+           {for (i = 1; i < NF; i++) if ($i == "inet6") {a = $(i+1); sub(/\/.*/, "", a); print tolower(a)}}' \
+    | grep -E '^[23][0-9a-f]{0,3}:' || true
+}
+
+# IPv6 сервера для ссылки: поле «SERVER IP6» в client-info.txt (если адресов несколько, а наружу
+# нужен другой), иначе — src маршрута наружу, если он среди годных, иначе — первый годный.
+# Пусто — глобального IPv6 нет.
+_get_server_ip6() {
+  local ip cands
+  ip=$(_get_field "SERVER IP6")
+  [[ -n "$ip" ]] && { echo "${ip,,}"; return 0; }
+  cands=$(_ip6_candidates)
+  [[ -z "$cands" ]] && return 0
+  ip=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | sed -n 's/.* src \([0-9a-fA-F:]*\).*/\1/p' | head -1)
+  if [[ -n "$ip" ]] && grep -qxF "${ip,,}" <<< "$cands"; then echo "${ip,,}"
+  else head -1 <<< "$cands"; fi
+}
+
 _get_fp() {
   local fp
   fp=$(_get_field "FINGERPRINT")
@@ -533,10 +557,11 @@ _doh_probe() {
 # как рассуждением. Теперь исключается конфигом.
 TUN_PORT=""; TUN_PID=""; TUN_CFG=""; TUN_LOG=""; TUN_SNI=""; TUN_SRVPORT=""
 
-# _tunnel_up [xhttp|tcp] [порт] [публичный ключ]: порт и ключ по умолчанию — из config.json.
-# Порт задаёт xm health (публичный, через фронт), ключ — его тестовый режим с неверным ключом.
+# _tunnel_up [xhttp|tcp] [порт] [публичный ключ] [адрес]: порт и ключ по умолчанию — из config.json,
+# адрес — 127.0.0.1. Порт задаёт xm health (публичный, через фронт), ключ — его тестовый режим с
+# неверным ключом, адрес — xm ipv6 (свой IPv6: тот же путь через lo, но сокет v6).
 _tunnel_up() {
-  local net="${1:-xhttp}" idx=0 fb="PUBLIC KEY" uuid port sni sid pub path_v mode
+  local net="${1:-xhttp}" idx=0 fb="PUBLIC KEY" uuid port sni sid pub path_v mode addr="${4:-127.0.0.1}"
   [[ "$net" == "tcp" ]] && { idx=1; fb="PUBLIC KEY2"; }
   # Поля inbound — одним jq, по строке на поле (null — «null», как у отдельных вызовов): самопроверка
   # xm health идёт сюда 288 раз в сутки, а каждый запуск jq — заметная доля её CPU.
@@ -555,24 +580,24 @@ _tunnel_up() {
 
   if [[ "$net" == "xhttp" ]]; then
     jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
-          --arg p "$path_v" --arg m "$mode" --argjson port "$port" --argjson sp "$TUN_PORT" \
+          --arg p "$path_v" --arg m "$mode" --arg addr "$addr" --argjson port "$port" --argjson sp "$TUN_PORT" \
           --argjson doh "$DOH_LIST" '{
       log:{loglevel:"warning"},
       dns:{servers:$doh, queryStrategy:"UseIPv4"},
       inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:true}}],
       outbounds:[{protocol:"vless",
-        settings:{vnext:[{address:"127.0.0.1",port:$port,users:[{id:$uuid,encryption:"none"}]}]},
+        settings:{vnext:[{address:$addr,port:$port,users:[{id:$uuid,encryption:"none"}]}]},
         streamSettings:{network:"xhttp",security:"reality",
           realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid},
           xhttpSettings:{path:$p,host:$sni,mode:$m}}}]}' > "$TUN_CFG"
   else
     jq -n --arg uuid "$uuid" --arg pub "$pub" --arg sni "$sni" --arg sid "$sid" \
-          --argjson port "$port" --argjson sp "$TUN_PORT" --argjson doh "$DOH_LIST" '{
+          --arg addr "$addr" --argjson port "$port" --argjson sp "$TUN_PORT" --argjson doh "$DOH_LIST" '{
       log:{loglevel:"warning"},
       dns:{servers:$doh, queryStrategy:"UseIPv4"},
       inbounds:[{listen:"127.0.0.1",port:$sp,protocol:"socks",settings:{udp:true}}],
       outbounds:[{protocol:"vless",
-        settings:{vnext:[{address:"127.0.0.1",port:$port,
+        settings:{vnext:[{address:$addr,port:$port,
           users:[{id:$uuid,encryption:"none",flow:"xtls-rprx-vision"}]}]},
         streamSettings:{network:"tcp",security:"reality",
           realitySettings:{serverName:$sni,fingerprint:"chrome",publicKey:$pub,shortId:$sid}}}]}' > "$TUN_CFG"
@@ -1998,8 +2023,18 @@ _parse_mldsa() {
 
 _pq_on() { jq -e '.inbounds[0].streamSettings.realitySettings.mldsa65Seed // empty' "$CONFIG" >/dev/null 2>&1; }
 
+# Адрес и хвост имени профиля для ссылок: пусто — IPv4 из client-info.txt. Ставит _uri_v6 (флаг --v6
+# у uri и qr); IPv6 в ссылке — в квадратных скобках, как в любом URL.
+URI_HOST=""; URI_SFX=""
+_uri_v6() {
+  URI_HOST=$(_get_server_ip6)
+  [[ -n "$URI_HOST" ]] || { echo -e "${RED}Глобального IPv6 у VPS нет — что не так: sudo xm ipv6${NC}" >&2; return 1; }
+  URI_SFX="-v6"
+}
+_uri_addr() { local a="${URI_HOST:-$(_get_server_ip)}"; [[ "$a" == *:* ]] && a="[$a]"; echo "$a"; }
+
 _make_uri_xhttp() {
-  local uuid="$1" comment="$2"
+  local uuid="$1" comment="$2$URI_SFX"
   local sni port sid path_val mode pubkey fp server_ip encoded_path
   sni=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.host // .inbounds[0].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
   # За фронтом Xray слушает свой локальный порт, а клиент идёт на публичный.
@@ -2011,7 +2046,7 @@ _make_uri_xhttp() {
   mode=$(jq -r '.inbounds[0].streamSettings.xhttpSettings.mode' "$CONFIG")
   pubkey=$(_get_pubkey_xhttp)
   fp=$(_get_fp)
-  server_ip=$(_get_server_ip)
+  server_ip=$(_uri_addr)
   encoded_path=$(_url_encode "$path_val")
 
   if [[ -z "$pubkey" || ${#pubkey} -lt 30 ]]; then
@@ -2023,14 +2058,14 @@ _make_uri_xhttp() {
 }
 
 _make_uri_tcp() {
-  local uuid="$1" comment="$2"
+  local uuid="$1" comment="$2$URI_SFX"
   local sni port sid pubkey fp server_ip
   sni=$(jq -r '.inbounds[1].streamSettings.realitySettings.serverNames[0]' "$CONFIG")
   port=$(jq -r '.inbounds[1].port' "$CONFIG")
   sid=$(jq -r '.inbounds[1].streamSettings.realitySettings.shortIds[0]' "$CONFIG")
   pubkey=$(_get_pubkey_tcp)
   fp=$(_get_fp)
-  server_ip=$(_get_server_ip)
+  server_ip=$(_uri_addr)
 
   if [[ -z "$pubkey" || ${#pubkey} -lt 30 ]]; then
     echo -e "${RED}[ERR] Не удалось получить публичный ключ TCP. Запусти: xm pubkey${NC}" >&2
@@ -3090,7 +3125,7 @@ del|del-client)
 uri)
     MODE_TCP=false; SEARCH_ARG=""
     for arg in "${@:2}"; do
-      case "$arg" in --tcp) MODE_TCP=true ;; --all) SEARCH_ARG="--all" ;; *) SEARCH_ARG="$arg" ;; esac
+      case "$arg" in --tcp) MODE_TCP=true ;; --all) SEARCH_ARG="--all" ;; --v6) _uri_v6 || exit 1 ;; *) SEARCH_ARG="$arg" ;; esac
     done
 
     $MODE_TCP && ! _has_tcp_inbound && {
@@ -3144,6 +3179,7 @@ qr)
         --tcp)  MODE_TCP=true ;;
         --both) MODE_BOTH=true ;;
         --all)  MODE_ALL=true ;;
+        --v6)   _uri_v6 || exit 1 ;;
         *)      SEARCH_ARG="$arg" ;;
       esac
     done
@@ -5085,6 +5121,87 @@ selftest)
     else
       _selftest xhttp
     fi
+    ;;
+
+# ─── IPv6: второй адрес для подключения
+#
+# Xray слушает 0.0.0.0, а Go на такой адрес открывает двухстековый сокет (в ss — *:порт): клиента по
+# IPv6 он примет без правки конфига; фронт nginx слушает [::] отдельной строкой. Здесь — что видно
+# с самого VPS: адрес, выход наружу, сокет, правило ufw, хендшейк REALITY на свой IPv6. Хендшейк
+# идёт через lo мимо ufw и фильтра хостера, поэтому доступность снаружи — только проверка с клиента.
+ipv6|ip6)
+    [[ $EUID -ne 0 ]] && { echo -e "${RED}Запусти от root: sudo xm ipv6${NC}"; exit 1; }
+    echo -e "${BOLD}${CYAN}[ IPv6: второй адрес для подключения ]${NC}"; sep
+    if ! _has_ipv6; then
+      fail "У VPS нет маршрута IPv6 наружу — в ОС адрес не настроен"
+      info "Адрес и шлюз из панели хостера — в /etc/netplan/*.yaml (addresses, routes), затем: sudo netplan try"
+      exit 1
+    fi
+    V6=$(_get_server_ip6)
+    if [[ -z "$V6" ]]; then
+      fail "Маршрут IPv6 есть, а постоянного глобального адреса нет (только временные, ULA или link-local)"
+      exit 1
+    fi
+    V6_BAD=0
+    ok "Адрес для ссылки: $V6"
+    (( $(_ip6_candidates | grep -c .) > 1 )) \
+      && info "Глобальных адресов несколько — взят src маршрута наружу; нужен другой — строка «SERVER IP6: <адрес>» в $CLIENT_FILE"
+
+    # Выход наружу — признак, что хостер IPv6 маршрутизирует, а не только выдал адрес в панели.
+    OUT6=$(curl -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$OUT6" ]]; then
+      fail "Наружу по IPv6 не выйти — адрес настроен, но пакеты не ходят: шлюз в netplan или IPv6 у хостера. Проверка: ping -6 -c3 2001:4860:4860::8888"
+      V6_BAD=$((V6_BAD + 1))
+    elif [[ "${OUT6,,}" != "$V6" ]]; then
+      warn "Наружу сервер выходит с ${OUT6,,}, а не с $V6 — если клиент не подключится, попробуй этот адрес строкой «SERVER IP6:» в $CLIENT_FILE"
+    else
+      ok "Наружу по IPv6 выходит с этого же адреса — маршрут у хостера жив"
+    fi
+
+    PUBPORT=$(_front_public_port)
+    V6_PORTS=("$PUBPORT"); _has_tcp_inbound && V6_PORTS+=("$(jq -r '.inbounds[1].port' "$CONFIG")")
+    for p in "${V6_PORTS[@]}"; do
+      L6=$(ss -Htln "sport = :$p" 2>/dev/null | awk '$4 ~ /^(\*|\[)/ {print $4; exit}')
+      if [[ -n "$L6" ]]; then ok "Порт $p слушается и на IPv6 ($L6)"
+      else fail "Порт $p слушается только на IPv4 — кто держит: sudo ss -tlnp 'sport = :$p'"; V6_BAD=$((V6_BAD + 1)); fi
+    done
+
+    # IPV6=no: ufw не трогает ip6tables, и что пропускать по IPv6 — решает не он.
+    if _ufw_active; then
+      if grep -qE '^[[:space:]]*IPV6=yes' /etc/default/ufw 2>/dev/null; then
+        for p in "${V6_PORTS[@]}"; do
+          if ufw status 2>/dev/null | grep -qE "^${p}(/tcp)? \(v6\)[[:space:]]+ALLOW"; then ok "UFW: ${p}/tcp открыт и для IPv6"
+          else fail "UFW: для IPv6 порт $p закрыт — открыть: ${BOLD}sudo ufw allow ${p}/tcp${NC}"; V6_BAD=$((V6_BAD + 1)); fi
+        done
+      else
+        fail "UFW не управляет IPv6 (IPV6 ≠ yes в /etc/default/ufw): правила на IPv6 не действуют, политика ip6tables — $(ip6tables -S INPUT 2>/dev/null | head -1)"
+        info "Включить: sudo sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw && sudo ufw --force disable && sudo ufw --force enable"
+        V6_BAD=$((V6_BAD + 1))
+      fi
+    else
+      info "UFW не активен — фильтра на VPS нет; у хостера может быть свой (панель)"
+    fi
+
+    # Публичный порт XHTTP — через фронт, как клиент; TCP-inbound — свой порт напрямую.
+    for net in xhttp tcp; do
+      [[ $net == tcp ]] && ! _has_tcp_inbound && continue
+      p=""; [[ $net == xhttp ]] && p=$PUBPORT
+      if _tunnel_up "$net" "$p" "" "$V6"; then CODE=$(_tunnel_code); else CODE=000; fi
+      if [[ "$CODE" == "200" ]]; then
+        ok "REALITY $net на [$V6]:$TUN_SRVPORT — трафик прошёл (HTTP 200)"
+      else
+        fail "REALITY $net на [$V6]:$TUN_SRVPORT — трафик не прошёл (код $CODE), по IPv4: sudo xm selftest"
+        _tunnel_hint | sed 's/^/    /'; V6_BAD=$((V6_BAD + 1))
+      fi
+      _tunnel_down
+    done
+
+    sep
+    if (( V6_BAD )); then fail "IPv6 не готов: проблем — $V6_BAD (выше)"
+    else ok "Со стороны VPS IPv6 готов. Снаружи отсюда не видно (зонд идёт через lo) — проверка с клиента"; fi
+    info "Ссылка на IPv6: sudo xm uri <имя> --v6   ·   QR: sudo xm qr <имя> --v6"
+    info "С клиента без VPN (PowerShell): Test-NetConnection -ComputerName $V6 -Port $PUBPORT   → TcpTestSucceeded : True"
+    exit $(( V6_BAD > 0 ))
     ;;
 
 # ─── Почему клиент не подключается ───────────────────────────────────────────
@@ -7094,7 +7211,7 @@ neighbors)
     echo -e "${BOLD}${CYAN}xm — менеджер Xray${NC}   sudo xm <команда>"
     echo ""
     echo -e "${BOLD}Клиенты${NC}     add [имя] · del [uuid] · clients [--json]"
-    echo    "            uri [имя|--tcp|--all] · qr [имя] [--tcp|--both|--all]"
+    echo    "            uri [имя|--tcp|--all] [--v6] · qr [имя] [--tcp|--both|--all] [--v6]   --v6 — ссылка на IPv6"
     echo -e "${BOLD}Сервис${NC}      start · stop · restart · status · log · log-live · log-clear"
     echo -e "${BOLD}Конфиг${NC}      edit · test · apply · backup · restore · backups"
     echo -e "            ${GREEN}set-sni <домен>${NC}          домен-маска в config+nginx, с откатом"
@@ -7112,6 +7229,7 @@ neighbors)
     echo    "                                     «Подключить» — вердикт: сервер, профиль, ядро клиента или сеть"
     echo -e "            ${GREEN}bridge on|off|status${NC}     мост для xdiag: sudo без пароля только на чтение —"
     echo    "                                     bridge facts · health · doctor [--live 10-120] (JSON по SSH)"
+    echo -e "            ${GREEN}ipv6${NC}                     готов ли VPS принять клиента по IPv6: адрес, сокет, ufw, хендшейк"
     echo -e "            ${GREEN}diag${NC} · ${GREEN}diag-dpi [--quick]${NC} · sni-scan [--local [CIDR]] · neighbors"
     echo    "            reality-debug on|off · diag-ntp|diag-ports|diag-tls|diag-fw|diag-log"
     echo -e "${BOLD}Обновление${NC}  ${GREEN}self-update [--check|--force|--from <url>]${NC}  xm из репозитория"
