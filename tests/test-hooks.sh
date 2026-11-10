@@ -72,6 +72,9 @@ guard "чужое слово с git" 0 "legit-git commit $ip"
 guard "коммит с адресом в сообщении" 2 "git add -A && git commit -m 'фикс для $ip'"
 guard "push через -C" 2 "git -C /tmp push origin x # $ip"
 guard "коммит с документационным адресом" 0 "git commit -m 'пример 192.0.2.1'"
+ip6="2a0$((2 + 3)):f00::$((4 * 2))"  # глобальный IPv6, собран здесь по той же причине
+guard "коммит с глобальным IPv6" 2 "git commit -m 'фикс для $ip6'"
+guard "коммит с документационным IPv6" 0 "git commit -m 'пример 2001:db8::5, резолвер 2001:4860:4860::8888'"
 uuid=$(printf '%s-%s-%s-%s-%s' 1b671a64 40d5 491e 99b0 da01ff1f3341)
 guard "UUID в сообщении" 2 "git commit -m 'клиент $uuid'"
 guard "UUID в локальном пути" 0 "cd /tmp/s/$uuid/x && git commit -m 'тест'"
